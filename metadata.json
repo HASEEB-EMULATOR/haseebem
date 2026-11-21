@@ -1,0 +1,6 @@
+{
+  "name": "HASEEB GAMING",
+  "description": "Android-on-Android gaming VM launcher powered by QEMU with a custom Magisk-enabled Android 10 ROM and automated CI pipelines.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

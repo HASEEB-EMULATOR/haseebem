@@ -1,0 +1,10 @@
+GNU GENERAL PUBLIC LICENSE
+Version 3 Notice & Attribution for Magisk
+
+The Haseeb Gaming Android 10 ROM includes Magisk (https://github.com/topjohnwu/Magisk),
+a suite of open-source software for customizing Android, licensed under the
+GNU General Public License v3.0 (GPL-3.0).
+
+Magisk is shipped as a standard user-controlled root solution with its built-in
+DenyList. HASEEB GAMING does not implement Play Integrity / SafetyNet bypasses,
+keybox spoofing, or anti-cheat evasion.

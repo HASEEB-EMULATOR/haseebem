@@ -1,0 +1,397 @@
+name: Build Haseeb Gaming Android 10 ROM
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_tag:
+        description: 'Release tag for the built ROM archive'
+        required: false
+        default: 'rom-a10-v1'
+      base_gsi_url:
+        description: 'Android 10 arm64 GSI (.img.xz) URL'
+        required: false
+        default: 'https://github.com/phhusson/treble_experimentations/releases/download/v222/system-quack-arm64-ab-vanilla.img.xz'
+      base_kernel_url:
+        description: 'Android 10 arm64 QEMU/Virt kernel Image.gz URL'
+        required: false
+        default: 'https://android.googlesource.com/kernel/prebuilts/common-android10-5.4/arm64/+archive/refs/heads/main.tar.gz'
+  push:
+    paths:
+      - '.github/workflows/build-rom.yml'
+      - 'rom/**'
+
+permissions:
+  contents: write
+
+jobs:
+  build-rom:
+    runs-on: ubuntu-latest
+    env:
+      ROM_VERSION: haseeb-gaming-a10-v1
+      GUEST_API_LEVEL: 29
+      GUEST_ANDROID_VERSION: '10'
+      WORK_DIR: ${{ github.workspace }}/rom_work
+      OUT_DIR: ${{ github.workspace }}/rom_out
+      BUILD_LOG: ${{ github.workspace }}/rom_build.log
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install ROM build & Magisk patching tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            android-sdk-libsparse-utils \
+            android-tools-fsutils \
+            bc \
+            bzip2 \
+            cpio \
+            curl \
+            e2fsprogs \
+            file \
+            jq \
+            lz4 \
+            mkbootimg \
+            python3 \
+            unzip \
+            wget \
+            xz-utils \
+            zip
+          # Ensure simg2img / img2simg / mkbootimg are present
+          command -v simg2img
+          command -v resize2fs
+          command -v e2fsck
+          command -v python3
+          command -v jq
+
+      - name: Build, Debloat, Tune, Patch Magisk & Package ROM
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          mkdir -p "$WORK_DIR" "$OUT_DIR" "$WORK_DIR/mnt" "$WORK_DIR/magisk" "$WORK_DIR/boot" "$WORK_DIR/verify"
+          : > "$BUILD_LOG"
+          exec > >(tee -a "$BUILD_LOG") 2>&1
+
+          echo "=== [1/7] Downloading Base Android 10 arm64 GSI ==="
+          GSI_URL="${{ github.event.inputs.base_gsi_url || 'https://github.com/phhusson/treble_experimentations/releases/download/v222/system-quack-arm64-ab-vanilla.img.xz' }}"
+          curl -fL --retry 3 --retry-delay 5 -o "$WORK_DIR/system.img.xz" "$GSI_URL"
+          xz -d -T0 "$WORK_DIR/system.img.xz"
+
+          if file "$WORK_DIR/system.img" | grep -qi "Android sparse image"; then
+            echo "Converting sparse system.img to raw ext4..."
+            simg2img "$WORK_DIR/system.img" "$WORK_DIR/system.raw.img"
+            mv "$WORK_DIR/system.raw.img" "$WORK_DIR/system.img"
+          fi
+
+          # Add 384 MiB headroom for tuning, Magisk APK, and clean resize
+          truncate -s +384M "$WORK_DIR/system.img"
+          e2fsck -fy "$WORK_DIR/system.img"
+          resize2fs "$WORK_DIR/system.img"
+
+          echo "=== [2/7] Mounting system.img, Debloating & Applying Gaming Tuning ==="
+          sudo mount -o loop,rw "$WORK_DIR/system.img" "$WORK_DIR/mnt"
+          cleanup_mount() {
+            if mountpoint -q "$WORK_DIR/mnt"; then
+              sudo umount "$WORK_DIR/mnt" || true
+            fi
+          }
+          trap cleanup_mount EXIT
+
+          # Determine system root inside A/B vs A-only GSI layout
+          if [ -d "$WORK_DIR/mnt/system/app" ]; then
+            SYS_ROOT="$WORK_DIR/mnt/system"
+          else
+            SYS_ROOT="$WORK_DIR/mnt"
+          fi
+          echo "Detected SYS_ROOT=$SYS_ROOT"
+
+          DEBLOAT_PKGS=(
+            Camera2
+            Snap
+            Email
+            BuiltInPrintService
+            PrintSpooler
+            LiveWallpapersPicker
+            LiveWallpapers
+            Traceur
+            QuickSearchBox
+            BasicDreams
+            PhotoTable
+            Gallery2
+            Eleven
+            Music
+            WallpaperPicker
+            ThemePicker
+          )
+
+          for sub in app priv-app product/app product/priv-app; do
+            for pkg in "${DEBLOAT_PKGS[@]}"; do
+              if [ -d "$SYS_ROOT/$sub/$pkg" ]; then
+                echo "Debloating $SYS_ROOT/$sub/$pkg"
+                sudo rm -rf "$SYS_ROOT/$sub/$pkg"
+              fi
+            done
+          done
+
+          # Write Haseeb ROM recognition marker
+          echo -n "$ROM_VERSION" | sudo tee "$SYS_ROOT/etc/haseeb_rom" >/dev/null
+          sudo chmod 0644 "$SYS_ROOT/etc/haseeb_rom"
+
+          # Gaming tuning properties in /system/build.prop (NEVER fake hardware/EGL/QEMU props)
+          sudo tee -a "$SYS_ROOT/build.prop" >/dev/null <<'EOF'
+
+          # --- HASEEB GAMING A10 TUNING ---
+          debug.hwui.renderer=skiagl
+          debug.hwui.use_buffer_age=true
+          debug.hwui.render_dirty_regions=false
+          debug.hwui.disable_vsync=false
+          persist.sys.ui.hw=1
+          windowsmgr.max_events_per_sec=240
+          ro.min_pointer_dur=8
+          ro.max.fling_velocity=12000
+          ro.min.fling_velocity=8000
+          ro.config.low_ram=false
+          ro.lmk.use_psi=true
+          ro.lmk.psi_partial_stall_ms=70
+          ro.lmk.psi_complete_stall_ms=700
+          ro.lmk.kill_heaviest_task=true
+          EOF
+
+          # If a vendor build.prop exists inside the image, append compatible input/LMK tuning
+          if [ -f "$WORK_DIR/mnt/vendor/build.prop" ]; then
+            sudo tee -a "$WORK_DIR/mnt/vendor/build.prop" >/dev/null <<'EOF'
+
+          # --- HASEEB GAMING VENDOR TUNING ---
+          ro.config.low_ram=false
+          ro.lmk.use_psi=true
+          ro.lmk.kill_heaviest_task=true
+          EOF
+          fi
+
+          # Disable animations on first boot cleanly via init .rc
+          sudo mkdir -p "$SYS_ROOT/etc/init"
+          sudo tee "$SYS_ROOT/etc/init/haseeb_gaming.rc" >/dev/null <<'EOF'
+          on property:sys.boot_completed=1
+              exec u:r:shell:s0 -- /system/bin/settings put global window_animation_scale 0.0
+              exec u:r:shell:s0 -- /system/bin/settings put global transition_animation_scale 0.0
+              exec u:r:shell:s0 -- /system/bin/settings put global animator_duration_scale 0.0
+          EOF
+          sudo chmod 0644 "$SYS_ROOT/etc/init/haseeb_gaming.rc"
+
+          echo "=== [3/7] Downloading Latest Magisk Release ==="
+          MAGISK_JSON=$(curl -fsSL "https://api.github.com/repos/topjohnwu/Magisk/releases/latest")
+          MAGISK_URL=$(echo "$MAGISK_JSON" | jq -r '.assets[] | select(.name | test("^Magisk-v.*\\.apk$")) | .browser_download_url' | head -n 1)
+          MAGISK_TAG=$(echo "$MAGISK_JSON" | jq -r '.tag_name')
+          echo "Found Magisk $MAGISK_TAG at $MAGISK_URL"
+          curl -fL --retry 3 -o "$WORK_DIR/magisk/Magisk.apk" "$MAGISK_URL"
+          unzip -q -o "$WORK_DIR/magisk/Magisk.apk" -d "$WORK_DIR/magisk/unpacked"
+
+          # Pre-install Magisk Manager APK into /system/priv-app/Magisk
+          sudo mkdir -p "$SYS_ROOT/priv-app/Magisk"
+          sudo cp "$WORK_DIR/magisk/Magisk.apk" "$SYS_ROOT/priv-app/Magisk/Magisk.apk"
+          sudo chmod 0644 "$SYS_ROOT/priv-app/Magisk/Magisk.apk"
+
+          # Include GPL-3 / Magisk / QEMU attribution licenses in /system/etc/licenses
+          sudo mkdir -p "$SYS_ROOT/etc/haseeb_licenses"
+          [ -f "${{ github.workspace }}/LICENSES/QEMU-COPYING.txt" ] && sudo cp "${{ github.workspace }}/LICENSES/QEMU-COPYING.txt" "$SYS_ROOT/etc/haseeb_licenses/"
+          [ -f "${{ github.workspace }}/LICENSES/MAGISK-LICENSE.txt" ] && sudo cp "${{ github.workspace }}/LICENSES/MAGISK-LICENSE.txt" "$SYS_ROOT/etc/haseeb_licenses/"
+
+          # Copy ramdisk / init binary baseline from system if needed for boot.img construction
+          sudo sync
+          sudo umount "$WORK_DIR/mnt"
+          e2fsck -fy "$WORK_DIR/system.img"
+          resize2fs -M "$WORK_DIR/system.img"
+
+          echo "=== [4/7] Building Android 10 arm64 boot.img (Kernel + Ramdisk) ==="
+          KERNEL_ARCHIVE_URL="${{ github.event.inputs.base_kernel_url || 'https://android.googlesource.com/kernel/prebuilts/common-android10-5.4/arm64/+archive/refs/heads/main.tar.gz' }}"
+          mkdir -p "$WORK_DIR/kernel_pkg" "$WORK_DIR/ramdisk_root"
+          curl -fL --retry 3 -o "$WORK_DIR/kernel.tar.gz" "$KERNEL_ARCHIVE_URL"
+          tar -xzf "$WORK_DIR/kernel.tar.gz" -C "$WORK_DIR/kernel_pkg"
+          KERNEL_BIN=$(find "$WORK_DIR/kernel_pkg" -type f \( -name "Image.gz" -o -name "Image" \) | head -n 1)
+          if [ -z "$KERNEL_BIN" ]; then
+            echo "ERROR: Could not locate arm64 Image or Image.gz in kernel archive"
+            exit 1
+          fi
+          echo "Using kernel binary: $KERNEL_BIN"
+
+          # Construct minimal Android 10 SAR ramdisk for QEMU virtio-blk root=/dev/vda
+          mkdir -p "$WORK_DIR/ramdisk_root"/{dev,proc,sys,system,mnt,vendor,debug_ramdisk}
+          # Create placeholder /init that magiskboot will replace with magiskinit
+          printf '#!/system/bin/sh\nexec /system/bin/init\n' > "$WORK_DIR/ramdisk_root/init"
+          chmod 0750 "$WORK_DIR/ramdisk_root/init"
+          (cd "$WORK_DIR/ramdisk_root" && find . | cpio -o -H newc | gzip -9 > "$WORK_DIR/boot/ramdisk.cpio.gz")
+
+          python3 - <<PY
+          import subprocess, shutil
+          mkbootimg = shutil.which("mkbootimg")
+          if not mkbootimg:
+              raise RuntimeError("mkbootimg tool missing")
+          cmd = [
+              mkbootimg,
+              "--kernel", "$KERNEL_BIN",
+              "--ramdisk", "$WORK_DIR/boot/ramdisk.cpio.gz",
+              "--header_version", "2",
+              "--os_version", "10.0.0",
+              "--os_patch_level", "2020-10",
+              "--pagesize", "4096",
+              "--cmdline", "console=ttyAMA0 androidboot.hardware=ranchu androidboot.selinux=permissive earlycon=pl011,0x09000000",
+              "--output", "$WORK_DIR/boot/boot.img",
+          ]
+          subprocess.run(cmd, check=True)
+          PY
+
+          echo "=== [5/7] Patching boot.img with Magisk (magiskboot unpack -> magiskinit + overlay.d -> repack) ==="
+          MAGISKBOOT="$WORK_DIR/magisk/unpacked/lib/x86_64/libmagiskboot.so"
+          MAGISKINIT="$WORK_DIR/magisk/unpacked/lib/arm64-v8a/libmagiskinit.so"
+          MAGISK64="$WORK_DIR/magisk/unpacked/lib/arm64-v8a/libmagisk64.so"
+          MAGISK32="$WORK_DIR/magisk/unpacked/lib/armeabi-v7a/libmagisk32.so"
+          STUB_APK="$WORK_DIR/magisk/unpacked/assets/stub.apk"
+
+          if [ ! -f "$MAGISKBOOT" ] || [ ! -f "$MAGISKINIT" ] || [ ! -f "$MAGISK64" ]; then
+            echo "ERROR: Expected Magisk native binaries not found inside Magisk.apk"
+            ls -laR "$WORK_DIR/magisk/unpacked/lib"
+            exit 1
+          fi
+          chmod +x "$MAGISKBOOT"
+
+          cd "$WORK_DIR/boot"
+          "$MAGISKBOOT" unpack boot.img
+          cp ramdisk.cpio ramdisk.cpio.orig
+
+          "$MAGISKBOOT" compress=xz "$MAGISK64" magisk64.xz
+          [ -f "$MAGISK32" ] && "$MAGISKBOOT" compress=xz "$MAGISK32" magisk32.xz || true
+          [ -f "$STUB_APK" ] && "$MAGISKBOOT" compress=xz "$STUB_APK" stub.xz || true
+
+          cat > config <<'EOF'
+          KEEPVERITY=false
+          KEEPFORCEENCRYPT=false
+          RECOVERYMODE=false
+          PREINITDEVICE=userdata
+          EOF
+
+          cat > haseeb_magisk.rc <<'EOF'
+          on post-fs-data
+              setprop persist.haseeb.magisk.ready 1
+          EOF
+
+          "$MAGISKBOOT" cpio ramdisk.cpio \
+            "add 0750 init $MAGISKINIT" \
+            "mkdir 0750 overlay.d" \
+            "mkdir 0750 overlay.d/sbin" \
+            "add 0644 overlay.d/sbin/magisk64.xz magisk64.xz" \
+            "add 0644 overlay.d/haseeb_magisk.rc haseeb_magisk.rc" \
+            "patch" \
+            "backup ramdisk.cpio.orig" \
+            "mkdir 000 .backup" \
+            "add 000 .backup/.magisk config"
+
+          if [ -f magisk32.xz ]; then
+            "$MAGISKBOOT" cpio ramdisk.cpio "add 0644 overlay.d/sbin/magisk32.xz magisk32.xz"
+          fi
+          if [ -f stub.xz ]; then
+            "$MAGISKBOOT" cpio ramdisk.cpio "add 0644 overlay.d/sbin/stub.xz stub.xz"
+          fi
+
+          "$MAGISKBOOT" repack boot.img "$OUT_DIR/boot.img"
+
+          echo "=== [6/7] Verifying patched boot.img with magiskboot ==="
+          cd "$WORK_DIR/verify"
+          "$MAGISKBOOT" unpack "$OUT_DIR/boot.img"
+          "$MAGISKBOOT" cpio ramdisk.cpio "exists init"
+          "$MAGISKBOOT" cpio ramdisk.cpio "exists .backup/.magisk"
+          "$MAGISKBOOT" cpio ramdisk.cpio "exists overlay.d/sbin/magisk64.xz"
+          echo "Verified patched boot.img ramdisk contains Magisk init, .backup/.magisk, and overlay.d!"
+
+          echo "=== [7/7] Generating manifest.json & Packaging ROM Archive ==="
+          mv "$WORK_DIR/system.img" "$OUT_DIR/system.img"
+          cp "${{ github.workspace }}/LICENSES/QEMU-COPYING.txt" "$OUT_DIR/QEMU-COPYING.txt"
+          cp "${{ github.workspace }}/LICENSES/MAGISK-LICENSE.txt" "$OUT_DIR/MAGISK-LICENSE.txt"
+
+          SYS_SHA=$(sha256sum "$OUT_DIR/system.img" | awk '{print $1}')
+          SYS_SIZE=$(stat -c%s "$OUT_DIR/system.img")
+          BOOT_SHA=$(sha256sum "$OUT_DIR/boot.img" | awk '{print $1}')
+          BOOT_SIZE=$(stat -c%s "$OUT_DIR/boot.img")
+
+          cat > "$OUT_DIR/manifest.json" <<EOF
+          {
+            "id": "$ROM_VERSION",
+            "name": "Haseeb Gaming Android 10",
+            "version": "1.0.0",
+            "androidVersion": "$GUEST_ANDROID_VERSION",
+            "apiLevel": $GUEST_API_LEVEL,
+            "arch": "arm64-v8a",
+            "marker": "$ROM_VERSION",
+            "magiskVersion": "$MAGISK_TAG",
+            "parts": {
+              "system.img": {
+                "sha256": "$SYS_SHA",
+                "sizeBytes": $SYS_SIZE
+              },
+              "boot.img": {
+                "sha256": "$BOOT_SHA",
+                "sizeBytes": $BOOT_SIZE
+              }
+            }
+          }
+          EOF
+
+          ARCHIVE_NAME="${ROM_VERSION}-arm64.zip"
+          cd "$OUT_DIR"
+          zip -6 -r "${{ github.workspace }}/$ARCHIVE_NAME" system.img boot.img manifest.json QEMU-COPYING.txt MAGISK-LICENSE.txt
+          cd "${{ github.workspace }}"
+          sha256sum "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256"
+
+          echo "=== Output Artifact Sizes ==="
+          ls -lh "$OUT_DIR/system.img" "$OUT_DIR/boot.img" "${{ github.workspace }}/$ARCHIVE_NAME" "${{ github.workspace }}/${ARCHIVE_NAME}.sha256"
+          cat "$OUT_DIR/manifest.json"
+
+      - name: Capture build-error.txt and commit on failure
+        if: failure()
+        run: |
+          set +e
+          LOG_FILE="$BUILD_LOG"
+          ERR_OUT="${{ github.workspace }}/build-error.txt"
+          if [ -f "$LOG_FILE" ]; then
+            MATCH_LINE=$(grep -inE -m 1 'ERROR:|FAILED:|fatal:|Traceback|No such file|Permission denied|command not found|not found|exit code' "$LOG_FILE" | cut -d: -f1)
+            if [ -n "$MATCH_LINE" ]; then
+              START=$((MATCH_LINE > 20 ? MATCH_LINE - 20 : 1))
+              END=$((MATCH_LINE + 20))
+              {
+                echo "Haseeb Gaming ROM Build Failure (around line $MATCH_LINE)"
+                echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                echo "================================================================"
+                sed -n "${START},${END}p" "$LOG_FILE"
+              } > "$ERR_OUT"
+            else
+              tail -n 41 "$LOG_FILE" > "$ERR_OUT"
+            fi
+          else
+            echo "Build failed before log file creation." > "$ERR_OUT"
+          fi
+
+          git config user.name "haseeb-gaming-ci[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add build-error.txt
+          if ! git diff --cached --quiet; then
+            git commit -m "ci: record ROM build error context [skip ci]"
+            git push origin "HEAD:${{ github.ref_name }}"
+          fi
+
+      - name: Publish ROM Release Asset
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.rom_tag || 'rom-a10-v1' }}
+          name: 'Haseeb Gaming Android 10 ROM (v1)'
+          body: |
+            Automated Android 10 (arm64, API 29) gaming ROM with Magisk pre-patched into boot.img.
+            Includes `manifest.json` with per-partition SHA-256 checksums and `/system/etc/haseeb_rom` marker (`haseeb-gaming-a10-v1`).
+          files: |
+            ${{ env.ROM_VERSION }}-arm64.zip
+            ${{ env.ROM_VERSION }}-arm64.zip.sha256
+            rom_out/manifest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

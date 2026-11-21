@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">HASEEB GAMING</string>
+    <string name="brand_subtitle">एंड्रॉइड-ऑन-एंड्रॉइड हाइपरवाइज़र</string>
+    <string name="cd_brand_logo">हसीब गेमिंग प्रतीक</string>
+    <string name="cd_hero_banner">हसीब गेमिंग एंड्रॉइड 10 रोम आर्टवर्क</string>
+    <string name="cd_import_firmware">फर्मवेयर फ़ाइल इम्पोर्ट करें</string>
+    <string name="cd_logs_nav">लॉग्स खोलें</string>
+    <string name="cd_settings_nav">सेटिंग्स खोलें</string>
+    <string name="cd_root_nav">मैजिस्क रूट पैनल खोलें</string>
+    <string name="first_launch_badge">पहला लॉन्च सेटअप</string>
+    <string name="first_launch_title">आधिकारिक गेमिंग ROM तैयार है</string>
+    <string name="first_launch_body">GitHub Releases से सीधे Haseeb Gaming Android 10 (arm64, Magisk पहले से इंस्टॉल) डाउनलोड करें। SHA-256 सत्यापित और ऑटो-इम्पोर्ट।</string>
+    <string name="action_download_verify">ROM डाउनलोड और ऑटो-इम्पोर्ट करें</string>
+    <string name="action_skip_for_now">अभी हटाएं</string>
+    <string name="hero_card_badge">HASEEB ROM A10 · MAGISK तैयार</string>
+    <string name="hero_card_title">हमारा गेमिंग ROM इंस्टॉल करें</string>
+    <string name="hero_card_subtitle">डिब्लोटेड Android 10 arm64 · HWUI + LMK ट्यून्ड · Magisk रूट शामिल</string>
+    <string name="hero_card_cta">ROM इंस्टॉल करें</string>
+    <string name="section_installed_systems">इंस्टॉल किए गए सिस्टम</string>
+    <string name="section_installed_count">%1$d VM</string>
+    <string name="empty_systems_title">अभी कोई वर्चुअल सिस्टम नहीं</string>
+    <string name="empty_systems_body">ऊपर से हमारा Android 10 गेमिंग ROM इंस्टॉल करें या फर्मवेयर (.zip / .img) इम्पोर्ट करने के लिए + दबाएं।</string>
+    <string name="label_last_boot">आखिरी बूट</string>
+    <string name="label_never_booted">कभी बूट नहीं हुआ</string>
+    <string name="label_magisk_badge">MAGISK</string>
+    <string name="label_verified_badge">सत्यापित</string>
+    <string name="action_boot_vm">VM चलाएं</string>
+    <string name="action_gaming_mode">गेमिंग मोड</string>
+    <string name="fab_import_label">इम्पोर्ट</string>
+    <string name="status_downloading">डाउनलोड हो रहा है %1$d%% (%2$s)</string>
+    <string name="status_verifying">SHA-256 चेकसम सत्यापित हो रहा है…</string>
+    <string name="status_extracting">सिस्टम और बूट इमेज निकाली जा रही हैं…</string>
+    <string name="status_importing">वर्चुअल सिस्टम रजिस्टर हो रहा है…</string>
+    <string name="status_rom_ready">Haseeb Gaming A10 ROM इम्पोर्ट हो गया</string>
+    <string name="status_error_prefix">ROM इम्पोर्ट विफल: %1$s</string>
+    <string name="milestone_notice_title">माइलस्टोन 1 तैयार</string>
+    <string name="milestone_notice_body">QEMU JNI इंजन, गेमिंग मोड, फुलस्क्रीन डिस्प्ले, रूट पैनल, लॉग्स और सेटिंग्स अगले माइलस्टोन में जुड़ेंगे।</string>
+</resources>

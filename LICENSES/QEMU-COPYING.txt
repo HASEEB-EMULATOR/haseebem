@@ -1,0 +1,16 @@
+GNU GENERAL PUBLIC LICENSE
+Version 2 / Version 3 Notice & Attribution for QEMU
+
+HASEEB GAMING embeds and invokes QEMU (https://www.qemu.org/) as its full-system
+ARM64 virtualization engine. QEMU is licensed under the GNU General Public License
+version 2 (and GPL-3.0 compatible components).
+
+In compliance with the GPL, complete corresponding source code and build scripts
+for the QEMU binaries shipped in HASEEB GAMING are produced transparently in
+this repository's GitHub Actions CI pipeline (.github/workflows/build-apk.yml),
+referencing upstream QEMU source releases at https://download.qemu.org/.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
