@@ -124,6 +124,7 @@ public:
         int64_t ret = 0;
         uint64_t pc = 0;
         int32_t pid = 1;
+        char note[48]{};
     };
 
     enum class TaskState : uint8_t {
@@ -164,6 +165,9 @@ public:
         uint64_t wait_status_uva = 0;
         int64_t wakeup_ns = 0;
         uint64_t clear_child_tid = 0;
+        uint64_t sigaltstack_sp = 0ULL;
+        int32_t sigaltstack_flags = 2; // SS_DISABLE
+        uint64_t sigaltstack_size = 0ULL;
     };
 
     LinuxGuestSupervisor(GuestRam& ram,
@@ -253,14 +257,14 @@ private:
                           uint64_t mode,
                           bool check_access_only);
     void RecordSyscall(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2,
-                       int64_t ret, uint64_t pc, int32_t pid);
+                       int64_t ret, uint64_t pc, int32_t pid, const std::string& note = "");
     void LogToUart(const std::string& msg) const;
     std::string DumpRecentSyscalls(size_t max_entries = 16) const;
     void EmitFailureDiagnostics(AArch64CpuCore& cpu, const std::string& reason) const;
     bool ReadUserString(AArch64CpuCore& cpu, uint64_t uva, std::string& out_str) const;
     bool ReadUserBytes(AArch64CpuCore& cpu, uint64_t uva, void* dst, size_t len) const;
     bool WriteUserBytes(AArch64CpuCore& cpu, uint64_t uva, const void* src, size_t len) const;
-    int64_t DispatchSyscall(AArch64CpuCore& cpu, CpuState& st, bool& out_halt, bool& out_retry, bool& out_yield);
+    int64_t DispatchSyscall(AArch64CpuCore& cpu, CpuState& st, bool& out_halt, bool& out_retry, bool& out_yield, std::string* out_note = nullptr);
     std::string FormatExceptionTrap(AArch64CpuCore& cpu, const CpuState& state, uint32_t ec) const;
 
     GuestRam& ram_;
@@ -293,6 +297,9 @@ private:
 
     uint32_t uid_ = 0u;
     uint32_t gid_ = 0u;
+    uint64_t sigaltstack_sp_ = 0ULL;
+    int32_t sigaltstack_flags_ = 2; // SS_DISABLE
+    uint64_t sigaltstack_size_ = 0ULL;
 
     std::vector<uint64_t> fb_mapped_pas_;
     bool FlushFramebufferToGpu();

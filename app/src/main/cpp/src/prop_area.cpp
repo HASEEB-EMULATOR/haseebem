@@ -106,19 +106,18 @@ struct BinaryPropertyInfoHeader {
     uint32_t types_offset;
     uint32_t root_offset;
 };
+static_assert(sizeof(BinaryPropertyInfoHeader) == 24, "PropertyInfoHeader must be 24 bytes");
 
 struct BinaryTrieNodeInternal {
-    uint32_t property_count;
-    uint32_t property_offset;
-    uint32_t context_index;
-    uint32_t type_index;
+    uint32_t property_entry;
     uint32_t num_child_nodes;
-    uint32_t child_nodes_offset;
+    uint32_t child_nodes;
     uint32_t num_prefixes;
-    uint32_t prefix_entries_offset;
+    uint32_t prefix_entries;
     uint32_t num_exact_matches;
-    uint32_t exact_match_entries_offset;
+    uint32_t exact_match_entries;
 };
+static_assert(sizeof(BinaryTrieNodeInternal) == 28, "TrieNodeInternal must be 28 bytes");
 
 struct BinaryPropertyEntry {
     uint32_t name_offset;
@@ -126,6 +125,7 @@ struct BinaryPropertyEntry {
     uint32_t context_index;
     uint32_t type_index;
 };
+static_assert(sizeof(BinaryPropertyEntry) == 16, "PropertyEntry must be 16 bytes");
 
 void AppendU32(std::vector<uint8_t>& buf, uint32_t v) {
     const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
@@ -613,9 +613,10 @@ bool PropertyAreaManager::Initialize(const std::string& runtime_dir,
                         line = Trim(line);
                         if (line.empty() || line[0] == '#') continue;
                         std::istringstream ls(line);
-                        std::string prefix, ctx;
+                        std::string prefix, ctx, match_kind;
                         if (ls >> prefix >> ctx) {
-                            context_rules_.push_back({prefix, ctx, false});
+                            ls >> match_kind;
+                            context_rules_.push_back({prefix, ctx, match_kind == "exact"});
                         }
                     }
                     loaded_contexts = !context_rules_.empty();
@@ -632,19 +633,23 @@ bool PropertyAreaManager::Initialize(const std::string& runtime_dir,
             line = Trim(line);
             if (line.empty() || line[0] == '#') continue;
             std::istringstream ls(line);
-            std::string prefix, ctx;
+            std::string prefix, ctx, match_kind;
             if (ls >> prefix >> ctx) {
-                context_rules_.push_back({prefix, ctx, false});
+                ls >> match_kind;
+                context_rules_.push_back({prefix, ctx, match_kind == "exact"});
             }
         }
     }
 
-    // Pre-create core arenas and apply pre-registered overrides BEFORE guest reads anything
+    // Pre-create arenas for all configured property contexts BEFORE guest reads anything
     GetOrCreateContextArenaLocked("u:object_r:default_prop:s0");
     GetOrCreateContextArenaLocked("u:object_r:build_prop:s0");
     GetOrCreateContextArenaLocked("u:object_r:system_prop:s0");
     GetOrCreateContextArenaLocked("u:object_r:vendor_default_prop:s0");
     GetOrCreateContextArenaLocked("u:object_r:exported_default_prop:s0");
+    for (const auto& rule : context_rules_) {
+        GetOrCreateContextArenaLocked(rule.context);
+    }
 
     WritePropertyContextsFileLocked();
     WritePropertyInfoFileLocked();
@@ -723,9 +728,10 @@ bool PropertyAreaManager::LoadPropertyContexts(const std::string& contexts_text)
         line = Trim(line);
         if (line.empty() || line[0] == '#') continue;
         std::istringstream ls(line);
-        std::string prefix, ctx;
+        std::string prefix, ctx, match_kind;
         if (ls >> prefix >> ctx) {
-            context_rules_.push_back({prefix, ctx, false});
+            ls >> match_kind;
+            context_rules_.push_back({prefix, ctx, match_kind == "exact"});
             if (initialized_) {
                 GetOrCreateContextArenaLocked(ctx);
             }
@@ -739,9 +745,15 @@ bool PropertyAreaManager::LoadPropertyContexts(const std::string& contexts_text)
 }
 
 std::string PropertyAreaManager::ResolveContextForProperty(const std::string& name) const {
+    for (const auto& rule : context_rules_) {
+        if (rule.exact && name == rule.prefix) {
+            return rule.context;
+        }
+    }
     std::string best_ctx = "u:object_r:default_prop:s0";
     size_t best_len = 0;
     for (const auto& rule : context_rules_) {
+        if (rule.exact) continue;
         if (rule.prefix == "*") {
             if (best_len == 0) best_ctx = rule.context;
             continue;
@@ -840,26 +852,36 @@ bool PropertyAreaManager::WritePropertyContextsFileLocked() {
     std::ofstream ofs(path, std::ios::trunc);
     if (!ofs.good()) return false;
     for (const auto& rule : context_rules_) {
-        ofs << rule.prefix << " " << rule.context << "\n";
+        ofs << rule.prefix << " " << rule.context;
+        if (rule.exact) ofs << " exact";
+        ofs << "\n";
     }
     return ofs.good();
 }
 
 bool PropertyAreaManager::WritePropertyInfoFileLocked() {
     // Serialize Bionic-compatible PropertyInfoArea binary blob into /dev/__properties__/property_info
+    // matching AOSP libpropertyinfoserializer / libpropertyinfoparser ABI v1.
     std::vector<uint8_t> buf(sizeof(BinaryPropertyInfoHeader), 0);
 
     std::vector<std::string> unique_contexts;
-    auto find_or_add_ctx = [&](const std::string& c) -> uint32_t {
-        for (size_t i = 0; i < unique_contexts.size(); ++i) {
-            if (unique_contexts[i] == c) return static_cast<uint32_t>(i);
-        }
-        unique_contexts.push_back(c);
-        return static_cast<uint32_t>(unique_contexts.size() - 1);
-    };
     for (const auto& rule : context_rules_) {
-        find_or_add_ctx(rule.context);
+        if (!rule.context.empty() &&
+            std::find(unique_contexts.begin(), unique_contexts.end(), rule.context) == unique_contexts.end()) {
+            unique_contexts.push_back(rule.context);
+        }
     }
+    if (unique_contexts.empty()) {
+        unique_contexts.push_back("u:object_r:default_prop:s0");
+    }
+    std::sort(unique_contexts.begin(), unique_contexts.end());
+    auto find_ctx_idx = [&](const std::string& c) -> uint32_t {
+        auto it = std::lower_bound(unique_contexts.begin(), unique_contexts.end(), c);
+        if (it != unique_contexts.end() && *it == c) {
+            return static_cast<uint32_t>(it - unique_contexts.begin());
+        }
+        return ~0u;
+    };
 
     AlignBuffer4(buf);
     uint32_t contexts_offset = static_cast<uint32_t>(buf.size());
@@ -882,46 +904,167 @@ bool PropertyAreaManager::WritePropertyInfoFileLocked() {
     uint32_t string_type_off = AppendString(buf, "string");
     WriteU32At(buf, type_table_pos, string_type_off);
 
-    AlignBuffer4(buf);
-    std::vector<uint32_t> prefix_name_offsets;
-    prefix_name_offsets.reserve(context_rules_.size());
+    // Build AOSP hierarchical dot-separated Trie from context_rules_
+    struct TrieBuildNode {
+        std::string name;
+        uint32_t context_index = ~0u;
+        uint32_t type_index = ~0u;
+        std::vector<std::unique_ptr<TrieBuildNode>> children;
+        struct LeafRule {
+            std::string name;
+            uint32_t context_index;
+            uint32_t type_index;
+        };
+        std::vector<LeafRule> prefixes;
+        std::vector<LeafRule> exact_matches;
+
+        TrieBuildNode* GetOrAddChild(const std::string& seg) {
+            for (const auto& c : children) {
+                if (c->name == seg) return c.get();
+            }
+            auto node = std::make_unique<TrieBuildNode>();
+            node->name = seg;
+            TrieBuildNode* raw = node.get();
+            children.push_back(std::move(node));
+            return raw;
+        }
+    };
+
+    auto split_dots = [](const std::string& s) -> std::vector<std::string> {
+        std::vector<std::string> parts;
+        size_t pos = 0;
+        while (pos <= s.size()) {
+            size_t dot = s.find('.', pos);
+            if (dot == std::string::npos) {
+                if (pos < s.size()) parts.push_back(s.substr(pos));
+                break;
+            }
+            if (dot > pos) parts.push_back(s.substr(pos, dot - pos));
+            pos = dot + 1;
+        }
+        return parts;
+    };
+
+    TrieBuildNode root;
+    root.name = "";
     for (const auto& rule : context_rules_) {
-        prefix_name_offsets.push_back(AppendString(buf, rule.prefix));
+        const uint32_t ctx_idx = find_ctx_idx(rule.context);
+        if (ctx_idx == ~0u) continue;
+        const uint32_t type_idx = 0u;
+
+        if (rule.prefix == "*") {
+            root.context_index = ctx_idx;
+            root.type_index = type_idx;
+            continue;
+        }
+        if (!rule.exact && !rule.prefix.empty() && rule.prefix.back() == '.') {
+            std::string stem = rule.prefix.substr(0, rule.prefix.size() - 1u);
+            auto segs = split_dots(stem);
+            TrieBuildNode* cur = &root;
+            for (const auto& seg : segs) {
+                cur = cur->GetOrAddChild(seg);
+            }
+            cur->context_index = ctx_idx;
+            cur->type_index = type_idx;
+        } else {
+            auto segs = split_dots(rule.prefix);
+            if (segs.empty()) continue;
+            TrieBuildNode* cur = &root;
+            for (size_t i = 0; i + 1u < segs.size(); ++i) {
+                cur = cur->GetOrAddChild(segs[i]);
+            }
+            if (rule.exact) {
+                cur->exact_matches.push_back({segs.back(), ctx_idx, type_idx});
+            } else {
+                cur->prefixes.push_back({segs.back(), ctx_idx, type_idx});
+            }
+        }
     }
 
-    AlignBuffer4(buf);
-    uint32_t prefixes_array_offset = static_cast<uint32_t>(buf.size());
-    for (size_t i = 0; i < context_rules_.size(); ++i) {
-        BinaryPropertyEntry entry{};
-        entry.name_offset = prefix_name_offsets[i];
-        entry.namelen = static_cast<uint32_t>(context_rules_[i].prefix.size());
-        entry.context_index = find_or_add_ctx(context_rules_[i].context);
-        entry.type_index = 0u;
-        const uint8_t* p = reinterpret_cast<const uint8_t*>(&entry);
-        buf.insert(buf.end(), p, p + sizeof(entry));
-    }
+    auto write_property_entry = [&](const std::string& name, uint32_t ctx_idx, uint32_t type_idx) -> uint32_t {
+        uint32_t name_off = AppendString(buf, name);
+        AlignBuffer4(buf);
+        uint32_t off = static_cast<uint32_t>(buf.size());
+        BinaryPropertyEntry pe{};
+        pe.name_offset = name_off;
+        pe.namelen = static_cast<uint32_t>(name.size());
+        pe.context_index = ctx_idx;
+        pe.type_index = type_idx;
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&pe);
+        buf.insert(buf.end(), p, p + sizeof(pe));
+        return off;
+    };
 
-    AlignBuffer4(buf);
-    uint32_t root_offset = static_cast<uint32_t>(buf.size());
-    uint32_t root_name_off = AppendString(buf, "");
-    AlignBuffer4(buf);
-    BinaryTrieNodeInternal root_node{};
-    root_node.property_count = static_cast<uint32_t>(context_rules_.size());
-    root_node.property_offset = root_name_off;
-    root_node.context_index = 0u;
-    root_node.type_index = 0u;
-    root_node.num_child_nodes = 0u;
-    root_node.child_nodes_offset = 0u;
-    root_node.num_prefixes = static_cast<uint32_t>(context_rules_.size());
-    root_node.prefix_entries_offset = prefixes_array_offset;
-    root_node.num_exact_matches = 0u;
-    root_node.exact_match_entries_offset = 0u;
-    const uint8_t* rp = reinterpret_cast<const uint8_t*>(&root_node);
-    // Overwrite root_offset with header-first layout
-    buf.resize(root_offset);
-    buf.insert(buf.end(), rp, rp + sizeof(root_node));
-    uint32_t final_root_name_off = AppendString(buf, "");
-    WriteU32At(buf, root_offset + offsetof(BinaryTrieNodeInternal, property_offset), final_root_name_off);
+    auto serialize_node = [&](auto& self, TrieBuildNode& node) -> uint32_t {
+        // AOSP binary-searches child_nodes lexicographically and exact_matches lexicographically;
+        // prefixes are scanned longest-namelen first.
+        std::sort(node.children.begin(), node.children.end(),
+                  [](const auto& a, const auto& b) { return a->name < b->name; });
+        std::sort(node.prefixes.begin(), node.prefixes.end(),
+                  [](const auto& a, const auto& b) {
+                      if (a.name.size() != b.name.size()) return a.name.size() > b.name.size();
+                      return a.name < b.name;
+                  });
+        std::sort(node.exact_matches.begin(), node.exact_matches.end(),
+                  [](const auto& a, const auto& b) { return a.name < b.name; });
+
+        std::vector<uint32_t> child_offsets;
+        child_offsets.reserve(node.children.size());
+        for (auto& c : node.children) {
+            child_offsets.push_back(self(self, *c));
+        }
+
+        std::vector<uint32_t> prefix_offsets;
+        prefix_offsets.reserve(node.prefixes.size());
+        for (const auto& pe : node.prefixes) {
+            prefix_offsets.push_back(write_property_entry(pe.name, pe.context_index, pe.type_index));
+        }
+
+        std::vector<uint32_t> exact_offsets;
+        exact_offsets.reserve(node.exact_matches.size());
+        for (const auto& ee : node.exact_matches) {
+            exact_offsets.push_back(write_property_entry(ee.name, ee.context_index, ee.type_index));
+        }
+
+        uint32_t node_prop_entry_off = write_property_entry(node.name, node.context_index, node.type_index);
+
+        uint32_t child_nodes_off = 0u;
+        if (!child_offsets.empty()) {
+            AlignBuffer4(buf);
+            child_nodes_off = static_cast<uint32_t>(buf.size());
+            for (uint32_t o : child_offsets) AppendU32(buf, o);
+        }
+
+        uint32_t prefix_entries_off = 0u;
+        if (!prefix_offsets.empty()) {
+            AlignBuffer4(buf);
+            prefix_entries_off = static_cast<uint32_t>(buf.size());
+            for (uint32_t o : prefix_offsets) AppendU32(buf, o);
+        }
+
+        uint32_t exact_entries_off = 0u;
+        if (!exact_offsets.empty()) {
+            AlignBuffer4(buf);
+            exact_entries_off = static_cast<uint32_t>(buf.size());
+            for (uint32_t o : exact_offsets) AppendU32(buf, o);
+        }
+
+        AlignBuffer4(buf);
+        uint32_t node_off = static_cast<uint32_t>(buf.size());
+        BinaryTrieNodeInternal tn{};
+        tn.property_entry = node_prop_entry_off;
+        tn.num_child_nodes = static_cast<uint32_t>(child_offsets.size());
+        tn.child_nodes = child_nodes_off;
+        tn.num_prefixes = static_cast<uint32_t>(prefix_offsets.size());
+        tn.prefix_entries = prefix_entries_off;
+        tn.num_exact_matches = static_cast<uint32_t>(exact_offsets.size());
+        tn.exact_match_entries = exact_entries_off;
+        const uint8_t* np = reinterpret_cast<const uint8_t*>(&tn);
+        buf.insert(buf.end(), np, np + sizeof(tn));
+        return node_off;
+    };
+
+    uint32_t root_offset = serialize_node(serialize_node, root);
 
     BinaryPropertyInfoHeader hdr{};
     hdr.current_version = 1u;

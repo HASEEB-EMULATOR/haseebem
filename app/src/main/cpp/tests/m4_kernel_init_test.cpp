@@ -724,6 +724,37 @@ void TestElfPhdrTlsMmapCoherencyAndSyscalls() {
     cb.insns.push_back(Movz(8, 167u)); // prctl
     cb.insns.push_back(Svc(0));
 
+    // sigaltstack(nullptr, sp+368) -> expect 0 and ss_flags == 2 (SS_DISABLE)
+    cb.insns.push_back(Movz(0, 0u));
+    cb.insns.push_back(AddImm64(1, 31, 368u));
+    cb.insns.push_back(Movz(8, 132u)); // sigaltstack
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 0u));
+    const size_t b_fail8 = cb.insns.size(); cb.insns.push_back(0);
+    cb.insns.push_back(LdrW(10, 31, 376u)); // old_ss.ss_flags at offset 8
+    cb.insns.push_back(CmpImm64(10, 2u));
+    const size_t b_fail9 = cb.insns.size(); cb.insns.push_back(0);
+
+    // sigaltstack({x24, 0, 8192}, nullptr) -> 0
+    auto str_x = [](uint8_t xt, uint8_t xn, uint16_t imm_bytes) -> uint32_t {
+        return 0xF9000000u | (static_cast<uint32_t>((imm_bytes / 8u) & 0xFFFu) << 10) |
+               (static_cast<uint32_t>(xn & 31u) << 5) | (xt & 31u);
+    };
+    auto str_w = [](uint8_t wt, uint8_t xn, uint16_t imm_bytes) -> uint32_t {
+        return 0xB9000000u | (static_cast<uint32_t>((imm_bytes / 4u) & 0xFFFu) << 10) |
+               (static_cast<uint32_t>(xn & 31u) << 5) | (wt & 31u);
+    };
+    cb.insns.push_back(str_x(24, 31, 408u));
+    cb.insns.push_back(str_w(31, 31, 416u)); // flags = 0
+    cb.insns.push_back(Movz(10, 8192u));
+    cb.insns.push_back(str_x(10, 31, 424u));
+    cb.insns.push_back(AddImm64(0, 31, 408u));
+    cb.insns.push_back(Movz(1, 0u));
+    cb.insns.push_back(Movz(8, 132u)); // sigaltstack
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 0u));
+    const size_t b_fail10 = cb.insns.size(); cb.insns.push_back(0);
+
     // Success banner then intentional exit_group(1) to verify [FAIL]/[SYS]/[TRACE]
     cb.insns.push_back(Movz(0, 1u));
     cb.EmitAdrPlaceholder(1, ok_msg);
@@ -746,6 +777,9 @@ void TestElfPhdrTlsMmapCoherencyAndSyscalls() {
     cb.insns[b_fail5] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - b_fail5));
     cb.insns[b_fail6] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - b_fail6));
     cb.insns[b_fail7] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - b_fail7));
+    cb.insns[b_fail8] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - b_fail8));
+    cb.insns[b_fail9] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - b_fail9));
+    cb.insns[b_fail10] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - b_fail10));
 
     // Wrap blob into ELF64 with 3 Phdrs: PT_PHDR, PT_LOAD, PT_TLS(align=64)
     std::vector<uint8_t> code_and_data = cb.Finalize();

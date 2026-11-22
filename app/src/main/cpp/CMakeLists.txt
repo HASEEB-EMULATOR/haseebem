@@ -110,6 +110,8 @@ if(HASEEB_BUILD_HOST_TESTS OR HASEEB_BUILD_GUEST_TEST)
 
     set(HASEEB_TEST_TARGETS
         haseeb_m1_vm_tests:tests/m1_boot_machine_test.cpp
+        haseeb_m1_property_tests:tests/m1_property_area_test.cpp
+        haseeb_guest_prop_integration_tests:tests/guest_prop_integration_test.cpp
         haseeb_m2_cpu_mmu_tests:tests/m2_cpu_mmu_test.cpp
         haseeb_m3_devices_tests:tests/m3_devices_test.cpp
         haseeb_m4_kernel_init_tests:tests/m4_kernel_init_test.cpp

@@ -1210,8 +1210,21 @@ void LinuxGuestSupervisor::LogToUart(const std::string& msg) const {
 }
 
 void LinuxGuestSupervisor::RecordSyscall(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2,
-                                         int64_t ret, uint64_t pc, int32_t pid) {
-    syscall_ring_[syscall_head_] = SyscallTraceEntry{nr, a0, a1, a2, ret, pc, pid};
+                                         int64_t ret, uint64_t pc, int32_t pid, const std::string& note) {
+    SyscallTraceEntry entry{nr, a0, a1, a2, ret, pc, pid, {}};
+    if (!note.empty()) {
+        const size_t copy_len = std::min(note.size(), sizeof(entry.note) - 1u);
+        if (note.size() > sizeof(entry.note) - 1u) {
+            const size_t tail = sizeof(entry.note) - 4u;
+            std::memcpy(entry.note, "...", 3u);
+            std::memcpy(entry.note + 3u, note.data() + (note.size() - tail), tail);
+            entry.note[sizeof(entry.note) - 1u] = '\0';
+        } else {
+            std::memcpy(entry.note, note.data(), copy_len);
+            entry.note[copy_len] = '\0';
+        }
+    }
+    syscall_ring_[syscall_head_] = entry;
     syscall_head_ = (syscall_head_ + 1u) % kSyscallTraceSize;
     ++syscall_total_;
 }
@@ -1230,7 +1243,11 @@ std::string LinuxGuestSupervisor::DumpRecentSyscalls(size_t max_entries) const {
             << " nr=" << e.nr
             << "(0x" << std::hex << e.a0 << ",0x" << e.a1 << ",0x" << e.a2 << ")"
             << " -> " << std::dec << e.ret
-            << " @0x" << std::hex << e.pc << "\n";
+            << " @0x" << std::hex << e.pc;
+        if (e.note[0] != '\0') {
+            oss << " (" << e.note << ")";
+        }
+        oss << "\n";
     }
     return oss.str();
 }
@@ -1451,7 +1468,8 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                                               CpuState& st,
                                               bool& out_halt,
                                               bool& out_retry,
-                                              bool& out_yield) {
+                                              bool& out_yield,
+                                              std::string* out_note) {
     out_halt = false;
     out_retry = false;
     out_yield = false;
@@ -1879,6 +1897,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             std::string path, norm;
             if (!ReadUserString(cpu, st.x[1], path)) return -14;
             if (!ResolveGuestPathWithDirfd(fds, static_cast<int>(st.x[0]), path, norm)) return -9;
+            if (out_note) *out_note = norm;
             return OpenGuestPath(fds, next_fd, norm,
                                  (nr == 56) ? st.x[2] : 0ULL,
                                  (nr == 56) ? st.x[3] : 0ULL,
@@ -1888,6 +1907,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             std::string path, norm;
             if (!ReadUserString(cpu, st.x[1], path)) return -14;
             if (!ResolveGuestPathWithDirfd(fds, static_cast<int>(st.x[0]), path, norm)) return -9;
+            if (out_note) *out_note = norm;
             uint64_t how[3]{};
             const size_t how_sz = std::min<size_t>(static_cast<size_t>(st.x[3]), sizeof(how));
             if (how_sz > 0u && !ReadUserBytes(cpu, st.x[2], how, how_sz)) return -14;
@@ -2290,6 +2310,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             std::string path, norm, target;
             if (!ReadUserString(cpu, st.x[1], path)) return -14;
             if (!ResolveGuestPathWithDirfd(fds, static_cast<int>(st.x[0]), path, norm)) return -9;
+            if (out_note) *out_note = norm;
             if (ResolveSymlinkTarget(norm, target)) {
                 const size_t n = std::min(target.size(), static_cast<size_t>(st.x[3]));
                 if (n > 0u && !WriteUserBytes(cpu, st.x[2], target.data(), n)) return -14;
@@ -2311,6 +2332,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 if (!ReadUserString(cpu, st.x[1], path)) return -14;
                 const uint64_t flags = st.x[3];
                 if (path.empty() && (flags & 0x1000ULL /* AT_EMPTY_PATH */) != 0ULL) {
+                    if (out_note) *out_note = "AT_EMPTY_PATH";
                     int fd = static_cast<int>(st.x[0]);
                     if (fd > 2) {
                         auto it = fds.find(fd);
@@ -2321,6 +2343,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 } else {
                     std::string norm;
                     if (!ResolveGuestPathWithDirfd(fds, static_cast<int>(st.x[0]), path, norm)) return -9;
+                    if (out_note) *out_note = norm;
                     std::string target;
                     if ((flags & 0x100ULL /* AT_SYMLINK_NOFOLLOW */) != 0ULL &&
                         ResolveSymlinkTarget(norm, target)) {
@@ -2412,6 +2435,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             } else {
                 std::string norm, target;
                 if (!ResolveGuestPathWithDirfd(fds, static_cast<int>(st.x[0]), path, norm)) return -9;
+                if (out_note) *out_note = norm;
                 if ((flags & 0x100ULL /* AT_SYMLINK_NOFOLLOW */) != 0ULL &&
                     ResolveSymlinkTarget(norm, target)) {
                     is_link = true;
@@ -2573,6 +2597,47 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                     exited_ = true;
                     out_halt = true;
                 }
+            }
+            return 0;
+        }
+        case 132: { // sigaltstack(const stack_t* ss, stack_t* old_ss)
+            struct LinuxSigAltStack {
+                uint64_t ss_sp;
+                int32_t ss_flags;
+                int32_t pad;
+                uint64_t ss_size;
+            };
+            static_assert(sizeof(LinuxSigAltStack) == 24, "AArch64 stack_t must be 24 bytes");
+
+            uint64_t& cur_sp = cur ? cur->sigaltstack_sp : sigaltstack_sp_;
+            int32_t& cur_flags = cur ? cur->sigaltstack_flags : sigaltstack_flags_;
+            uint64_t& cur_size = cur ? cur->sigaltstack_size : sigaltstack_size_;
+
+            LinuxSigAltStack old_ss{};
+            old_ss.ss_sp = cur_sp;
+            old_ss.ss_flags = cur_flags;
+            old_ss.pad = 0;
+            old_ss.ss_size = cur_size;
+
+            if (st.x[0] != 0ULL) {
+                LinuxSigAltStack new_ss{};
+                if (!ReadUserBytes(cpu, st.x[0], &new_ss, sizeof(new_ss))) return -14;
+                if ((static_cast<uint32_t>(new_ss.ss_flags) & ~0x80000002u) != 0u) {
+                    return -22; // EINVAL
+                }
+                if ((new_ss.ss_flags & 2) != 0) { // SS_DISABLE
+                    cur_sp = 0ULL;
+                    cur_flags = 2;
+                    cur_size = 0ULL;
+                } else {
+                    if (new_ss.ss_size < 2048ULL) return -12; // ENOMEM
+                    cur_sp = new_ss.ss_sp;
+                    cur_flags = new_ss.ss_flags & ~static_cast<int32_t>(0x80000000u);
+                    cur_size = new_ss.ss_size;
+                }
+            }
+            if (st.x[1] != 0ULL) {
+                if (!WriteUserBytes(cpu, st.x[1], &old_ss, sizeof(old_ss))) return -14;
             }
             return 0;
         }
@@ -2803,6 +2868,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
         case 221: { // execve(pathname, argv, envp)
             std::string path;
             if (!ReadUserString(cpu, st.x[0], path)) return -14;
+            if (out_note) *out_note = path;
             std::vector<uint8_t> elf_bytes;
             if (!TryResolveElfForTask(path, elf_bytes)) {
                 return -2;
@@ -2839,7 +2905,13 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             st.sys.spsr_el1 = 0ULL; // EL0t
             st.sp_el[0] = new_sp_el0;
             st.x[0] = 0ULL;
+            sigaltstack_sp_ = 0ULL;
+            sigaltstack_flags_ = 2;
+            sigaltstack_size_ = 0ULL;
             if (cur) {
+                cur->sigaltstack_sp = 0ULL;
+                cur->sigaltstack_flags = 2;
+                cur->sigaltstack_size = 0ULL;
                 SaveTaskContext(st, *cur);
             }
             return 0;
@@ -3054,10 +3126,11 @@ HypercallResult LinuxGuestSupervisor::HandleHypercall(AArch64CpuCore& cpu,
             bool halt = false;
             bool retry = false;
             bool yield = false;
-            int64_t ret = DispatchSyscall(cpu, state, halt, retry, yield);
+            std::string note;
+            int64_t ret = DispatchSyscall(cpu, state, halt, retry, yield, &note);
             if (!retry) {
                 state.x[0] = static_cast<uint64_t>(ret);
-                RecordSyscall(nr, a0, a1, a2, ret, pc, pid);
+                RecordSyscall(nr, a0, a1, a2, ret, pc, pid, note);
                 if (ret == -38 && logged_enosys_.insert(nr).second) {
                     std::ostringstream oss;
                     oss << "[SYS-ENOSYS] nr=" << std::dec << nr
