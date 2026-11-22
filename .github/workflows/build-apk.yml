@@ -7,23 +7,39 @@ on:
         description: 'Publish debug APK as a GitHub pre-release'
         required: false
         type: boolean
-        default: false
+        default: true
+  workflow_call:
+    inputs:
+      create_release:
+        description: 'Publish debug APK as a GitHub pre-release'
+        required: false
+        type: boolean
+        default: true
   push:
     branches:
-      - main
-      - master
+      - '**'
+    tags:
+      - 'v*'
     paths-ignore:
       - 'build-error.txt'
+      - '*.md'
+      - 'LICENSES/**'
   pull_request:
-    branches:
-      - main
-      - master
+    paths-ignore:
+      - 'build-error.txt'
+      - '*.md'
+      - 'LICENSES/**'
 
 permissions:
   contents: write
 
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-apk:
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -40,7 +56,11 @@ jobs:
       - name: Set up Android SDK, NDK 27, and CMake 3.22.1
         run: |
           set -euo pipefail
-          SDK_ROOT="${ANDROID_HOME:-$HOME/Android/Sdk}"
+          SDK_ROOT="${ANDROID_HOME:-}"
+          if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT" ] || [ ! -w "$SDK_ROOT" ]; then
+            SDK_ROOT="$HOME/Android/Sdk"
+          fi
+          mkdir -p "$SDK_ROOT"
           if [ ! -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
             mkdir -p "$SDK_ROOT/cmdline-tools"
             curl -fsSLo /tmp/cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip
@@ -49,8 +69,11 @@ jobs:
             mv "$SDK_ROOT/cmdline-tools/cmdline-tools" "$SDK_ROOT/cmdline-tools/latest"
             rm -f /tmp/cmdline-tools.zip
           fi
-          yes | "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
-          "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK_ROOT" \
+          set +o pipefail
+          yes 2>/dev/null | "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
+          set -o pipefail
+          "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK_ROOT" --install \
+            "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0" \
             "ndk;27.0.12077973" \
@@ -58,9 +81,15 @@ jobs:
           echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
 
-      - name: Generate debug.keystore
+      - name: Prepare debug.keystore
         run: |
           set -euo pipefail
+          if [ -f debug.keystore.base64 ] && [ ! -f debug.keystore ]; then
+            tr -d '\r\n' < debug.keystore.base64 | base64 -d > debug.keystore || rm -f debug.keystore
+            if [ -f debug.keystore ] && ! keytool -list -keystore debug.keystore -storepass android >/dev/null 2>&1; then
+              rm -f debug.keystore
+            fi
+          fi
           if [ ! -f debug.keystore ]; then
             keytool -genkeypair \
               -keystore debug.keystore \
@@ -76,34 +105,63 @@ jobs:
       - name: Verify gradle.properties
         run: |
           set -euo pipefail
-          grep -q '^android.useAndroidX=true$' gradle.properties
-          grep -q '^android.enableJetifier=true$' gradle.properties
-          grep -q '^org.gradle.configuration-cache=false$' gradle.properties
+          grep -qE '^android\.useAndroidX=true\r?$' gradle.properties
+          grep -qE '^android\.enableJetifier=true\r?$' gradle.properties
+          grep -qE '^org\.gradle\.configuration-cache=false\r?$' gradle.properties
 
       - name: Set up Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Run unit tests and build Debug APK
+      - name: Build Debug APK
         run: |
           set -euo pipefail
-          gradle --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug
+          gradle --no-daemon --stacktrace :app:assembleDebug
           ls -lh app/build/outputs/apk/debug/
+          sha256sum app/build/outputs/apk/debug/*.apk
+
+      - name: Run Unit & Robolectric Tests
+        run: |
+          set -euo pipefail
+          gradle --no-daemon --stacktrace :app:testDebugUnitTest
 
       - name: Upload Debug APK artifact
+        if: (!cancelled()) && hashFiles('app/build/outputs/apk/debug/*.apk') != ''
         uses: actions/upload-artifact@v4
         with:
           name: haseeb-gaming-debug-apk
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 
-      - name: Publish APK Pre-Release (when requested)
-        if: github.event_name == 'workflow_dispatch' && inputs.create_release == true
+      - name: Upload Unit Test Report on Failure
+        if: failure() && hashFiles('app/build/reports/tests/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: app/build/reports/tests/
+
+      - name: Publish APK Pre-Release (manual or tag)
+        if: >-
+          success() && (
+            ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.create_release != false) ||
+            startsWith(github.ref, 'refs/tags/')
+          )
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: apk-ci-${{ github.run_number }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('apk-ci-{0}', github.run_number) }}
           name: Haseeb Gaming APK #${{ github.run_number }}
+          files: app/build/outputs/apk/debug/*.apk
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Rolling Latest Debug APK Release (push)
+        if: success() && github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ci-latest-apk
+          name: Haseeb Gaming Latest Debug APK (CI)
           files: app/build/outputs/apk/debug/*.apk
           prerelease: true
         env:

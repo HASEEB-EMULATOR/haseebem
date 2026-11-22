@@ -148,8 +148,8 @@ fun TealGlowButton(
 @Composable
 fun SectionHeader(
     title: String,
-    trailingBadge: String? = null,
     modifier: Modifier = Modifier,
+    trailingBadge: String? = null,
 ) {
     Row(
         modifier = modifier.fillMaxWidth(),

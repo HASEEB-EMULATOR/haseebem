@@ -851,10 +851,13 @@ private fun ActiveVmSessionCard(
                                     when (action) {
                                         MotionEvent.ACTION_DOWN,
                                         MotionEvent.ACTION_POINTER_DOWN,
-                                        MotionEvent.ACTION_UP,
                                         MotionEvent.ACTION_POINTER_UP,
                                         MotionEvent.ACTION_CANCEL -> {
                                             onSendTouch(action, gx, gy, ptrId)
+                                        }
+                                        MotionEvent.ACTION_UP -> {
+                                            onSendTouch(action, gx, gy, ptrId)
+                                            v.performClick()
                                         }
                                         MotionEvent.ACTION_MOVE -> {
                                             for (p in 0 until event.pointerCount) {

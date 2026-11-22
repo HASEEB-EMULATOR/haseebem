@@ -183,7 +183,7 @@ jobs:
 
           echo "=== [3/7] Downloading Latest Magisk Release ==="
           MAGISK_JSON=$(curl -fsSL "https://api.github.com/repos/topjohnwu/Magisk/releases/latest")
-          MAGISK_URL=$(echo "$MAGISK_JSON" | jq -r '.assets[] | select(.name | test("^Magisk-v.*\\.apk$")) | .browser_download_url' | head -n 1)
+          MAGISK_URL=$(echo "$MAGISK_JSON" | jq -r '[.assets[] | select(.name | test("^Magisk-v.*\\.apk$")) | .browser_download_url][0] // empty')
           MAGISK_TAG=$(echo "$MAGISK_JSON" | jq -r '.tag_name')
           echo "Found Magisk $MAGISK_TAG at $MAGISK_URL"
           curl -fL --retry 3 -o "$WORK_DIR/magisk/Magisk.apk" "$MAGISK_URL"
@@ -210,7 +210,7 @@ jobs:
           mkdir -p "$WORK_DIR/kernel_pkg" "$WORK_DIR/ramdisk_root"
           curl -fL --retry 3 -o "$WORK_DIR/kernel.tar.gz" "$KERNEL_ARCHIVE_URL"
           tar -xzf "$WORK_DIR/kernel.tar.gz" -C "$WORK_DIR/kernel_pkg"
-          KERNEL_BIN=$(find "$WORK_DIR/kernel_pkg" -type f \( -name "Image.gz" -o -name "Image" \) | head -n 1)
+          KERNEL_BIN=$(find "$WORK_DIR/kernel_pkg" -type f \( -name "Image.gz" -o -name "Image" \) -print -quit)
           if [ -z "$KERNEL_BIN" ]; then
             echo "ERROR: Could not locate arm64 Image or Image.gz in kernel archive"
             exit 1

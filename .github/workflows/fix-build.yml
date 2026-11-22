@@ -1,75 +1,20 @@
 name: Build HASEEB GAMING v2
-on: workflow_dispatch
-permissions: write-all
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Publish debug APK as a GitHub pre-release'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Apply fixes
-        run: |
-          echo 'aW1wb3J0IHJlLCBvcywgc3VicHJvY2VzcwoKZGVmIHNoKGNtZCk6CiAgICBzdWJwcm9jZXNzLnJ1bihjbWQsIHNoZWxsPVRydWUsIGNoZWNrPUZhbHNlKQoKIyAtLS0tLS0tLS0tIDEuIGdyYWRsZTogc3RhYmxlLCBidWlsZGFibGUgLS0tLS0tLS0tLQpwID0gImdyYWRsZS9saWJzLnZlcnNpb25zLnRvbWwiCnMgPSBvcGVuKHAsIGVuY29kaW5nPSJ1dGYtOCIpLnJlYWQoKQpzID0gcmUuc3ViKHInXmFncCA9ICIuKiIkJywgJ2FncCA9ICI4LjcuMyInLCBzLCBmbGFncz1yZS5NKQpzID0gcmUuc3ViKHInXmtvdGxpbiA9ICIuKiIkJywgJ2tvdGxpbiA9ICIyLjAuMjEiJywgcywgZmxhZ3M9cmUuTSkKcyA9IHJlLnN1YihyJ15nb29nbGVEZXZ0b29sc0tzcCA9ICIuKiIkJywgJ2dvb2dsZURldnRvb2xzS3NwID0gIjIuMC4yMS0xLjAuMjgiJywgcywgZmxhZ3M9cmUuTSkKb3BlbihwLCAidyIsIGVuY29kaW5nPSJ1dGYtOCIpLndyaXRlKHMpCnByaW50KCJbMV0gY2F0YWxvZyAtPiBhZ3AgOC43LjMgLyBrb3RsaW4gMi4wLjIxIikKCiMgLS0tLS0tLS0tLSAyLiByb290IGJ1aWxkOiBubyBzZWNyZXRzIC8gZ29vZ2xlLXNlcnZpY2VzIC0tLS0tLS0tLS0KcCA9ICJidWlsZC5ncmFkbGUua3RzIgpzID0gb3BlbihwLCBlbmNvZGluZz0idXRmLTgiKS5yZWFkKCkKcyA9ICJcbiIuam9pbihsIGZvciBsIGluIHMuc3BsaXQoIlxuIikKICAgICAgICAgICAgICBpZiAibGlicy5wbHVnaW5zLnNlY3JldHMiIG5vdCBpbiBsIGFuZCAibGlicy5wbHVnaW5zLmdvb2dsZS5zZXJ2aWNlcyIgbm90IGluIGwpCm9wZW4ocCwgInciLCBlbmNvZGluZz0idXRmLTgiKS53cml0ZShzKQpwcmludCgiWzJdIHJvb3QgYnVpbGQgY2xlYW5lZCIpCgojIC0tLS0tLS0tLS0gMy4gYXBwIGJ1aWxkOiBwbHVnaW5zLCBjb21waWxlU2RrLCBuZGsgLS0tLS0tLS0tLQpwID0gImFwcC9idWlsZC5ncmFkbGUua3RzIgpzID0gb3BlbihwLCBlbmNvZGluZz0idXRmLTgiKS5yZWFkKCkKcyA9ICJcbiIuam9pbihsIGZvciBsIGluIHMuc3BsaXQoIlxuIikKICAgICAgICAgICAgICBpZiAiYWxpYXMobGlicy5wbHVnaW5zLnNlY3JldHMpIiBub3QgaW4gbAogICAgICAgICAgICAgIGFuZCAiYWxpYXMobGlicy5wbHVnaW5zLmdvb2dsZS5zZXJ2aWNlcykiIG5vdCBpbiBsCiAgICAgICAgICAgICAgYW5kICJNaXNzaW5nR29vZ2xlU2VydmljZXNTdHJhdGVneSIgbm90IGluIGwpCnMgPSByZS5zdWIocidjb21waWxlU2RrIFx7IHZlcnNpb24gPSByZWxlYXNlXCgoXGQrKVwpIFx7IG1pbm9yQXBpTGV2ZWwgPSBcZCsgXH0gXH0nLCByJ2NvbXBpbGVTZGsgPSBcMScsIHMpCnMgPSBzLnJlcGxhY2UoImNvbXBpbGVTZGsgPSAzNiIsICJjb21waWxlU2RrID0gMzUiKQppZiAibmRrVmVyc2lvbiIgbm90IGluIHM6CiAgICBzID0gcy5yZXBsYWNlKCJjb21waWxlU2RrID0gMzUiLCAnY29tcGlsZVNkayA9IDM1XG4gIG5ka1ZlcnNpb24gPSAiMjcuMC4xMjA3Nzk3MyInKQpvcGVuKHAsICJ3IiwgZW5jb2Rpbmc9InV0Zi04Iikud3JpdGUocykKcHJpbnQoIlszXSBhcHAgYnVpbGQ6IGNvbXBpbGVTZGsgMzUgKyBuZGsgMjciKQoKIyAtLS0tLS0tLS0tIDQuIENNYWtlOiBicmluZyBiYWNrIHRoZSBvcnBoYW5lZCBNMSBzb3VyY2VzIC0tLS0tLS0tLS0KcCA9ICJhcHAvc3JjL21haW4vY3BwL0NNYWtlTGlzdHMudHh0IgpzID0gb3BlbihwLCBlbmNvZGluZz0idXRmLTgiKS5yZWFkKCkKaWYgInNyYy9wcm9wX2FyZWEuY3BwIiBub3QgaW4gczoKICAgIHMgPSBzLnJlcGxhY2UoIiAgICBzcmMvZXh0NF9yZWFkZXIuY3BwXG4iLAogICAgICAgICAgICAgICAgICAiICAgIHNyYy9leHQ0X3JlYWRlci5jcHBcbiAgICBzcmMvZWxmNjRfbG9hZGVyLmNwcFxuIgogICAgICAgICAgICAgICAgICAiICAgIHNyYy9wcm9wX2FyZWEuY3BwXG4gICAgc3JjL3Byb3BlcnR5X3NlcnZpY2UuY3BwXG4iLCAxKQogICAgb3BlbihwLCAidyIsIGVuY29kaW5nPSJ1dGYtOCIpLndyaXRlKHMpCiAgICBwcmludCgiWzRdIENNYWtlOiBwcm9wX2FyZWEgKyBwcm9wZXJ0eV9zZXJ2aWNlICsgZWxmNjRfbG9hZGVyIGFkZGVkIGJhY2siKQplbHNlOgogICAgcHJpbnQoIls0XSBDTWFrZSBhbHJlYWR5IGhhcyB0aGVtIikKCiMgLS0tLS0tLS0tLSA1LiBkcm9wIHRoZSBkdXBsaWNhdGUgSk5JIGNvcHkgaW4gdGVzdHMvIC0tLS0tLS0tLS0KZHVwID0gImFwcC9zcmMvbWFpbi9jcHAvdGVzdHMvaGFzZWViX3ZtX2puaS5jcHAiCmlmIG9zLnBhdGguZXhpc3RzKGR1cCk6CiAgICBvcy5yZW1vdmUoZHVwKQogICAgcHJpbnQoIls1XSByZW1vdmVkIGR1cGxpY2F0ZSB0ZXN0cy9oYXNlZWJfdm1fam5pLmNwcCIpCmVsc2U6CiAgICBwcmludCgiWzVdIG5vIGR1cGxpY2F0ZSIpCgoKIyAtLS0tLS0tLS0tIDcuIHJlbW92ZSB0aGUgc2VjcmV0cyAvIGdvb2dsZVNlcnZpY2VzIGJsb2NrcyAtLS0tLS0tLS0tCnAgPSAiYXBwL2J1aWxkLmdyYWRsZS5rdHMiCnMgPSBvcGVuKHAsIGVuY29kaW5nPSJ1dGYtOCIpLnJlYWQoKQpzID0gcmUuc3ViKHInXG5zZWNyZXRzIFx7W159XSpcfVxuJywgJ1xuJywgcykKcyA9IHJlLnN1YihyJ1xuZ29vZ2xlU2VydmljZXMgXHtbXn1dKlx9XG4nLCAnXG4nLCBzKQpzID0gcmUuc3ViKHInXG4vLyBDb25maWd1cmUgdGhlIFNlY3JldHMgR3JhZGxlIFBsdWdpblteXG5dKlxuLy8gdG8gbWF0Y2ggdGhlIGNvbnZlbnRpb24gdXNlZCBpbiBXZWIgcHJvamVjdHNcLlxuJywgJ1xuJywgcykKb3BlbihwLCAidyIsIGVuY29kaW5nPSJ1dGYtOCIpLndyaXRlKHMpCmxlZnQgPSBbbCBmb3IgbCBpbiBzLnNwbGl0KCJcbiIpIGlmICJzZWNyZXRzIiBpbiBsIG9yICJnb29nbGVTZXJ2aWNlcyIgaW4gbF0KcHJpbnQoIls3XSBzZWNyZXRzL2dvb2dsZVNlcnZpY2VzIGJsb2NrcyByZW1vdmVkOyBsZWZ0b3ZlcnM6IiwgbGVmdCBpZiBsZWZ0IGVsc2UgIm5vbmUiKQoKIyAtLS0tLS0tLS0tIDguIGNsZWFuIHRoZSBqdW5rIGNvbW1pdHRlZCBieSB0aGUgbGFzdCBydW4gLS0tLS0tLS0tLQpmb3IganVuayBpbiBbImdyYWRsZS04LjkiLCAiZ3JhZGxlLnppcCIsICJidWlsZC5sb2ciLCAiYnVpbGQtZnVsbC5sb2ciLCAiY2kubG9nIiwgImxvY2FsLnByb3BlcnRpZXMiXToKICAgIGlmIG9zLnBhdGguZXhpc3RzKGp1bmspOgogICAgICAgIHNoKCJnaXQgcm0gLXIgLS1jYWNoZWQgIiArIGp1bmsgKyAiID4vZGV2L251bGwgMj4mMSIpCiAgICAgICAgc2goInJtIC1yZiAiICsganVuaykKICAgICAgICBwcmludCgiWzhdIGNsZWFuZWQiLCBqdW5rKQoKZ2kgPSAiLmdpdGlnbm9yZSIKY3VyID0gb3BlbihnaSwgZW5jb2Rpbmc9InV0Zi04IikucmVhZCgpIGlmIG9zLnBhdGguZXhpc3RzKGdpKSBlbHNlICIiCmV4dHJhID0gWyJncmFkbGUtOC45LyIsICJncmFkbGUuemlwIiwgImJ1aWxkLmxvZyIsICJidWlsZC1mdWxsLmxvZyIsICJjaS5sb2ciLCAibG9jYWwucHJvcGVydGllcyJdCndpdGggb3BlbihnaSwgImEiLCBlbmNvZGluZz0idXRmLTgiKSBhcyBmOgogICAgZm9yIGUgaW4gZXh0cmE6CiAgICAgICAgaWYgZSBub3QgaW4gY3VyOgogICAgICAgICAgICBmLndyaXRlKGUgKyAiXG4iKQpwcmludCgiWzhdIC5naXRpZ25vcmUgdXBkYXRlZCIpCgoKIyAtLS0tLS0tLS0tIDkuIGdyYWRsZS5wcm9wZXJ0aWVzOiBhbmRyb2lkeCArIGRyb3AgY29uZmlnIGNhY2hlIC0tLS0tLS0tLS0KcCA9ICJncmFkbGUucHJvcGVydGllcyIKcyA9IG9wZW4ocCwgZW5jb2Rpbmc9InV0Zi04IikucmVhZCgpIGlmIG9zLnBhdGguZXhpc3RzKHApIGVsc2UgIiIKYWRkX2xpbmVzID0gW10KaWYgImFuZHJvaWQudXNlQW5kcm9pZFgiIG5vdCBpbiBzOgogICAgYWRkX2xpbmVzLmFwcGVuZCgiYW5kcm9pZC51c2VBbmRyb2lkWD10cnVlIikKaWYgImFuZHJvaWQuZW5hYmxlSmV0aWZpZXIiIG5vdCBpbiBzOgogICAgYWRkX2xpbmVzLmFwcGVuZCgiYW5kcm9pZC5lbmFibGVKZXRpZmllcj10cnVlIikKIyB0aGUgY29uZmlndXJhdGlvbiBjYWNoZSB0cmlwcyBvdmVyIEFHUCB0YXNrczsga2VlcCBpdCBvZmYgZm9yIENJCnMgPSBzLnJlcGxhY2UoIm9yZy5ncmFkbGUuY29uZmlndXJhdGlvbi1jYWNoZT10cnVlIiwgIm9yZy5ncmFkbGUuY29uZmlndXJhdGlvbi1jYWNoZT1mYWxzZSIpCmlmICJvcmcuZ3JhZGxlLmNvbmZpZ3VyYXRpb24tY2FjaGUiIG5vdCBpbiBzOgogICAgYWRkX2xpbmVzLmFwcGVuZCgib3JnLmdyYWRsZS5jb25maWd1cmF0aW9uLWNhY2hlPWZhbHNlIikKaWYgImFuZHJvaWQubm9uVHJhbnNpdGl2ZVJDbGFzcyIgbm90IGluIHM6CiAgICBhZGRfbGluZXMuYXBwZW5kKCJhbmRyb2lkLm5vblRyYW5zaXRpdmVSQ2xhc3M9dHJ1ZSIpCmlmIGFkZF9saW5lczoKICAgIHMgPSBzLnJzdHJpcCgpICsgIlxuIiArICJcbiIuam9pbihhZGRfbGluZXMpICsgIlxuIgogICAgb3BlbihwLCAidyIsIGVuY29kaW5nPSJ1dGYtOCIpLndyaXRlKHMpCnByaW50KCJbOV0gZ3JhZGxlLnByb3BlcnRpZXM6IiwgYWRkX2xpbmVzIGlmIGFkZF9saW5lcyBlbHNlICJhbHJlYWR5IG9rIikKCiMgLS0tLS0tLS0tLSA2LiByZXBvcnQgLS0tLS0tLS0tLQpwcmludCgiXG4tLS0gcmVzdWx0IC0tLSIpCmZvciBsIGluIG9wZW4oImFwcC9idWlsZC5ncmFkbGUua3RzIiwgZW5jb2Rpbmc9InV0Zi04Iik6CiAgICBpZiBhbnkoayBpbiBsIGZvciBrIGluICgiY29tcGlsZVNkayIsICJuZGtWZXJzaW9uIiwgImFsaWFzKGxpYnMucGx1Z2lucyIpKToKICAgICAgICBwcmludCgiICAgIiwgbC5yc3RyaXAoKSkKcHJpbnQoIiAgIENNYWtlIGNvcmUgc291cmNlczoiKQpmb3IgbCBpbiBvcGVuKHAsIGVuY29kaW5nPSJ1dGYtOCIpOgogICAgaWYgInNyYy8iIGluIGwgYW5kICIuY3BwIiBpbiBsOgogICAgICAgIHByaW50KCIgICAgICIsIGwuc3RyaXAoKSkK' | base64 -d > /tmp/fix.py
-          python3 /tmp/fix.py 2>&1 | tee -a /tmp/all.log
-
-      - name: Android SDK + NDK + CMake
-        run: |
-          set +e
-          SDK=$HOME/android-sdk
-          mkdir -p "$SDK/cmdline-tools"; cd "$SDK"
-          curl -sSLo clt.zip https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip >> /tmp/all.log 2>&1
-          unzip -q clt.zip -d cmdline-tools >> /tmp/all.log 2>&1
-          mv cmdline-tools/cmdline-tools cmdline-tools/latest 2>> /tmp/all.log
-          yes 2>/dev/null | cmdline-tools/latest/bin/sdkmanager --sdk_root="$SDK" --licenses > /dev/null 2>&1
-          cmdline-tools/latest/bin/sdkmanager --sdk_root="$SDK" "platforms;android-35" "build-tools;35.0.0" "ndk;27.0.12077973" "cmake;3.22.1" >> /tmp/all.log 2>&1
-          echo "SDK_INSTALL=$?" >> /tmp/all.log
-          echo "ANDROID_HOME=$SDK" >> $GITHUB_ENV
-          echo "ANDROID_SDK_ROOT=$SDK" >> $GITHUB_ENV
-          cd "$GITHUB_WORKSPACE"
-          echo "sdk.dir=$SDK" > local.properties
-
-      - name: Gradle (installed outside the repo)
-        run: |
-          set +e
-          curl -sSLo /tmp/gradle.zip https://services.gradle.org/distributions/gradle-8.9-bin.zip >> /tmp/all.log 2>&1
-          echo "GRADLE_DL=$?" >> /tmp/all.log
-          unzip -q /tmp/gradle.zip -d /opt >> /tmp/all.log 2>&1
-          echo "GRADLE_UNZIP=$?" >> /tmp/all.log
-          echo "/opt/gradle-8.9/bin" >> $GITHUB_PATH
-
-      - name: Build
-        run: |
-          set +e
-          gradle --no-daemon assembleDebug > /tmp/build.log 2>&1
-          echo "GRADLE_BUILD=$?" >> /tmp/all.log
-          grep -nE "(^|: )e: |error:|FAILURE:|What went wrong|CMake Error|undefined reference" /tmp/build.log | grep -v "note:" | head -25 | while IFS= read -r l; do echo "::error::$l"; done
-          ls -lh app/build/outputs/apk/debug/ 2>/dev/null
-
-      - name: Report
-        if: always()
-        run: |
-          set +e
-          ERR=$(grep -m3 -E "(^|: )e: |error:|FAILURE:|What went wrong|CMake Error|undefined reference|GRADLE_BUILD|SDK_INSTALL" /tmp/all.log /tmp/build.log 2>/dev/null | grep -v "note:" | head -3 | tr '\n' ' ' | cut -c1-170)
-          [ -z "$ERR" ] && ERR="build-ok-or-no-error-line"
-          cp /tmp/all.log ci.log 2>/dev/null; cp /tmp/build.log build-full.log 2>/dev/null
-          git config user.name "ci-bot"; git config user.email "ci-bot@users.noreply.github.com"
-          git add -f ci.log build-full.log app/build.gradle.kts gradle/libs.versions.toml build.gradle.kts app/src/main/cpp/CMakeLists.txt .gitignore 2>/dev/null
-          git add -A 2>/dev/null
-          git commit -m "CI: $ERR" 2>&1 | head -3
-          git pull --rebase --autostash 2>&1 | head -3
-          git push 2>&1 | head -5
-
-      - name: Publish APK
-        if: success()
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: apk-${{ github.run_number }}
-          name: HASEEB GAMING ${{ github.run_number }}
-          files: app/build/outputs/apk/debug/*.apk
-          prerelease: true
+    uses: ./.github/workflows/build-apk.yml
+    with:
+      create_release: ${{ inputs.create_release }}
+    secrets: inherit
