@@ -553,6 +553,98 @@ void TestLoadStoreSimdStructAndBionicNeon() {
     std::cout << "[PASS] TestLoadStoreSimdStructAndBionicNeon\n";
 }
 
+void TestExtendedAdvSimdShiftAndMisc() {
+    GuestRam ram;
+    MmioBus bus;
+    HASEEB_CHECK(ram.Allocate(kGuestRamBase, 16ULL * 1024ULL * 1024ULL) == VmError::Ok);
+
+    AArch64CpuCore cpu(ram, bus, 0);
+    const uint64_t code_addr = kGuestRamBase;
+
+    std::vector<uint32_t> code;
+    // Seed V1 with 16 bytes: low 8 bytes = [0x80, 0x05, 0xFF, 0x10, 0x01, 0x02, 0x03, 0x04]
+    // high 8 bytes = [0xFE, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80]
+    EmitImm64(code, 0, 0x0403020110FF0580ULL);
+    EmitImm64(code, 1, 0x80706050403020FEULL);
+    code.push_back(0x9E670001u); // FMOV D1, X0
+    code.push_back(0x4E081C21u); // INS V1.D[1], X1 (Wait: INS Vd.D[1], Xn = 0x4E181C21 -> imm5=11000=0x18!)
+    code.pop_back();
+    code.push_back(0x4E181C21u); // INS V1.D[1], X1
+
+    // Save original V1 into V20 (ORR V20.16B, V1.16B, V1.16B = 0x4EA11C34)
+    code.push_back(0x4EA11C34u);
+
+    // 1. Exact instruction from insns=753495 trap:
+    //    0x2F08A421 = UXTL V1.8H, V1.8B (USHLL V1.8H, V1.8B, #0, rd == rn == 1!)
+    //    V1.H[0] = 0x0080, V1.H[2] = 0x00FF
+    code.push_back(0x2F08A421u);
+    code.push_back(0x0E023C22u); // UMOV W2, V1.H[0] -> 0x0080
+    code.push_back(0x0E0A3C23u); // UMOV W3, V1.H[2] -> 0x00FF
+
+    // 2. USHLL2 V2.8H, V20.16B, #0 (0x6F08A682) -> V2.H[0] = 0x00FE, V2.H[1] = 0x0020
+    code.push_back(0x6F08A682u);
+    code.push_back(0x0E023C44u); // UMOV W4, V2.H[0] -> 0x00FE
+
+    // 3. SSHLL V3.8H, V20.8B, #0 (SXTL: 0x0F08A683) -> V3.H[0] = 0xFF80 (-128)
+    code.push_back(0x0F08A683u);
+    code.push_back(0x0E023C65u); // UMOV W5, V3.H[0] -> 0xFF80
+
+    // 4. USHLL V4.4S, V2.4H, #3 (0x2F13A444) -> V4.S[0] = 0x00FE << 3 = 0x07F0
+    code.push_back(0x2F13A444u);
+    code.push_back(0x0E043C86u); // UMOV W6, V4.S[0] -> 0x07F0
+
+    // 5. SHLL V5.8H, V20.8B, #8 (0x2E213A85) -> V5.H[0] = 0x8000
+    code.push_back(0x2E213A85u);
+    code.push_back(0x0E023CA7u); // UMOV W7, V5.H[0] -> 0x8000
+
+    // 6. RSHRN V6.8B, V1.8H, #4 (0x0F0C8C26): V1.H[0]=0x0080 -> (0x80+8)>>4 = 8; V1.H[2]=0x00FF -> (0xFF+8)>>4 = 0x10
+    code.push_back(0x0F0C8C26u);
+    code.push_back(0x0E013CC8u); // UMOV W8, V6.B[0] -> 8
+    code.push_back(0x0E053CC9u); // UMOV W9, V6.B[2] -> 0x10
+
+    // 7. SRI V6.8B, V20.8B, #4 (0x2F0C4686): V6.B[0]=0x08 (top 4 bits 0), V20.B[0]=0x80 >> 4 = 0x08 -> (0x08 & 0xF0) | 0x08 = 0x08;
+    //    V6.B[2]=0x10 (top 4 bits 0x10), V20.B[2]=0xFF >> 4 = 0x0F -> 0x1F
+    code.push_back(0x2F0C4686u);
+    code.push_back(0x0E053CCAu); // UMOV W10, V6.B[2] -> 0x1F
+
+    // 8. REV16 V7.8B, V20.8B (0x0E201A87) -> [0x05, 0x80, ...] -> H[0] = 0x8005
+    code.push_back(0x0E201A87u);
+    code.push_back(0x0E023CEBu); // UMOV W11, V7.H[0] -> 0x8005
+
+    // 9. CLZ V8.8B, V20.8B (0x2E204A88) -> V20.B[4]=0x01 -> clz=7
+    code.push_back(0x2E204A88u);
+    code.push_back(0x0E093D0Cu); // UMOV W12, V8.B[4] -> 7
+
+    // 10. ADDP D9, V20.2D (0x5EF1BA89) -> 0x0403020110FF0580 + 0x80706050403020FE
+    code.push_back(0x5EF1BA89u);
+    code.push_back(0x9E66012Du); // FMOV X13, D9
+
+    // 11. XTN V10.8B, V1.8H (0x0E21282A) -> V10.B[0]=0x80, V10.B[2]=0xFF
+    code.push_back(0x0E21282Au);
+    code.push_back(0x0E013D4Eu); // UMOV W14, V10.B[0] -> 0x80
+    code.push_back(Hlt(0));
+
+    ram.WriteBytes(code_addr, code.data(), code.size() * 4u);
+    cpu.Reset(code_addr, kGuestRamBase + 0x80000ULL, 1);
+    HASEEB_CHECK(cpu.Run(1000) == VmError::Ok);
+    HASEEB_CHECK(cpu.State().halted);
+    HASEEB_CHECK(cpu.State().x[2] == 0x0080ULL);
+    HASEEB_CHECK(cpu.State().x[3] == 0x00FFULL);
+    HASEEB_CHECK(cpu.State().x[4] == 0x00FEULL);
+    HASEEB_CHECK(cpu.State().x[5] == 0xFF80ULL);
+    HASEEB_CHECK(cpu.State().x[6] == 0x07F0ULL);
+    HASEEB_CHECK(cpu.State().x[7] == 0x8000ULL);
+    HASEEB_CHECK(cpu.State().x[8] == 8ULL);
+    HASEEB_CHECK(cpu.State().x[9] == 0x10ULL);
+    HASEEB_CHECK(cpu.State().x[10] == 0x1FULL);
+    HASEEB_CHECK(cpu.State().x[11] == 0x8005ULL);
+    HASEEB_CHECK(cpu.State().x[12] == 7ULL);
+    HASEEB_CHECK(cpu.State().x[13] == (0x0403020110FF0580ULL + 0x80706050403020FEULL));
+    HASEEB_CHECK(cpu.State().x[14] == 0x80ULL);
+
+    std::cout << "[PASS] TestExtendedAdvSimdShiftAndMisc\n";
+}
+
 } // namespace
 
 int main() {
@@ -562,6 +654,7 @@ int main() {
     TestEl0El1ExceptionsSysregsAndSmc();
     TestLinkerNeonAndTrace();
     TestLoadStoreSimdStructAndBionicNeon();
+    TestExtendedAdvSimdShiftAndMisc();
     std::cout << "All M2 AArch64 CPU, DBT, MMU & Exception tests PASSED.\n";
     return 0;
 }

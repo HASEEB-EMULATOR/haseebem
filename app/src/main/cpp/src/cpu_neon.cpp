@@ -34,6 +34,44 @@ uint32_t ClampToUint32(double v) {
     return static_cast<uint32_t>(v);
 }
 
+int64_t Ashr64(int64_t v, uint32_t s) {
+    if (s >= 64u) return (v < 0) ? -1LL : 0LL;
+    return v >> s;
+}
+
+uint64_t Lshr64(uint64_t v, uint32_t s) {
+    if (s >= 64u) return 0ULL;
+    return v >> s;
+}
+
+int64_t AshrRound64(int64_t v, uint32_t s) {
+    if (s == 0u) return v;
+    return Ashr64(v, s) + (Ashr64(v, s - 1u) & 1LL);
+}
+
+uint64_t LshrRound64(uint64_t v, uint32_t s) {
+    if (s == 0u) return v;
+    return Lshr64(v, s) + (Lshr64(v, s - 1u) & 1ULL);
+}
+
+uint32_t VfpExpandImm32(uint8_t imm8) {
+    const uint32_t sign = (imm8 >> 7) & 1u;
+    const uint32_t exp_top = ((imm8 >> 6) & 1u) ^ 1u;
+    const uint32_t rep = ((imm8 >> 6) & 1u) ? 0x1Fu : 0u;
+    const uint32_t exp_rest = (imm8 >> 4) & 3u;
+    const uint32_t mant = imm8 & 0xFu;
+    return (sign << 31) | (exp_top << 30) | (rep << 25) | (exp_rest << 23) | (mant << 19);
+}
+
+uint64_t VfpExpandImm64(uint8_t imm8) {
+    const uint64_t sign = (imm8 >> 7) & 1u;
+    const uint64_t exp_top = ((imm8 >> 6) & 1u) ^ 1u;
+    const uint64_t rep = ((imm8 >> 6) & 1u) ? 0xFFULL : 0ULL;
+    const uint64_t exp_rest = (imm8 >> 4) & 3u;
+    const uint64_t mant = imm8 & 0xFu;
+    return (sign << 63) | (exp_top << 62) | (rep << 54) | (exp_rest << 52) | (mant << 48);
+}
+
 } // namespace
 
 bool AArch64CpuCore::CheckFpSimdEnabled() {
@@ -365,6 +403,23 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
             }
             uint64_t p16 = v16;
             pattern64 = p16 | (p16 << 16) | (p16 << 32) | (p16 << 48);
+        } else if ((cmode & 0xEu) == 0xCu) {
+            // MOVI / MVNI with MSL (1-fill shift 8 or 16)
+            uint32_t v32 = (cmode == 0xCu)
+                ? ((static_cast<uint32_t>(imm8) << 8) | 0xFFu)
+                : ((static_cast<uint32_t>(imm8) << 16) | 0xFFFFu);
+            if (op != 0u) v32 = ~v32;
+            pattern64 = (static_cast<uint64_t>(v32) << 32) | v32;
+        } else if (cmode == 0xFu) {
+            if (op == 0u) {
+                uint64_t b32 = VfpExpandImm32(static_cast<uint8_t>(imm8));
+                pattern64 = (b32 << 32) | b32;
+            } else if (q) {
+                pattern64 = VfpExpandImm64(static_cast<uint8_t>(imm8));
+            } else {
+                RaiseException(ec::kUnknown, 0, 0, false, state_.pc);
+                return false;
+            }
         } else {
             pattern64 = imm8 * 0x0101010101010101ULL;
         }
@@ -397,74 +452,146 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
         else if (immh & 2u) esize = 1u;
         else esize = 0u;
 
-        if (u == 0u && opcode == 0x10u) {
-            // SHRN / SHRN2: right-shift 2*elem_bits elements into low/high 64 bits
+        if (u == 0u && (opcode == 0x10u || opcode == 0x11u) && esize <= 2u) {
+            // SHRN / SHRN2 (0x10) & RSHRN / RSHRN2 (0x11): right-shift 2*elem_bits elements into low/high 64 bits
             const uint32_t shift = (16u << esize) - imm7;
+            const bool rounding = (opcode == 0x11u);
             NeonReg out = q ? state_.v[rd] : NeonReg{};
             const uint32_t byte_off = q ? 8u : 0u;
             if (esize == 0u) {
-                for (uint32_t i = 0; i < 8u; ++i) out.u8[byte_off + i] = static_cast<uint8_t>(src_v.u16[i] >> shift);
+                for (uint32_t i = 0; i < 8u; ++i) {
+                    uint64_t v = src_v.u16[i];
+                    out.u8[byte_off + i] = static_cast<uint8_t>(rounding ? LshrRound64(v, shift) : Lshr64(v, shift));
+                }
             } else if (esize == 1u) {
-                for (uint32_t i = 0; i < 4u; ++i) out.u16[(byte_off / 2u) + i] = static_cast<uint16_t>(src_v.u32[i] >> shift);
-            } else if (esize == 2u) {
-                for (uint32_t i = 0; i < 2u; ++i) out.u32[(byte_off / 4u) + i] = static_cast<uint32_t>(src_v.u64[i] >> shift);
+                for (uint32_t i = 0; i < 4u; ++i) {
+                    uint64_t v = src_v.u32[i];
+                    out.u16[(byte_off / 2u) + i] = static_cast<uint16_t>(rounding ? LshrRound64(v, shift) : Lshr64(v, shift));
+                }
+            } else {
+                for (uint32_t i = 0; i < 2u; ++i) {
+                    uint64_t v = src_v.u64[i];
+                    out.u32[(byte_off / 4u) + i] = static_cast<uint32_t>(rounding ? LshrRound64(v, shift) : Lshr64(v, shift));
+                }
             }
             if (!q) out.u64[1] = 0ULL;
             state_.v[rd] = out;
             return true;
         }
-        if (opcode == 0x00u || opcode == 0x0Au) {
+        if (opcode == 0x14u && esize <= 2u) {
+            // SSHLL / SSHLL2 (u=0, alias SXTL/SXTL2 when shift==0) & USHLL / USHLL2 (u=1, alias UXTL/UXTL2)
+            const uint32_t shift = imm7 - (8u << esize);
+            const bool is_unsigned = (u == 1u);
+            NeonReg out{};
+            if (esize == 0u) {
+                const uint32_t src_off = q ? 8u : 0u;
+                for (uint32_t i = 0; i < 8u; ++i) {
+                    uint16_t ext = is_unsigned
+                        ? static_cast<uint16_t>(src_v.u8[src_off + i])
+                        : static_cast<uint16_t>(static_cast<int16_t>(src_v.i8[src_off + i]));
+                    out.u16[i] = static_cast<uint16_t>(ext << shift);
+                }
+            } else if (esize == 1u) {
+                const uint32_t src_off = q ? 4u : 0u;
+                for (uint32_t i = 0; i < 4u; ++i) {
+                    uint32_t ext = is_unsigned
+                        ? static_cast<uint32_t>(src_v.u16[src_off + i])
+                        : static_cast<uint32_t>(static_cast<int32_t>(src_v.i16[src_off + i]));
+                    out.u32[i] = ext << shift;
+                }
+            } else {
+                const uint32_t src_off = q ? 2u : 0u;
+                for (uint32_t i = 0; i < 2u; ++i) {
+                    uint64_t ext = is_unsigned
+                        ? static_cast<uint64_t>(src_v.u32[src_off + i])
+                        : static_cast<uint64_t>(static_cast<int64_t>(src_v.i32[src_off + i]));
+                    out.u64[i] = ext << shift;
+                }
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+        if (opcode == 0x00u || opcode == 0x02u || opcode == 0x04u || opcode == 0x06u ||
+            (u == 1u && opcode == 0x08u) || opcode == 0x0Au) {
             const bool is_left = (opcode == 0x0Au);
             const uint32_t shift = is_left ? (imm7 - (8u << esize)) : ((16u << esize) - imm7);
             const bool is_signed = !is_left && (u == 0u);
-            const bool insert_left = is_left && (u == 1u); // SLI
-            NeonReg out = insert_left ? state_.v[rd] : NeonReg{};
+            const bool is_rounding = (opcode == 0x04u || opcode == 0x06u);
+            const bool is_accum = (opcode == 0x02u || opcode == 0x06u);
+            const bool insert_right = (u == 1u && opcode == 0x08u); // SRI
+            const bool insert_left = is_left && (u == 1u);         // SLI
+            NeonReg out = (insert_left || insert_right || is_accum) ? state_.v[rd] : NeonReg{};
+            if (!q && (insert_left || insert_right || is_accum)) out.u64[1] = 0ULL;
             if (esize == 0u) {
-                const uint8_t mask = insert_left ? static_cast<uint8_t>((1u << shift) - 1u) : 0u;
+                const uint8_t sri_keep = (shift >= 8u) ? 0xFFu : static_cast<uint8_t>(0xFFu ^ (0xFFu >> shift));
+                const uint8_t sli_mask = insert_left ? static_cast<uint8_t>((1u << shift) - 1u) : 0u;
                 for (uint32_t i = 0; i < lanes_bytes; ++i) {
                     if (is_left) {
                         uint8_t v = static_cast<uint8_t>(src_v.u8[i] << shift);
-                        out.u8[i] = insert_left ? static_cast<uint8_t>((out.u8[i] & mask) | v) : v;
+                        out.u8[i] = insert_left ? static_cast<uint8_t>((out.u8[i] & sli_mask) | v) : v;
+                    } else if (insert_right) {
+                        uint8_t v = static_cast<uint8_t>(Lshr64(src_v.u8[i], shift));
+                        out.u8[i] = static_cast<uint8_t>((out.u8[i] & sri_keep) | (v & ~sri_keep));
                     } else if (is_signed) {
-                        out.i8[i] = static_cast<int8_t>(src_v.i8[i] >> shift);
+                        int64_t r = is_rounding ? AshrRound64(src_v.i8[i], shift) : Ashr64(src_v.i8[i], shift);
+                        out.i8[i] = is_accum ? static_cast<int8_t>(out.i8[i] + r) : static_cast<int8_t>(r);
                     } else {
-                        out.u8[i] = static_cast<uint8_t>(src_v.u8[i] >> shift);
+                        uint64_t r = is_rounding ? LshrRound64(src_v.u8[i], shift) : Lshr64(src_v.u8[i], shift);
+                        out.u8[i] = is_accum ? static_cast<uint8_t>(out.u8[i] + r) : static_cast<uint8_t>(r);
                     }
                 }
             } else if (esize == 1u) {
-                const uint16_t mask = insert_left ? static_cast<uint16_t>((1u << shift) - 1u) : 0u;
+                const uint16_t sri_keep = (shift >= 16u) ? 0xFFFFu : static_cast<uint16_t>(0xFFFFu ^ (0xFFFFu >> shift));
+                const uint16_t sli_mask = insert_left ? static_cast<uint16_t>((1u << shift) - 1u) : 0u;
                 for (uint32_t i = 0; i < lanes_bytes / 2u; ++i) {
                     if (is_left) {
                         uint16_t v = static_cast<uint16_t>(src_v.u16[i] << shift);
-                        out.u16[i] = insert_left ? static_cast<uint16_t>((out.u16[i] & mask) | v) : v;
+                        out.u16[i] = insert_left ? static_cast<uint16_t>((out.u16[i] & sli_mask) | v) : v;
+                    } else if (insert_right) {
+                        uint16_t v = static_cast<uint16_t>(Lshr64(src_v.u16[i], shift));
+                        out.u16[i] = static_cast<uint16_t>((out.u16[i] & sri_keep) | (v & ~sri_keep));
                     } else if (is_signed) {
-                        out.i16[i] = static_cast<int16_t>(src_v.i16[i] >> shift);
+                        int64_t r = is_rounding ? AshrRound64(src_v.i16[i], shift) : Ashr64(src_v.i16[i], shift);
+                        out.i16[i] = is_accum ? static_cast<int16_t>(out.i16[i] + r) : static_cast<int16_t>(r);
                     } else {
-                        out.u16[i] = static_cast<uint16_t>(src_v.u16[i] >> shift);
+                        uint64_t r = is_rounding ? LshrRound64(src_v.u16[i], shift) : Lshr64(src_v.u16[i], shift);
+                        out.u16[i] = is_accum ? static_cast<uint16_t>(out.u16[i] + r) : static_cast<uint16_t>(r);
                     }
                 }
             } else if (esize == 2u) {
-                const uint32_t mask = insert_left ? ((1u << shift) - 1u) : 0u;
+                const uint32_t sri_keep = (shift >= 32u) ? 0xFFFFFFFFu : (0xFFFFFFFFu ^ (0xFFFFFFFFu >> shift));
+                const uint32_t sli_mask = insert_left ? ((1u << shift) - 1u) : 0u;
                 for (uint32_t i = 0; i < lanes_bytes / 4u; ++i) {
                     if (is_left) {
                         uint32_t v = src_v.u32[i] << shift;
-                        out.u32[i] = insert_left ? ((out.u32[i] & mask) | v) : v;
+                        out.u32[i] = insert_left ? ((out.u32[i] & sli_mask) | v) : v;
+                    } else if (insert_right) {
+                        uint32_t v = static_cast<uint32_t>(Lshr64(src_v.u32[i], shift));
+                        out.u32[i] = (out.u32[i] & sri_keep) | (v & ~sri_keep);
                     } else if (is_signed) {
-                        out.i32[i] = src_v.i32[i] >> shift;
+                        int64_t r = is_rounding ? AshrRound64(src_v.i32[i], shift) : Ashr64(src_v.i32[i], shift);
+                        out.i32[i] = is_accum ? static_cast<int32_t>(out.i32[i] + r) : static_cast<int32_t>(r);
                     } else {
-                        out.u32[i] = src_v.u32[i] >> shift;
+                        uint64_t r = is_rounding ? LshrRound64(src_v.u32[i], shift) : Lshr64(src_v.u32[i], shift);
+                        out.u32[i] = is_accum ? static_cast<uint32_t>(out.u32[i] + r) : static_cast<uint32_t>(r);
                     }
                 }
             } else {
-                const uint64_t mask = insert_left ? ((shift == 64u) ? ~0ULL : ((1ULL << shift) - 1ULL)) : 0ULL;
+                const uint64_t sri_keep = (shift >= 64u) ? ~0ULL : (~0ULL ^ (~0ULL >> shift));
+                const uint64_t sli_mask = insert_left ? ((shift == 64u) ? ~0ULL : ((1ULL << shift) - 1ULL)) : 0ULL;
                 for (uint32_t i = 0; i < lanes_bytes / 8u; ++i) {
                     if (is_left) {
-                        uint64_t v = src_v.u64[i] << shift;
-                        out.u64[i] = insert_left ? ((out.u64[i] & mask) | v) : v;
+                        uint64_t v = (shift >= 64u) ? 0ULL : (src_v.u64[i] << shift);
+                        out.u64[i] = insert_left ? ((out.u64[i] & sli_mask) | v) : v;
+                    } else if (insert_right) {
+                        uint64_t v = Lshr64(src_v.u64[i], shift);
+                        out.u64[i] = (out.u64[i] & sri_keep) | (v & ~sri_keep);
                     } else if (is_signed) {
-                        out.i64[i] = src_v.i64[i] >> shift;
+                        int64_t r = is_rounding ? AshrRound64(src_v.i64[i], shift) : Ashr64(src_v.i64[i], shift);
+                        out.i64[i] = is_accum ? (out.i64[i] + r) : r;
                     } else {
-                        out.u64[i] = src_v.u64[i] >> shift;
+                        uint64_t r = is_rounding ? LshrRound64(src_v.u64[i], shift) : Lshr64(src_v.u64[i], shift);
+                        out.u64[i] = is_accum ? (out.u64[i] + r) : r;
                     }
                 }
             }
@@ -752,14 +879,26 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
             return true;
         }
 
-        // Integer MUL (u=0, opcode=0x13)
-        if (u == 0u && opcode == 0x13u) {
+        // Integer MUL (u=0, opcode=0x13) and MLA (u=0, opcode=0x12) / MLS (u=1, opcode=0x12)
+        if ((u == 0u && opcode == 0x13u) || opcode == 0x12u) {
+            const bool is_mul = (opcode == 0x13u);
+            const bool is_sub = (opcode == 0x12u && u == 1u);
+            const NeonReg acc = state_.v[rd];
             if (size == 0u) {
-                for (uint32_t i = 0; i < lanes_bytes; ++i) out.u8[i] = a.u8[i] * b.u8[i];
+                for (uint32_t i = 0; i < lanes_bytes; ++i) {
+                    uint8_t prod = static_cast<uint8_t>(a.u8[i] * b.u8[i]);
+                    out.u8[i] = is_mul ? prod : (is_sub ? static_cast<uint8_t>(acc.u8[i] - prod) : static_cast<uint8_t>(acc.u8[i] + prod));
+                }
             } else if (size == 1u) {
-                for (uint32_t i = 0; i < lanes_bytes / 2u; ++i) out.u16[i] = a.u16[i] * b.u16[i];
+                for (uint32_t i = 0; i < lanes_bytes / 2u; ++i) {
+                    uint16_t prod = static_cast<uint16_t>(a.u16[i] * b.u16[i]);
+                    out.u16[i] = is_mul ? prod : (is_sub ? static_cast<uint16_t>(acc.u16[i] - prod) : static_cast<uint16_t>(acc.u16[i] + prod));
+                }
             } else if (size == 2u) {
-                for (uint32_t i = 0; i < lanes_bytes / 4u; ++i) out.u32[i] = a.u32[i] * b.u32[i];
+                for (uint32_t i = 0; i < lanes_bytes / 4u; ++i) {
+                    uint32_t prod = a.u32[i] * b.u32[i];
+                    out.u32[i] = is_mul ? prod : (is_sub ? (acc.u32[i] - prod) : (acc.u32[i] + prod));
+                }
             }
             state_.v[rd] = out;
             return true;
@@ -851,6 +990,95 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
         }
         state_.v[rd] = out;
         return true;
+    }
+
+    // 3d. AdvSIMD Three Different: SADDL/UADDL, SADDW/UADDW, SSUBL/USUBL, SSUBW/USUBW, SABDL/UABDL, SMULL/UMULL
+    // Encoding: 0 Q U 01110 size 1 Rm opcode(4) 00 Rn Rd
+    if ((insn & 0x9F200C00u) == 0x0E200000u && size <= 2u) {
+        const uint32_t u = (insn >> 29) & 1u;
+        const uint32_t opcode = (insn >> 12) & 0xFu;
+        const bool is_unsigned = (u == 1u);
+        const NeonReg a = state_.v[rn];
+        const NeonReg b = state_.v[rm];
+        NeonReg out{};
+        if (opcode == 0x0u || opcode == 0x1u || opcode == 0x2u || opcode == 0x3u ||
+            opcode == 0x7u || opcode == 0xCu) {
+            const bool is_wide_a = (opcode == 0x1u || opcode == 0x3u);
+            const bool is_sub = (opcode == 0x2u || opcode == 0x3u);
+            const bool is_abd = (opcode == 0x7u);
+            const bool is_mul = (opcode == 0xCu);
+            if (size == 0u) {
+                const uint32_t off = q ? 8u : 0u;
+                for (uint32_t i = 0; i < 8u; ++i) {
+                    if (is_unsigned) {
+                        uint16_t va = is_wide_a ? a.u16[i] : static_cast<uint16_t>(a.u8[off + i]);
+                        uint16_t vb = b.u8[off + i];
+                        if (is_mul) out.u16[i] = static_cast<uint16_t>(va * vb);
+                        else if (is_abd) out.u16[i] = static_cast<uint16_t>(va >= vb ? (va - vb) : (vb - va));
+                        else out.u16[i] = is_sub ? static_cast<uint16_t>(va - vb) : static_cast<uint16_t>(va + vb);
+                    } else {
+                        int16_t va = is_wide_a ? a.i16[i] : static_cast<int16_t>(a.i8[off + i]);
+                        int16_t sb = b.i8[off + i];
+                        if (is_mul) out.i16[i] = static_cast<int16_t>(va * sb);
+                        else if (is_abd) out.i16[i] = static_cast<int16_t>(va >= sb ? (va - sb) : (sb - va));
+                        else out.i16[i] = is_sub ? static_cast<int16_t>(va - sb) : static_cast<int16_t>(va + sb);
+                    }
+                }
+            } else if (size == 1u) {
+                const uint32_t off = q ? 4u : 0u;
+                for (uint32_t i = 0; i < 4u; ++i) {
+                    if (is_unsigned) {
+                        uint32_t va = is_wide_a ? a.u32[i] : static_cast<uint32_t>(a.u16[off + i]);
+                        uint32_t vb = b.u16[off + i];
+                        if (is_mul) out.u32[i] = va * vb;
+                        else if (is_abd) out.u32[i] = (va >= vb) ? (va - vb) : (vb - va);
+                        else out.u32[i] = is_sub ? (va - vb) : (va + vb);
+                    } else {
+                        int32_t va = is_wide_a ? a.i32[i] : static_cast<int32_t>(a.i16[off + i]);
+                        int32_t sb = b.i16[off + i];
+                        if (is_mul) out.i32[i] = va * sb;
+                        else if (is_abd) out.i32[i] = (va >= sb) ? (va - sb) : (sb - va);
+                        else out.i32[i] = is_sub ? (va - sb) : (va + sb);
+                    }
+                }
+            } else {
+                const uint32_t off = q ? 2u : 0u;
+                for (uint32_t i = 0; i < 2u; ++i) {
+                    if (is_unsigned) {
+                        uint64_t va = is_wide_a ? a.u64[i] : static_cast<uint64_t>(a.u32[off + i]);
+                        uint64_t vb = b.u32[off + i];
+                        if (is_mul) out.u64[i] = va * vb;
+                        else if (is_abd) out.u64[i] = (va >= vb) ? (va - vb) : (vb - va);
+                        else out.u64[i] = is_sub ? (va - vb) : (va + vb);
+                    } else {
+                        int64_t va = is_wide_a ? a.i64[i] : static_cast<int64_t>(a.i32[off + i]);
+                        int64_t sb = b.i32[off + i];
+                        if (is_mul) out.i64[i] = va * sb;
+                        else if (is_abd) out.i64[i] = (va >= sb) ? (va - sb) : (sb - va);
+                        else out.i64[i] = is_sub ? (va - sb) : (va + sb);
+                    }
+                }
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+    }
+
+    // 4a. AdvSIMD Scalar Pairwise: ADDP Dd, Vn.2D / FADDP Sd, Vn.2S / FADDP Dd, Vn.2D
+    if ((insn & 0xDF3E0C00u) == 0x5E300800u) {
+        const uint32_t u = (insn >> 29) & 1u;
+        const uint32_t opcode = (insn >> 12) & 0x1Fu;
+        const NeonReg a = state_.v[rn];
+        state_.v[rd] = NeonReg{};
+        if (u == 0u && opcode == 0x1Bu && size == 3u) {
+            state_.v[rd].u64[0] = a.u64[0] + a.u64[1];
+            return true;
+        }
+        if (u == 1u && opcode == 0x0Du) {
+            if ((size & 1u) == 0u) state_.v[rd].f32[0] = a.f32[0] + a.f32[1];
+            else state_.v[rd].f64[0] = a.f64[0] + a.f64[1];
+            return true;
+        }
     }
 
     // 4. AdvSIMD Across Lanes: SADDLV / UADDLV / ADDV / SMAXV / UMAXV / SMINV / UMINV (0 Q U 01110 size 11000 opcode 10 Rn Rd)
@@ -948,7 +1176,8 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
         return true;
     }
 
-    // 6. AdvSIMD Two-reg misc: REV64 / CNT / NOT / RBIT / CMEQ0 / CMGT0 / CMGE0 / CMLT0 / CMLE0 / ABS / NEG
+    // 6. AdvSIMD Two-reg misc: REV64/REV32/REV16, CLS/CLZ, CNT/NOT/RBIT, XTN/SQXTUN/SQXTN/UQXTN,
+    // SHLL, CMEQ0/CMGT0/CMGE0/CMLT0/CMLE0, ABS/NEG, FABS/FNEG, FCMEQ0/FCMGT0/FCMGE0/FCMLT0/FCMLE0, SCVTF/UCVTF, FCVTZS/FCVTZU
     if ((insn & 0x9F3E0C00u) == 0x0E200800u) {
         const uint32_t u = (insn >> 29) & 1u;
         const uint32_t opcode = (insn >> 12) & 0x1Fu;
@@ -965,6 +1194,62 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
                 } else if (size == 2u) {
                     for (uint32_t i = 0; i < 2u; ++i) out.u32[h * 2u + i] = a.u32[h * 2u + (1u - i)];
                 }
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+        if (u == 1u && opcode == 0x00u && (size == 0u || size == 1u)) {
+            // REV32 Vd.T, Vn.T
+            const uint32_t words = q ? 4u : 2u;
+            for (uint32_t w = 0; w < words; ++w) {
+                if (size == 0u) {
+                    for (uint32_t i = 0; i < 4u; ++i) out.u8[w * 4u + i] = a.u8[w * 4u + (3u - i)];
+                } else {
+                    out.u16[w * 2u] = a.u16[w * 2u + 1u];
+                    out.u16[w * 2u + 1u] = a.u16[w * 2u];
+                }
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+        if (u == 0u && opcode == 0x01u && size == 0u) {
+            // REV16 Vd.T, Vn.T
+            const uint32_t halfwords = q ? 8u : 4u;
+            for (uint32_t h = 0; h < halfwords; ++h) {
+                out.u8[h * 2u] = a.u8[h * 2u + 1u];
+                out.u8[h * 2u + 1u] = a.u8[h * 2u];
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+        if (opcode == 0x04u && size < 3u) {
+            // CLS (u=0) / CLZ (u=1)
+            auto clz_n = [](uint32_t val, uint32_t bits) -> uint32_t {
+                uint32_t c = 0;
+                for (int b = static_cast<int>(bits) - 1; b >= 0; --b) {
+                    if ((val >> b) & 1u) break;
+                    ++c;
+                }
+                return c;
+            };
+            auto cls_n = [](uint32_t val, uint32_t bits) -> uint32_t {
+                uint32_t sign_bit = (val >> (bits - 1u)) & 1u;
+                uint32_t c = 0;
+                for (int b = static_cast<int>(bits) - 2; b >= 0; --b) {
+                    if (((val >> b) & 1u) != sign_bit) break;
+                    ++c;
+                }
+                return c;
+            };
+            if (size == 0u) {
+                for (uint32_t i = 0; i < lanes_bytes; ++i)
+                    out.u8[i] = static_cast<uint8_t>((u == 1u) ? clz_n(a.u8[i], 8u) : cls_n(a.u8[i], 8u));
+            } else if (size == 1u) {
+                for (uint32_t i = 0; i < lanes_bytes / 2u; ++i)
+                    out.u16[i] = static_cast<uint16_t>((u == 1u) ? clz_n(a.u16[i], 16u) : cls_n(a.u16[i], 16u));
+            } else {
+                for (uint32_t i = 0; i < lanes_bytes / 4u; ++i)
+                    out.u32[i] = (u == 1u) ? clz_n(a.u32[i], 32u) : cls_n(a.u32[i], 32u);
             }
             state_.v[rd] = out;
             return true;
@@ -992,6 +1277,57 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
                     r = static_cast<uint8_t>((r << 1) | ((b >> bit) & 1u));
                 }
                 out.u8[i] = r;
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+        if ((opcode == 0x12u || opcode == 0x14u) && size < 3u) {
+            // XTN (u=0,op=0x12), SQXTUN (u=1,op=0x12), SQXTN (u=0,op=0x14), UQXTN (u=1,op=0x14)
+            out = q ? state_.v[rd] : NeonReg{};
+            const uint32_t byte_off = q ? 8u : 0u;
+            if (size == 0u) {
+                for (uint32_t i = 0; i < 8u; ++i) {
+                    uint8_t r = 0;
+                    if (opcode == 0x12u && u == 0u) r = static_cast<uint8_t>(a.u16[i]);
+                    else if (opcode == 0x12u && u == 1u) r = static_cast<uint8_t>(std::clamp<int32_t>(a.i16[i], 0, 255));
+                    else if (opcode == 0x14u && u == 0u) r = static_cast<uint8_t>(static_cast<int8_t>(std::clamp<int32_t>(a.i16[i], -128, 127)));
+                    else r = static_cast<uint8_t>(std::min<uint32_t>(a.u16[i], 255u));
+                    out.u8[byte_off + i] = r;
+                }
+            } else if (size == 1u) {
+                for (uint32_t i = 0; i < 4u; ++i) {
+                    uint16_t r = 0;
+                    if (opcode == 0x12u && u == 0u) r = static_cast<uint16_t>(a.u32[i]);
+                    else if (opcode == 0x12u && u == 1u) r = static_cast<uint16_t>(std::clamp<int32_t>(a.i32[i], 0, 65535));
+                    else if (opcode == 0x14u && u == 0u) r = static_cast<uint16_t>(static_cast<int16_t>(std::clamp<int32_t>(a.i32[i], -32768, 32767)));
+                    else r = static_cast<uint16_t>(std::min<uint32_t>(a.u32[i], 65535u));
+                    out.u16[(byte_off / 2u) + i] = r;
+                }
+            } else {
+                for (uint32_t i = 0; i < 2u; ++i) {
+                    uint32_t r = 0;
+                    if (opcode == 0x12u && u == 0u) r = static_cast<uint32_t>(a.u64[i]);
+                    else if (opcode == 0x12u && u == 1u) r = static_cast<uint32_t>(std::clamp<int64_t>(a.i64[i], 0, UINT32_MAX));
+                    else if (opcode == 0x14u && u == 0u) r = static_cast<uint32_t>(static_cast<int32_t>(std::clamp<int64_t>(a.i64[i], INT32_MIN, INT32_MAX)));
+                    else r = static_cast<uint32_t>(std::min<uint64_t>(a.u64[i], UINT32_MAX));
+                    out.u32[(byte_off / 4u) + i] = r;
+                }
+            }
+            if (!q) out.u64[1] = 0ULL;
+            state_.v[rd] = out;
+            return true;
+        }
+        if (u == 1u && opcode == 0x13u && size < 3u) {
+            // SHLL / SHLL2 Vd.Ta, Vn.Tb, #esize (shift left by 8 << size)
+            if (size == 0u) {
+                const uint32_t off = q ? 8u : 0u;
+                for (uint32_t i = 0; i < 8u; ++i) out.u16[i] = static_cast<uint16_t>(a.u8[off + i]) << 8;
+            } else if (size == 1u) {
+                const uint32_t off = q ? 4u : 0u;
+                for (uint32_t i = 0; i < 4u; ++i) out.u32[i] = static_cast<uint32_t>(a.u16[off + i]) << 16;
+            } else {
+                const uint32_t off = q ? 2u : 0u;
+                for (uint32_t i = 0; i < 2u; ++i) out.u64[i] = static_cast<uint64_t>(a.u32[off + i]) << 32;
             }
             state_.v[rd] = out;
             return true;
@@ -1030,6 +1366,64 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
             } else {
                 for (uint32_t i = 0; i < lanes_bytes / 8u; ++i)
                     out.i64[i] = is_neg ? -a.i64[i] : (a.i64[i] < 0 ? -a.i64[i] : a.i64[i]);
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+        if ((opcode == 0x0Cu || opcode == 0x0Du || opcode == 0x0Eu) && (size & 2u) != 0u) {
+            // Floating-point compare to 0.0: FCMGT(u=0,0x0C), FCMGE(u=1,0x0C), FCMEQ(u=0,0x0D), FCMLE(u=1,0x0D), FCMLT(u=0,0x0E)
+            auto fcmp0 = [&](double v) -> bool {
+                if (std::isnan(v)) return false;
+                if (opcode == 0x0Cu) return (u == 0u) ? (v > 0.0) : (v >= 0.0);
+                if (opcode == 0x0Du) return (u == 0u) ? (v == 0.0) : (v <= 0.0);
+                return (u == 0u) ? (v < 0.0) : false;
+            };
+            if ((size & 1u) == 0u) {
+                for (uint32_t i = 0; i < lanes_bytes / 4u; ++i) out.u32[i] = fcmp0(a.f32[i]) ? 0xFFFFFFFFu : 0u;
+            } else if (q) {
+                for (uint32_t i = 0; i < 2u; ++i) out.u64[i] = fcmp0(a.f64[i]) ? ~0ULL : 0ULL;
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+        if (opcode == 0x0Fu && (size & 2u) != 0u) {
+            // Vector FABS (u=0) / FNEG (u=1)
+            if ((size & 1u) == 0u) {
+                for (uint32_t i = 0; i < lanes_bytes / 4u; ++i)
+                    out.f32[i] = (u == 1u) ? -a.f32[i] : std::fabs(a.f32[i]);
+            } else if (q) {
+                for (uint32_t i = 0; i < 2u; ++i)
+                    out.f64[i] = (u == 1u) ? -a.f64[i] : std::fabs(a.f64[i]);
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+        if (opcode == 0x1Du && (size & 2u) == 0u) {
+            // Vector SCVTF (u=0) / UCVTF (u=1)
+            if ((size & 1u) == 0u) {
+                for (uint32_t i = 0; i < lanes_bytes / 4u; ++i) {
+                    out.f32[i] = (u == 1u) ? static_cast<float>(a.u32[i]) : static_cast<float>(a.i32[i]);
+                }
+            } else if (q) {
+                for (uint32_t i = 0; i < 2u; ++i) {
+                    out.f64[i] = (u == 1u) ? static_cast<double>(a.u64[i]) : static_cast<double>(a.i64[i]);
+                }
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+        if (opcode == 0x1Bu && (size & 2u) != 0u) {
+            // Vector FCVTZS (u=0) / FCVTZU (u=1)
+            if ((size & 1u) == 0u) {
+                for (uint32_t i = 0; i < lanes_bytes / 4u; ++i) {
+                    double t = std::trunc(static_cast<double>(a.f32[i]));
+                    out.u32[i] = (u == 1u) ? ClampToUint32(t) : static_cast<uint32_t>(ClampToInt32(t));
+                }
+            } else if (q) {
+                for (uint32_t i = 0; i < 2u; ++i) {
+                    double t = std::trunc(a.f64[i]);
+                    out.u64[i] = (u == 1u) ? ClampToUint64(t) : ClampToInt64(t);
+                }
             }
             state_.v[rd] = out;
             return true;
