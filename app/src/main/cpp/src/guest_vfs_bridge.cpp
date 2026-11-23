@@ -162,6 +162,86 @@ bool GuestVfsBridge::TryResolveSpecialVfs(const std::string& norm_path,
         out_data.assign(text.begin(), text.end());
         return true;
     }
+    if (norm_path == "/proc/mounts" || norm_path == "/proc/self/mounts" || norm_path == "/proc/self/mountinfo") {
+        const std::string mounts = (norm_path == "/proc/self/mountinfo")
+            ? "1 1 0:1 / / rw,relatime - rootfs rootfs rw\n"
+              "2 1 0:2 / /system ro,relatime - ext4 /dev/block/vda ro\n"
+              "3 1 0:3 / /proc rw,nosuid,nodev,noexec - proc proc rw\n"
+              "4 1 0:4 / /sys rw,nosuid,nodev,noexec - sysfs sysfs rw\n"
+              "5 1 0:5 / /dev rw,nosuid - tmpfs tmpfs rw\n"
+              "6 1 0:6 / /sys/fs/selinux rw,nosuid,noexec - selinuxfs selinuxfs rw\n"
+              "7 1 0:7 / /data rw,nosuid,nodev - tmpfs tmpfs rw\n"
+              "8 1 0:8 / /storage/emulated/0 rw,nosuid,nodev - sdcardfs /storage/emulated/0 rw\n"
+            : "rootfs / rootfs rw 0 0\n"
+              "/dev/block/vda /system ext4 ro,relatime 0 0\n"
+              "proc /proc proc rw,nosuid,nodev,noexec 0 0\n"
+              "sysfs /sys sysfs rw,nosuid,nodev,noexec 0 0\n"
+              "tmpfs /dev tmpfs rw,nosuid 0 0\n"
+              "selinuxfs /sys/fs/selinux selinuxfs rw,nosuid,noexec 0 0\n"
+              "tmpfs /data tmpfs rw,nosuid,nodev 0 0\n"
+              "sdcardfs /storage/emulated/0 sdcardfs rw,nosuid,nodev 0 0\n";
+        out_data.assign(mounts.begin(), mounts.end());
+        return true;
+    }
+    if (norm_path == "/proc/filesystems") {
+        const std::string fs = "nodev\tsysfs\nnodev\trootfs\nnodev\ttmpfs\nnodev\tproc\nnodev\tselinuxfs\n\text4\n\tf2fs\n";
+        out_data.assign(fs.begin(), fs.end());
+        return true;
+    }
+    if (norm_path == "/proc/stat") {
+        const std::string st = "cpu  1000 0 500 50000 0 0 0 0 0 0\n"
+                               "cpu0 250 0 125 12500 0 0 0 0 0 0\n"
+                               "cpu1 250 0 125 12500 0 0 0 0 0 0\n"
+                               "cpu2 250 0 125 12500 0 0 0 0 0 0\n"
+                               "cpu3 250 0 125 12500 0 0 0 0 0 0\n"
+                               "intr 100\nctxt 500\nbtime 1700000000\nprocesses 10\nprocs_running 1\n";
+        out_data.assign(st.begin(), st.end());
+        return true;
+    }
+    if (norm_path == "/proc/uptime") {
+        const std::string up = "10.00 35.00\n";
+        out_data.assign(up.begin(), up.end());
+        return true;
+    }
+    if (norm_path == "/proc/loadavg") {
+        const std::string la = "0.10 0.08 0.05 1/16 10\n";
+        out_data.assign(la.begin(), la.end());
+        return true;
+    }
+
+    // 1b. /sys/fs/selinux/* and /sys/devices/system/cpu/*
+    if (norm_path == "/sys/fs/selinux") {
+        out_is_dir = true;
+        out_children = {"enforce", "mls", "policyvers", "status", "null", "load"};
+        return true;
+    }
+    if (norm_path == "/sys/fs/selinux/enforce") {
+        out_data = {'0'};
+        return true;
+    }
+    if (norm_path == "/sys/fs/selinux/mls") {
+        out_data = {'1'};
+        return true;
+    }
+    if (norm_path == "/sys/fs/selinux/policyvers") {
+        out_data = {'3', '3'};
+        return true;
+    }
+    if (norm_path == "/sys/fs/selinux/status") {
+        out_data.assign(4096u, 0u); // version=1, enforcing=0, policyload=0, deny_unknown=0
+        out_data[0] = 1u;
+        return true;
+    }
+    if (norm_path == "/sys/fs/selinux/null") {
+        return true;
+    }
+    if (norm_path == "/sys/devices/system/cpu/online" ||
+        norm_path == "/sys/devices/system/cpu/possible" ||
+        norm_path == "/sys/devices/system/cpu/present") {
+        const std::string cpus = "0-3\n";
+        out_data.assign(cpus.begin(), cpus.end());
+        return true;
+    }
 
     // 2. Virtual sysfs battery/thermal/sensor nodes
     if (hw != nullptr) {
@@ -195,12 +275,24 @@ bool GuestVfsBridge::TryResolveSpecialVfs(const std::string& norm_path,
         }
     }
 
-    // 4. Device nodes
+    // 4. Device nodes & directories
+    if (norm_path == "/dev/socket") {
+        out_is_dir = true;
+        out_children = {"property_service", "logdw", "logd", "zygote"};
+        return true;
+    }
+    if (norm_path == "/dev/dma_heap") {
+        out_is_dir = true;
+        out_children = {"system"};
+        return true;
+    }
     if (norm_path == "/dev/haseeb_sensors" || norm_path == "/dev/video0" ||
         norm_path == "/dev/haseeb_gles" || norm_path == "/dev/magisk_su" ||
         norm_path == "/dev/snd/pcmC0D0p" || norm_path == "/dev/snd/pcmC0D0c" ||
         norm_path == "/dev/binder" || norm_path == "/dev/hwbinder" ||
-        norm_path == "/dev/vndbinder") {
+        norm_path == "/dev/vndbinder" || norm_path == "/dev/ashmem" ||
+        norm_path == "/dev/ion" || norm_path == "/dev/dma_heap/system" ||
+        norm_path == "/dev/kmsg" || norm_path == "/dev/tty" || norm_path == "/dev/ptmx") {
         return true;
     }
 

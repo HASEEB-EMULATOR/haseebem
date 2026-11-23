@@ -538,9 +538,9 @@ vm::VmError EngineRuntime::Start(int api, int width, int height, int dpi, int ra
 }
 
 void EngineRuntime::RunGuestLoop() {
-    uint64_t next_milestone = 10000ULL;
+    uint64_t next_milestone = 100000ULL;
     while (running_.load()) {
-        vm::VmError step_res = machine_.StepGuest(10000ULL);
+        vm::VmError step_res = machine_.StepGuest(100000ULL);
         const auto& st = machine_.CpuState();
         instructions_executed_.store(st.instructions_executed);
 
@@ -617,7 +617,7 @@ void EngineRuntime::RunGuestLoop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(4));
         } else {
             // Cooperative yield so tight DBT loops never starve Android UI / RenderThread
-            std::this_thread::sleep_for(std::chrono::microseconds(250));
+            std::this_thread::yield();
         }
     }
 }

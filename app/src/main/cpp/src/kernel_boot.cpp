@@ -2,15 +2,20 @@
 #include "haseeb/guest_vfs_bridge.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <fcntl.h>
 #include <iomanip>
+#include <netinet/in.h>
+#include <poll.h>
 #include <random>
 #include <sstream>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 namespace haseeb::vm {
@@ -129,6 +134,8 @@ bool IsGuestCharDevicePath(const std::string& norm) {
            norm == "/dev/urandom" || norm == "/dev/random" ||
            norm == "/dev/fb0" ||
            norm == "/dev/binder" || norm == "/dev/hwbinder" || norm == "/dev/vndbinder" ||
+           norm == "/dev/ashmem" || norm == "/dev/ion" || norm == "/dev/dma_heap/system" ||
+           norm == "/dev/kmsg" || norm == "/dev/tty" || norm == "/dev/ptmx" ||
            norm == "/dev/input/event0" || norm == "/dev/input/event1" ||
            norm == "/dev/haseeb_sensors" || norm == "/dev/video0" ||
            norm == "/dev/haseeb_gles" || norm == "/dev/magisk_su" ||
@@ -485,8 +492,13 @@ Elf64LoadResult Elf64GuestLoader::LoadAndMap(GuestRam& ram,
         return true;
     };
 
-    // Build Linux AArch64 initial user stack: strings + AT_RANDOM + auxv + envp + argv + argc
+    // Build Linux AArch64 initial user stack: strings + AT_PLATFORM + AT_RANDOM + auxv + envp + argv + argc
     uint64_t sp = kUserStackTop - 16ULL;
+    const char platform_str[] = "aarch64";
+    sp -= sizeof(platform_str);
+    uint64_t platform_va = sp;
+    write_stack(platform_va, platform_str, sizeof(platform_str));
+
     uint8_t rand16[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
     sp -= 16ULL;
     uint64_t random_va = sp;
@@ -532,9 +544,12 @@ Elf64LoadResult Elf64GuestLoader::LoadAndMap(GuestRam& ram,
     push_aux(12u, 0ULL);                   // AT_EUID
     push_aux(13u, 0ULL);                   // AT_GID
     push_aux(14u, 0ULL);                   // AT_EGID
+    push_aux(15u, platform_va);            // AT_PLATFORM
+    push_aux(16u, 0x1FFULL);               // AT_HWCAP (FP|ASIMD|EVTSTRM|AES|PMULL|SHA1|SHA2|CRC32|ATOMICS)
     push_aux(17u, 100ULL);                 // AT_CLKTCK
     push_aux(23u, 0ULL);                   // AT_SECURE
     push_aux(25u, random_va);              // AT_RANDOM
+    push_aux(26u, 0ULL);                   // AT_HWCAP2
     if (!arg_vas.empty()) {
         push_aux(31u, arg_vas.front());    // AT_EXECFN
     }
@@ -575,19 +590,82 @@ LinuxGuestSupervisor::~LinuxGuestSupervisor() {
     CloseAllOpenFds();
 }
 
-void LinuxGuestSupervisor::CloseTaskOpenFds(GuestTask& task) {
-    for (auto& kv : task.open_fds) {
-        if (kv.second.host_fd >= 0) {
-            ::close(kv.second.host_fd);
-            kv.second.host_fd = -1;
+LinuxGuestSupervisor::UnixSocketEndpoint::~UnixSocketEndpoint() {
+    for (auto& chunk : rx_chunks) {
+        for (auto& f : chunk.passed_fds) {
+            if (f && f->host_fd >= 0) {
+                ::close(f->host_fd);
+                f->host_fd = -1;
+            }
         }
     }
-    task.open_fds.clear();
+}
+
+void LinuxGuestSupervisor::CloseSingleOpenFile(OpenFile& of) {
+    if (of.host_fd >= 0) {
+        ::close(of.host_fd);
+        of.host_fd = -1;
+    }
+    if (of.unix_sock && of.unix_sock.use_count() == 1) {
+        if (!of.unix_sock->bound_path.empty()) {
+            auto bit = unix_bound_sockets_.find(of.unix_sock->bound_path);
+            if (bit != unix_bound_sockets_.end()) {
+                auto locked = bit->second.lock();
+                if (!locked || locked.get() == of.unix_sock.get()) {
+                    unix_bound_sockets_.erase(bit);
+                }
+            }
+        }
+        if (auto p = of.unix_sock->peer.lock()) {
+            p->peer_closed = true;
+            WakePollWaiters();
+        }
+    }
+    if (of.is_binder && of.binder_client_id != 0u) {
+        const uint32_t cid = of.binder_client_id;
+        of.binder_client_id = 0u;
+        bool still_referenced = false;
+        for (const auto& t : tasks_) {
+            if (!t || !t->files) continue;
+            for (const auto& kv : t->files->fds) {
+                if (kv.second.is_binder && kv.second.binder_client_id == cid) {
+                    still_referenced = true;
+                    break;
+                }
+            }
+            if (still_referenced) break;
+        }
+        if (!still_referenced) {
+            binder_broker_.CloseClient(cid, [this](int32_t target_pid) {
+                WakeBinderWaitersForPid(target_pid);
+            });
+        }
+    }
+}
+
+void LinuxGuestSupervisor::CloseTaskOpenFds(GuestTask& task) {
+    if (!task.files || task.files.use_count() > 1) {
+        task.files.reset();
+        return;
+    }
+    auto fds_copy = std::move(task.files->fds);
+    task.files->fds.clear();
+    for (auto& kv : fds_copy) {
+        CloseSingleOpenFile(kv.second);
+    }
 }
 
 void LinuxGuestSupervisor::CloseAllOpenFds() {
     for (auto& t : tasks_) {
-        if (t) CloseTaskOpenFds(*t);
+        if (t && t->files) {
+            for (auto& kv : t->files->fds) {
+                if (kv.second.host_fd >= 0) {
+                    ::close(kv.second.host_fd);
+                    kv.second.host_fd = -1;
+                }
+            }
+            t->files->fds.clear();
+        }
     }
     for (auto& kv : open_fds_) {
         if (kv.second.host_fd >= 0) {
@@ -596,6 +674,8 @@ void LinuxGuestSupervisor::CloseAllOpenFds() {
         }
     }
     open_fds_.clear();
+    unix_bound_sockets_.clear();
+    binder_broker_.Clear();
 }
 
 LinuxGuestSupervisor::GuestTask* LinuxGuestSupervisor::CurrentTask() {
@@ -627,17 +707,21 @@ void LinuxGuestSupervisor::SaveTaskContext(const CpuState& st, GuestTask& task) 
     task.cpu.v = st.v;
     task.uid = uid_;
     task.gid = gid_;
-    task.current_brk = current_brk_;
-    task.mmap_cursor = mmap_cursor_;
-    task.ttbr0_pa = ttbr0_pa_;
+    if (task.vm) {
+        task.vm->current_brk = current_brk_;
+        task.vm->mmap_cursor = mmap_cursor_;
+        task.vm->ttbr0_pa = ttbr0_pa_;
+    }
     task.binary = active_binary_;
 }
 
 void LinuxGuestSupervisor::RestoreTaskContext(AArch64CpuCore& cpu,
                                                 CpuState& st,
                                                 const GuestTask& task) const {
-    const uint64_t new_ttbr0 = (task.ttbr0_pa & 0x0000FFFFFFFFF000ULL) |
-                               (static_cast<uint64_t>(task.pid & 0xFFFFu) << 48);
+    const uint64_t vm_ttbr0 = task.vm ? task.vm->ttbr0_pa : 0ULL;
+    const int32_t asid = (task.tgid > 0) ? task.tgid : task.pid;
+    const uint64_t new_ttbr0 = (vm_ttbr0 & 0x0000FFFFFFFFF000ULL) |
+                               (static_cast<uint64_t>(asid & 0xFFFFu) << 48);
     if (st.sys.ttbr0_el1 != new_ttbr0) {
         cpu.Mmu().InvalidateAll();
         cpu.Cache().InvalidateAll();
@@ -654,11 +738,181 @@ void LinuxGuestSupervisor::RestoreTaskContext(AArch64CpuCore& cpu,
     st.waiting_for_interrupt = false;
 }
 
+uint32_t LinuxGuestSupervisor::ComputeFdPollEvents(const OpenFile& of) const {
+    const int64_t now = NowSteadyNs();
+    uint32_t ev = 0u;
+    if (of.input_dev != nullptr) {
+        if (of.input_dev->HasPendingEvdev()) ev |= 0x001u; // EPOLLIN
+        return ev;
+    }
+    if (of.is_eventfd) {
+        if (of.eventfd_counter > 0ULL) ev |= 0x001u;
+        ev |= 0x004u; // EPOLLOUT
+        return ev;
+    }
+    if (of.is_timerfd) {
+        if (of.timerfd_expirations > 0ULL ||
+            (of.timerfd_next_expire_ns > 0 && now >= of.timerfd_next_expire_ns)) {
+            ev |= 0x001u;
+        }
+        return ev;
+    }
+    if (of.is_binder) {
+        if (binder_broker_.HasPendingRead(of.binder_client_id)) ev |= 0x001u;
+        ev |= 0x004u;
+        return ev;
+    }
+    if (of.unix_sock) {
+        if (of.unix_sock->listening) {
+            if (!of.unix_sock->pending_accept.empty()) ev |= 0x001u;
+        } else {
+            if (!of.unix_sock->rx_chunks.empty()) ev |= 0x001u;
+            if (of.unix_sock->peer_closed || of.unix_sock->shutdown_rd) ev |= 0x010u | 0x001u; // EPOLLHUP|EPOLLIN
+            if (!of.unix_sock->shutdown_wr && !of.unix_sock->peer_closed) ev |= 0x004u;
+        }
+        return ev;
+    }
+    if (of.host_fd >= 0) {
+        struct pollfd pfd{};
+        pfd.fd = of.host_fd;
+        pfd.events = POLLIN | POLLOUT;
+        if (::poll(&pfd, 1, 0) > 0) {
+            if (pfd.revents & POLLIN) ev |= 0x001u;
+            if (pfd.revents & POLLOUT) ev |= 0x004u;
+            if (pfd.revents & POLLERR) ev |= 0x008u;
+            if (pfd.revents & POLLHUP) ev |= 0x010u;
+        }
+        return ev;
+    }
+    return 0x001u | 0x004u;
+}
+
+uint32_t LinuxGuestSupervisor::ComputeGuestFdPollEvents(const std::unordered_map<int, OpenFile>& fds,
+                                                        int fd) const {
+    if (fd < 0) return 0u;
+    if (fd == 0) {
+        return ((uart_.Read(0x018ULL, 4) & (1u << 4)) == 0u) ? 0x001u : 0u;
+    }
+    if (fd == 1 || fd == 2) return 0x004u;
+    auto it = fds.find(fd);
+    if (it == fds.end()) return 0x020u; // POLLNVAL
+    return ComputeFdPollEvents(it->second);
+}
+
+void LinuxGuestSupervisor::WakeBinderWaitersForPid(int32_t target_pid) {
+    for (auto& t : tasks_) {
+        if (!t || t->state == TaskState::Zombie) continue;
+        if (t->pid == target_pid || t->tgid == target_pid) {
+            if (t->state == TaskState::BinderWait || t->state == TaskState::PollWait) {
+                t->state = TaskState::Runnable;
+            }
+        }
+    }
+}
+
+void LinuxGuestSupervisor::WakePollWaiters() {
+    for (auto& t : tasks_) {
+        if (t && t->state == TaskState::PollWait) {
+            t->state = TaskState::Runnable;
+        }
+    }
+}
+
+int LinuxGuestSupervisor::WakeFutexWaiters(uint64_t pa, int max_wake, uint32_t bitset) {
+    if (max_wake <= 0) return 0;
+    int woken = 0;
+    for (auto& t : tasks_) {
+        if (!t || t->state != TaskState::FutexWait) continue;
+        if (t->futex_pa == pa && (t->futex_bitset & bitset) != 0u) {
+            t->cpu.x[0] = 0ULL;
+            t->futex_pa = 0ULL;
+            t->futex_has_timeout = false;
+            t->state = TaskState::Runnable;
+            if (++woken >= max_wake) break;
+        }
+    }
+    return woken;
+}
+
 void LinuxGuestSupervisor::WakeSleepingTasks() {
     const int64_t now = NowSteadyNs();
     for (auto& t : tasks_) {
-        if (t && t->state == TaskState::Sleeping && now >= t->wakeup_ns) {
+        if (!t || t->state == TaskState::Zombie || t->state == TaskState::Runnable) continue;
+
+        // Advance armed timerfds
+        if (t->files) {
+            for (auto& kv : t->files->fds) {
+                OpenFile& of = kv.second;
+                if (of.is_timerfd && of.timerfd_next_expire_ns > 0 && now >= of.timerfd_next_expire_ns) {
+                    if (of.timerfd_interval_ns > 0) {
+                        const int64_t elapsed = now - of.timerfd_next_expire_ns;
+                        const int64_t ticks = 1 + (elapsed / of.timerfd_interval_ns);
+                        of.timerfd_expirations += static_cast<uint64_t>(ticks);
+                        of.timerfd_next_expire_ns += ticks * of.timerfd_interval_ns;
+                    } else {
+                        ++of.timerfd_expirations;
+                        of.timerfd_next_expire_ns = 0;
+                    }
+                }
+            }
+        }
+
+        if (t->state == TaskState::Sleeping && now >= t->wakeup_ns) {
             t->state = TaskState::Runnable;
+        } else if (t->state == TaskState::FutexWait && t->futex_has_timeout &&
+                   now >= t->futex_deadline_ns) {
+            t->cpu.x[0] = static_cast<uint64_t>(-110LL); // -ETIMEDOUT
+            t->futex_pa = 0ULL;
+            t->futex_has_timeout = false;
+            t->state = TaskState::Runnable;
+        } else if (t->state == TaskState::BinderWait && t->files) {
+            for (const auto& kv : t->files->fds) {
+                if (kv.second.is_binder && binder_broker_.HasPendingRead(kv.second.binder_client_id)) {
+                    t->state = TaskState::Runnable;
+                    break;
+                }
+            }
+        } else if (t->state == TaskState::PollWait && t->files) {
+            bool any_ready = false;
+            if (t->poll_wait_epfd >= 0) {
+                auto epit = t->files->fds.find(t->poll_wait_epfd);
+                if (epit != t->files->fds.end()) {
+                    for (const auto& w : epit->second.epoll_watches) {
+                        const uint32_t rev = ComputeGuestFdPollEvents(t->files->fds, w.fd);
+                        const uint32_t mask = w.events | 0x008u | 0x010u; // EPOLLERR|EPOLLHUP
+                        if ((rev & mask) != 0u) {
+                            any_ready = true;
+                            break;
+                        }
+                    }
+                } else {
+                    any_ready = true;
+                }
+            } else if (!t->poll_wait_fds.empty()) {
+                for (const auto& w : t->poll_wait_fds) {
+                    const uint32_t rev = ComputeGuestFdPollEvents(t->files->fds, w.fd);
+                    const uint32_t mask = w.events | 0x008u | 0x010u | 0x020u; // ERR|HUP|NVAL
+                    if ((rev & mask) != 0u) {
+                        any_ready = true;
+                        break;
+                    }
+                }
+            } else {
+                any_ready = true;
+            }
+            if (any_ready) {
+                t->poll_has_timeout = false;
+                t->poll_wait_epfd = -1;
+                t->poll_wait_fds.clear();
+                t->state = TaskState::Runnable; // Retries svc and drains ready events
+            } else if (t->poll_has_timeout && now >= t->poll_deadline_ns) {
+                t->cpu.elr_el1 += 4ULL; // Skip retry; timed out with 0 events
+                t->cpu.x[0] = 0ULL;
+                t->poll_has_timeout = false;
+                t->poll_wait_epfd = -1;
+                t->poll_wait_fds.clear();
+                t->state = TaskState::Runnable;
+            }
         }
     }
 }
@@ -677,13 +931,18 @@ void LinuxGuestSupervisor::ResumeIfWaiting(AArch64CpuCore& cpu) {
                 current_task_idx_ = cand_idx;
                 uid_ = cand->uid;
                 gid_ = cand->gid;
-                current_brk_ = cand->current_brk;
-                mmap_cursor_ = cand->mmap_cursor;
-                ttbr0_pa_ = cand->ttbr0_pa;
+                if (cand->vm) {
+                    current_brk_ = cand->vm->current_brk;
+                    mmap_cursor_ = cand->vm->mmap_cursor;
+                    ttbr0_pa_ = cand->vm->ttbr0_pa;
+                }
                 active_binary_ = cand->binary;
                 RestoreTaskContext(cpu, st, *cand);
                 st.pc = cand->cpu.elr_el1;
                 st.pstate.UnpackSpsr(static_cast<uint32_t>(cand->cpu.spsr_el1));
+            } else {
+                st.x[0] = cand->cpu.x[0];
+                st.sys.elr_el1 = cand->cpu.elr_el1;
             }
             st.waiting_for_interrupt = false;
             return;
@@ -712,9 +971,11 @@ void LinuxGuestSupervisor::YieldTimeSlice(AArch64CpuCore& cpu) {
             current_task_idx_ = cand_idx;
             uid_ = cand->uid;
             gid_ = cand->gid;
-            current_brk_ = cand->current_brk;
-            mmap_cursor_ = cand->mmap_cursor;
-            ttbr0_pa_ = cand->ttbr0_pa;
+            if (cand->vm) {
+                current_brk_ = cand->vm->current_brk;
+                mmap_cursor_ = cand->vm->mmap_cursor;
+                ttbr0_pa_ = cand->vm->ttbr0_pa;
+            }
             active_binary_ = cand->binary;
             RestoreTaskContext(cpu, st, *cand);
             st.pc = cand->cpu.elr_el1;
@@ -746,19 +1007,23 @@ bool LinuxGuestSupervisor::ScheduleNextTask(AArch64CpuCore& cpu,
                 current_task_idx_ = cand_idx;
                 uid_ = cand->uid;
                 gid_ = cand->gid;
-                current_brk_ = cand->current_brk;
-                mmap_cursor_ = cand->mmap_cursor;
-                ttbr0_pa_ = cand->ttbr0_pa;
+                if (cand->vm) {
+                    current_brk_ = cand->vm->current_brk;
+                    mmap_cursor_ = cand->vm->mmap_cursor;
+                    ttbr0_pa_ = cand->vm->ttbr0_pa;
+                }
                 active_binary_ = cand->binary;
                 RestoreTaskContext(cpu, st, *cand);
             } else {
+                st.x[0] = cand->cpu.x[0];
+                st.sys.elr_el1 = cand->cpu.elr_el1;
                 st.waiting_for_interrupt = false;
             }
             return true;
         }
     }
 
-    // Check if any non-zombie task still waits (Sleeping / WaitingChild)
+    // Check if any non-zombie task still waits (Sleeping / WaitingChild / FutexWait / PollWait / BinderWait)
     for (const auto& t : tasks_) {
         if (t && t->state != TaskState::Zombie) {
             out_wfi_sleep = true;
@@ -807,7 +1072,10 @@ bool LinuxGuestSupervisor::ResolveGuestPathWithDirfd(
         return true;
     }
     if (dirfd == -100) { // AT_FDCWD
-        out_norm = NormalizeGuestPath("/" + raw_path);
+        const GuestTask* cur = CurrentTask();
+        const std::string& cwd = (cur && !cur->cwd.empty()) ? cur->cwd : std::string("/");
+        out_norm = (cwd == "/") ? NormalizeGuestPath("/" + raw_path)
+                                : NormalizeGuestPath(cwd + "/" + raw_path);
         return true;
     }
     auto it = fds.find(dirfd);
@@ -840,6 +1108,7 @@ bool LinuxGuestSupervisor::ResolveProcSymlinkTarget(
     const int32_t cur_pid = cur ? cur->pid : 1;
     const std::unordered_map<int, OpenFile>* target_fds = nullptr;
     std::string target_bin;
+    std::string target_cwd = cur ? cur->cwd : "/";
 
     if (who == "self" || who == "thread-self") {
         target_fds = &fds;
@@ -847,14 +1116,15 @@ bool LinuxGuestSupervisor::ResolveProcSymlinkTarget(
     } else {
         int req_pid = -1;
         if (!ParseNonNegInt(who, req_pid) || req_pid <= 0) return false;
-        if (req_pid == cur_pid) {
+        if (req_pid == cur_pid || (cur && req_pid == cur->tgid)) {
             target_fds = &fds;
             target_bin = active_binary_;
         } else {
             for (const auto& t : tasks_) {
-                if (t && t->pid == req_pid) {
-                    target_fds = &t->open_fds;
+                if (t && (t->pid == req_pid || t->tgid == req_pid) && t->files) {
+                    target_fds = &t->files->fds;
                     target_bin = t->binary;
+                    target_cwd = t->cwd;
                     break;
                 }
             }
@@ -864,6 +1134,10 @@ bool LinuxGuestSupervisor::ResolveProcSymlinkTarget(
 
     if (tail == "exe") {
         out_target = target_bin.empty() ? "/init" : target_bin;
+        return true;
+    }
+    if (tail == "cwd") {
+        out_target = target_cwd.empty() ? "/" : target_cwd;
         return true;
     }
     if (tail.rfind("fd/", 0) == 0) {
@@ -951,6 +1225,67 @@ bool LinuxGuestSupervisor::ResolveVfsFile(const std::string& path,
                 }
                 return finish_ok();
             }
+        }
+        if (norm == "/proc/self/cmdline" || norm == "/proc/thread-self/cmdline") {
+            const std::string bin = active_binary_.empty() ? "/init" : active_binary_;
+            out_data.assign(bin.begin(), bin.end());
+            out_data.push_back('\0');
+            return finish_ok();
+        }
+        if (norm == "/proc/self/comm" || norm == "/proc/thread-self/comm") {
+            std::string base = active_binary_.empty() ? "init" : active_binary_;
+            const size_t sl = base.find_last_of('/');
+            if (sl != std::string::npos) base = base.substr(sl + 1u);
+            base += "\n";
+            out_data.assign(base.begin(), base.end());
+            return finish_ok();
+        }
+        if (norm == "/proc/self/status" || norm == "/proc/thread-self/status") {
+            const GuestTask* cur = CurrentTask();
+            const int32_t pid = cur ? cur->tgid : 1;
+            const int32_t tid = cur ? cur->pid : 1;
+            const int32_t ppid = cur ? cur->ppid : 0;
+            std::string base = active_binary_.empty() ? "init" : active_binary_;
+            const size_t sl = base.find_last_of('/');
+            if (sl != std::string::npos) base = base.substr(sl + 1u);
+            std::ostringstream oss;
+            oss << "Name:\t" << base << "\n"
+                << "State:\tR (running)\n"
+                << "Tgid:\t" << pid << "\n"
+                << "Pid:\t" << tid << "\n"
+                << "PPid:\t" << ppid << "\n"
+                << "TracerPid:\t0\n"
+                << "Uid:\t" << uid_ << "\t" << uid_ << "\t" << uid_ << "\t" << uid_ << "\n"
+                << "Gid:\t" << gid_ << "\t" << gid_ << "\t" << gid_ << "\t" << gid_ << "\n"
+                << "Threads:\t" << std::max<size_t>(1u, ActiveTaskCount()) << "\n";
+            const std::string s = oss.str();
+            out_data.assign(s.begin(), s.end());
+            return finish_ok();
+        }
+        if (norm == "/proc/self/stat" || norm == "/proc/thread-self/stat") {
+            const GuestTask* cur = CurrentTask();
+            const int32_t pid = cur ? cur->tgid : 1;
+            const int32_t ppid = cur ? cur->ppid : 0;
+            std::string base = active_binary_.empty() ? "init" : active_binary_;
+            const size_t sl = base.find_last_of('/');
+            if (sl != std::string::npos) base = base.substr(sl + 1u);
+            std::ostringstream oss;
+            oss << pid << " (" << base << ") R " << ppid
+                << " 1 1 0 -1 4194560 0 0 0 0 10 5 0 0 20 0 "
+                << std::max<size_t>(1u, ActiveTaskCount()) << " 0 1 67108864 1024 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n";
+            const std::string s = oss.str();
+            out_data.assign(s.begin(), s.end());
+            return finish_ok();
+        }
+        if (norm == "/proc/self/maps" || norm == "/proc/thread-self/maps") {
+            std::ostringstream oss;
+            const std::string bin = active_binary_.empty() ? "/init" : active_binary_;
+            oss << "00400000-00800000 r-xp 00000000 00:01 1 " << bin << "\n"
+                << "20000000-20200000 r-xp 00000000 00:01 2 /system/bin/linker64\n"
+                << "7ffe0000-7fff0000 rw-p 00000000 00:00 0 [stack]\n";
+            const std::string s = oss.str();
+            out_data.assign(s.begin(), s.end());
+            return finish_ok();
         }
         if (norm == "/proc/cmdline") {
             std::string text = cmdline_ + "\n";
@@ -1109,7 +1444,8 @@ bool LinuxGuestSupervisor::MapFreshAddressSpace(AArch64CpuCore& cpu,
                                                 const std::vector<uint8_t>& elf_bytes,
                                                 const std::vector<std::string>& argv,
                                                 std::string& out_error,
-                                                bool reset_phys_cursor) {
+                                                bool reset_phys_cursor,
+                                                const std::vector<std::string>* envp_override) {
     if (reset_phys_cursor) {
         phys_cursor_ = arena_base_;
         vbar_pa_ = 0ULL;
@@ -1139,12 +1475,17 @@ bool LinuxGuestSupervisor::MapFreshAddressSpace(AArch64CpuCore& cpu,
         return false;
     }
 
-    std::vector<std::string> envp = {
-        "PATH=/sbin:/system/bin:/vendor/bin",
-        "HOME=/",
-        "TERM=vt100",
-        magisk_enabled_ ? "HASEEB_ROOT=magisk" : "HASEEB_ROOT=0",
-    };
+    std::vector<std::string> envp;
+    if (envp_override != nullptr && !envp_override->empty()) {
+        envp = *envp_override;
+    } else {
+        envp = {
+            "PATH=/sbin:/system/bin:/vendor/bin",
+            "HOME=/",
+            "TERM=vt100",
+            magisk_enabled_ ? "HASEEB_ROOT=magisk" : "HASEEB_ROOT=0",
+        };
+    }
 
     Elf64LoadResult load = Elf64GuestLoader::LoadAndMap(
         ram_, ttbr0_pa_, phys_cursor_, arena_limit_, elf_bytes, argv, envp,
@@ -1159,7 +1500,15 @@ bool LinuxGuestSupervisor::MapFreshAddressSpace(AArch64CpuCore& cpu,
     current_brk_ = AlignUp4K(load.brk_start);
     mmap_cursor_ = 0x0000001000000000ULL;
 
-    const int32_t active_pid = CurrentTask() ? CurrentTask()->pid : 1;
+    if (GuestTask* cur = CurrentTask()) {
+        if (!cur->vm) cur->vm = std::make_shared<VmSpace>();
+        cur->vm->ttbr0_pa = ttbr0_pa_;
+        cur->vm->current_brk = current_brk_;
+        cur->vm->mmap_cursor = mmap_cursor_;
+        cur->vm->fb_mapped_pas.clear();
+    }
+
+    const int32_t active_asid = CurrentTask() ? CurrentTask()->tgid : 1;
     cpu.Mmu().InvalidateAll();
     cpu.Cache().InvalidateAll();
     cpu.Reset(load.entry_pc, load.initial_sp, 0);
@@ -1169,7 +1518,7 @@ bool LinuxGuestSupervisor::MapFreshAddressSpace(AArch64CpuCore& cpu,
     st.pstate.spsel = false;
     st.sys.vbar_el1 = vbar_pa_;
     st.sys.ttbr0_el1 = (ttbr0_pa_ & 0x0000FFFFFFFFF000ULL) |
-                       (static_cast<uint64_t>(active_pid & 0xFFFFu) << 48);
+                       (static_cast<uint64_t>(active_asid & 0xFFFFu) << 48);
     st.sys.tcr_el1 = 25ULL | (1ULL << 23); // T0SZ=25 (39-bit VA, 4K), EPD1=1
     st.sys.mair_el1 = 0xFFULL;
     st.sys.cpacr_el1 = (3ULL << 20);
@@ -1247,10 +1596,12 @@ VmError LinuxGuestSupervisor::PrepareBoot(AArch64CpuCore& cpu,
 
     auto root = std::make_unique<GuestTask>();
     root->pid = next_pid_++;
+    root->tgid = root->pid;
     root->ppid = 0;
     root->uid = 0u;
     root->gid = 0u;
     root->binary = chosen;
+    root->cwd = "/";
     root->state = TaskState::Runnable;
     tasks_.push_back(std::move(root));
     current_task_idx_ = 0;
@@ -1302,7 +1653,7 @@ bool LinuxGuestSupervisor::ReadUserString(AArch64CpuCore& cpu,
 
 bool LinuxGuestSupervisor::FlushFramebufferToGpu() {
     GuestTask* cur = CurrentTask();
-    const auto& fb_pas = cur ? cur->fb_mapped_pas : fb_mapped_pas_;
+    const auto& fb_pas = (cur && cur->vm) ? cur->vm->fb_mapped_pas : fb_mapped_pas_;
     if (!gpu_ || fb_pas.empty()) return false;
     const uint32_t w = gpu_->DisplayWidth();
     const uint32_t h = gpu_->DisplayHeight();
@@ -1504,12 +1855,46 @@ int64_t LinuxGuestSupervisor::OpenGuestPath(std::unordered_map<int, OpenFile>& f
     }
     if (norm == "/dev/binder" || norm == "/dev/hwbinder" || norm == "/dev/vndbinder") {
         if (check_access_only) return 0;
+        const GuestTask* cur = CurrentTask();
+        const int32_t owner_pid = cur ? cur->tgid : 1;
         int fd = next_fd++;
         OpenFile of;
         of.path = norm;
         of.fd_flags = cloexec;
         of.is_binder = true;
+        of.binder_client_id = binder_broker_.OpenClient(
+            BinderIpcBroker::DomainFromPath(norm), owner_pid, uid_);
         of.nonblock = nonblock;
+        of.st_dev = 2ULL;
+        of.st_ino = ComputeGuestInode(of.path);
+        fds.emplace(fd, std::move(of));
+        return fd;
+    }
+    if (norm == "/dev/ashmem" || norm == "/dev/ion" || norm == "/dev/dma_heap/system") {
+        if (check_access_only) return 0;
+        int fd = next_fd++;
+        OpenFile of;
+        of.path = norm;
+        of.fd_flags = cloexec;
+        of.nonblock = nonblock;
+        of.is_ashmem = (norm == "/dev/ashmem");
+        of.is_ion = (norm == "/dev/ion");
+        of.is_dma_heap = (norm == "/dev/dma_heap/system");
+        of.shared_pages = std::make_shared<std::vector<uint64_t>>();
+        of.st_dev = 2ULL;
+        of.st_ino = ComputeGuestInode(norm + "#" + std::to_string(fd));
+        fds.emplace(fd, std::move(of));
+        return fd;
+    }
+    if (norm == "/dev/kmsg" || norm == "/dev/tty" || norm == "/dev/ptmx") {
+        if (check_access_only) return 0;
+        int fd = next_fd++;
+        OpenFile of;
+        of.path = norm;
+        of.fd_flags = cloexec;
+        of.nonblock = nonblock;
+        of.is_kmsg = (norm == "/dev/kmsg");
+        of.is_tty = (norm == "/dev/tty" || norm == "/dev/ptmx");
         of.st_dev = 2ULL;
         of.st_ino = ComputeGuestInode(of.path);
         fds.emplace(fd, std::move(of));
@@ -1655,12 +2040,14 @@ int64_t LinuxGuestSupervisor::StatFd(const std::unordered_map<int, OpenFile>& fd
     }
     if (of.is_dir) {
         out.st_mode = 0040755u;
+    } else if (of.unix_sock || of.is_host_inet_sock) {
+        out.st_mode = 0140777u;
     } else if (IsGuestCharDevicePath(of.path)) {
         out.st_mode = 0020666u;
     } else {
         out.st_mode = 0100755u;
     }
-    out.st_size = of.data.size();
+    out.st_size = (of.is_ashmem && of.ashmem_size > 0u) ? of.ashmem_size : of.data.size();
     return 0;
 }
 
@@ -1733,6 +2120,112 @@ int64_t LinuxGuestSupervisor::StatGuestPath(const std::unordered_map<int, OpenFi
     return 0;
 }
 
+void LinuxGuestSupervisor::HandleBuiltInPropertyServicePacket(
+    const std::shared_ptr<UnixSocketEndpoint>& client_ep,
+    const std::vector<uint8_t>& pkt) {
+    if (pkt.size() < 4u) return;
+    uint32_t cmd = 0u;
+    std::memcpy(&cmd, pkt.data(), 4u);
+
+    std::string name;
+    std::string value;
+    bool parsed = false;
+
+    if (cmd == 1u && pkt.size() >= 128u) { // PROP_MSG_SETPROP (legacy 128B)
+        const char* nptr = reinterpret_cast<const char*>(pkt.data() + 4u);
+        const char* vptr = reinterpret_cast<const char*>(pkt.data() + 36u);
+        name.assign(nptr, strnlen(nptr, 32u));
+        value.assign(vptr, strnlen(vptr, 92u));
+        parsed = !name.empty();
+    } else if (cmd == 0x00020001u && pkt.size() >= 12u) { // PROP_MSG_SETPROP2
+        uint32_t nlen = 0u;
+        std::memcpy(&nlen, pkt.data() + 4u, 4u);
+        if (nlen > 0u && nlen <= 256u && 8u + nlen + 4u <= pkt.size()) {
+            name.assign(reinterpret_cast<const char*>(pkt.data() + 8u), nlen);
+            while (!name.empty() && name.back() == '\0') name.pop_back();
+            uint32_t vlen = 0u;
+            std::memcpy(&vlen, pkt.data() + 8u + nlen, 4u);
+            if (vlen <= 4096u && 8u + nlen + 4u + vlen <= pkt.size()) {
+                value.assign(reinterpret_cast<const char*>(pkt.data() + 12u + nlen), vlen);
+                while (!value.empty() && value.back() == '\0') value.pop_back();
+                parsed = !name.empty();
+            }
+        }
+    }
+
+    int32_t reply_code = parsed ? 0 : -1;
+    if (parsed) {
+        if (prop_mgr_) {
+            prop_mgr_->SetProperty(name, value);
+        }
+        LogToUart("[PROP] set " + name + "=" + value + "\r\n");
+    }
+    if (client_ep) {
+        UnixSocketEndpoint::Chunk ack;
+        ack.data.resize(4u);
+        std::memcpy(ack.data.data(), &reply_code, 4u);
+        client_ep->rx_chunks.push_back(std::move(ack));
+        WakePollWaiters();
+    }
+}
+
+void LinuxGuestSupervisor::HandleBuiltInLogdPacket(const std::vector<uint8_t>& pkt) {
+    if (pkt.empty()) return;
+    // Standard Android logd wire format: android_log_header_t (11B) + prio (1B) + tag\0 + msg\0
+    if (pkt.size() > 13u && pkt[0] <= 7u) {
+        const size_t payload_off = 12u;
+        const char* base = reinterpret_cast<const char*>(pkt.data() + payload_off);
+        const size_t rem = pkt.size() - payload_off;
+        const size_t tag_len = strnlen(base, rem);
+        if (tag_len < rem) {
+            std::string tag(base, tag_len);
+            const char* msg_ptr = base + tag_len + 1u;
+            const size_t msg_rem = rem - tag_len - 1u;
+            std::string msg(msg_ptr, strnlen(msg_ptr, msg_rem));
+            while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) msg.pop_back();
+            if (!tag.empty() || !msg.empty()) {
+                LogToUart("[LOGD] " + tag + ": " + msg + "\r\n");
+                return;
+            }
+        }
+    }
+    std::string text;
+    text.reserve(pkt.size());
+    for (uint8_t b : pkt) {
+        if (b >= 0x20u && b < 0x7Fu) text.push_back(static_cast<char>(b));
+        else if (b == '\n' || b == '\r') text.push_back(' ');
+    }
+    if (!text.empty()) {
+        LogToUart("[LOGD] " + text + "\r\n");
+    }
+}
+
+namespace {
+
+bool ParseGuestUnixPath(const uint8_t* sa, size_t sa_len, std::string& out_key) {
+    if (sa_len < 2u) return false;
+    uint16_t family = 0u;
+    std::memcpy(&family, sa, 2u);
+    if (family != 1u) return false; // AF_UNIX
+    if (sa_len <= 2u) return false;
+    const char* path_ptr = reinterpret_cast<const char*>(sa + 2u);
+    const size_t path_cap = sa_len - 2u;
+    if (path_ptr[0] == '\0') {
+        if (path_cap <= 1u) return false;
+        size_t len = path_cap - 1u;
+        while (len > 0u && path_ptr[1u + len - 1u] == '\0') --len;
+        if (len == 0u) return false;
+        out_key = "@" + std::string(path_ptr + 1u, len);
+        return true;
+    }
+    const size_t n = strnlen(path_ptr, path_cap);
+    if (n == 0u) return false;
+    out_key.assign(path_ptr, n);
+    return true;
+}
+
+} // namespace
+
 int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                                               CpuState& st,
                                               bool& out_halt,
@@ -1745,17 +2238,46 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
     const uint64_t nr = st.x[8];
 
     GuestTask* cur = CurrentTask();
-    auto& fds = cur ? cur->open_fds : open_fds_;
-    int& next_fd = cur ? cur->next_fd : next_fd_;
-    auto& fb_pas = cur ? cur->fb_mapped_pas : fb_mapped_pas_;
+    auto& fds = (cur && cur->files) ? cur->files->fds : open_fds_;
+    int& next_fd = (cur && cur->files) ? cur->files->next_fd : next_fd_;
+    auto& fb_pas = (cur && cur->vm) ? cur->vm->fb_mapped_pas : fb_mapped_pas_;
 
     switch (nr) {
         case 17: { // getcwd(buf, size)
             uint64_t buf = st.x[0];
             uint64_t sz = st.x[1];
-            const char cwd[] = "/";
-            if (sz < sizeof(cwd)) return -34; // ERANGE
-            return WriteUserBytes(cpu, buf, cwd, sizeof(cwd)) ? static_cast<int64_t>(buf) : -14;
+            const std::string cwd = (cur && !cur->cwd.empty()) ? cur->cwd : "/";
+            if (sz < cwd.size() + 1u) return -34; // ERANGE
+            return WriteUserBytes(cpu, buf, cwd.c_str(), cwd.size() + 1u)
+                       ? static_cast<int64_t>(buf)
+                       : -14;
+        }
+        case 49: { // chdir(path)
+            std::string path, norm;
+            if (!ReadUserString(cpu, st.x[0], path)) return -14;
+            if (!ResolveGuestPathWithDirfd(fds, -100, path, norm)) return -2;
+            std::string hp, rel;
+            if (ResolveHostStoragePath(norm, hp, rel)) {
+                struct stat hst{};
+                if (::stat(hp.c_str(), &hst) != 0) return -2;
+                if (!S_ISDIR(hst.st_mode)) return -20; // ENOTDIR
+            } else {
+                std::vector<uint8_t> tmp;
+                bool is_dir = false;
+                std::vector<std::string> ch;
+                if (!ResolveVfsFile(norm, tmp, is_dir, ch, nullptr, &fds)) return -2;
+                if (!is_dir) return -20; // ENOTDIR
+            }
+            if (cur) cur->cwd = norm;
+            return 0;
+        }
+        case 50: { // fchdir(fd)
+            const int fd = static_cast<int>(st.x[0]);
+            auto it = fds.find(fd);
+            if (it == fds.end()) return -9;
+            if (!it->second.is_dir) return -20; // ENOTDIR
+            if (cur && !it->second.path.empty()) cur->cwd = it->second.path;
+            return 0;
         }
         case 19: { // eventfd2(initval, flags)
             const uint64_t initval = st.x[0];
@@ -1784,28 +2306,177 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             return fd;
         }
         case 21: { // epoll_ctl(epfd, op, fd, event)
-            auto it = fds.find(static_cast<int>(st.x[0]));
-            if (it == fds.end() || !it->second.is_epoll) return -22;
+            const int epfd = static_cast<int>(st.x[0]);
+            auto it = fds.find(epfd);
+            if (it == fds.end() || !it->second.is_epoll) return -9;
             const int op = static_cast<int>(st.x[1]);
             const int target_fd = static_cast<int>(st.x[2]);
-            auto& list = it->second.epoll_fds;
+            if (target_fd < 0 || target_fd == epfd) return -22;
+            if (target_fd > 2 && fds.find(target_fd) == fds.end()) return -9;
+
+            struct LinuxEpollEventA64 {
+                uint32_t events;
+                uint32_t pad;
+                uint64_t data;
+            };
+            static_assert(sizeof(LinuxEpollEventA64) == 16, "AArch64 epoll_event must be 16 bytes");
+
+            auto& watches = it->second.epoll_watches;
+            auto wit = std::find_if(watches.begin(), watches.end(),
+                                    [target_fd](const EpollWatch& w) { return w.fd == target_fd; });
             if (op == 1) { // EPOLL_CTL_ADD
-                if (std::find(list.begin(), list.end(), target_fd) == list.end()) {
-                    list.push_back(target_fd);
+                if (wit != watches.end()) return -17; // EEXIST
+                LinuxEpollEventA64 ev{};
+                if (st.x[3] == 0ULL || !ReadUserBytes(cpu, st.x[3], &ev, sizeof(ev))) return -14;
+                watches.push_back(EpollWatch{target_fd, ev.events, ev.data});
+                return 0;
+            }
+            if (op == 2) { // EPOLL_CTL_DEL
+                if (wit == watches.end()) return -2; // ENOENT
+                watches.erase(wit);
+                return 0;
+            }
+            if (op == 3) { // EPOLL_CTL_MOD
+                if (wit == watches.end()) return -2; // ENOENT
+                LinuxEpollEventA64 ev{};
+                if (st.x[3] == 0ULL || !ReadUserBytes(cpu, st.x[3], &ev, sizeof(ev))) return -14;
+                wit->events = ev.events;
+                wit->data = ev.data;
+                return 0;
+            }
+            return -22; // EINVAL
+        }
+        case 22: { // epoll_pwait(epfd, events, maxevents, timeout, sigmask)
+            const int epfd = static_cast<int>(st.x[0]);
+            auto it = fds.find(epfd);
+            if (it == fds.end() || !it->second.is_epoll) return -9;
+            const uint64_t events_uva = st.x[1];
+            const int maxevents = static_cast<int>(static_cast<int32_t>(st.x[2]));
+            const int timeout_ms = static_cast<int>(static_cast<int32_t>(st.x[3]));
+            if (maxevents <= 0) return -22;
+
+            struct LinuxEpollEventA64 {
+                uint32_t events;
+                uint32_t pad;
+                uint64_t data;
+            };
+            std::vector<LinuxEpollEventA64> ready;
+            const size_t limit = static_cast<size_t>(std::min(maxevents, 1024));
+            for (auto& w : it->second.epoll_watches) {
+                if (ready.size() >= limit) break;
+                if (w.events == 0u) continue;
+                const uint32_t rev = ComputeGuestFdPollEvents(fds, w.fd);
+                const uint32_t mask = (w.events & 0x0FFFFFFFu) | 0x008u | 0x010u; // ERR|HUP
+                const uint32_t hit = rev & mask;
+                if (hit != 0u) {
+                    LinuxEpollEventA64 ev{};
+                    ev.events = hit;
+                    ev.data = w.data;
+                    ready.push_back(ev);
+                    if ((w.events & 0x40000000u /* EPOLLONESHOT */) != 0u) {
+                        w.events = 0u;
+                    }
                 }
-            } else if (op == 2) { // EPOLL_CTL_DEL
-                list.erase(std::remove(list.begin(), list.end(), target_fd), list.end());
+            }
+            if (ready.empty() && timeout_ms != 0 && cur != nullptr) {
+                cur->state = TaskState::PollWait;
+                cur->poll_wait_epfd = epfd;
+                cur->poll_wait_fds.clear();
+                cur->poll_events_uva = events_uva;
+                cur->poll_maxevents = maxevents;
+                if (timeout_ms > 0) {
+                    cur->poll_has_timeout = true;
+                    cur->poll_deadline_ns =
+                        NowSteadyNs() + static_cast<int64_t>(timeout_ms) * 1000000LL;
+                } else {
+                    cur->poll_has_timeout = false;
+                    cur->poll_deadline_ns = 0;
+                }
+                st.sys.elr_el1 -= 4ULL;
+                out_retry = true;
+                out_yield = true;
+                return 0;
+            }
+            if (!ready.empty() &&
+                !WriteUserBytes(cpu, events_uva, ready.data(),
+                                ready.size() * sizeof(LinuxEpollEventA64))) {
+                return -14;
+            }
+            return static_cast<int64_t>(ready.size());
+        }
+        case 85: { // timerfd_create(clockid, flags)
+            const int clockid = static_cast<int>(st.x[0]);
+            const uint64_t tflags = st.x[1];
+            int fd = next_fd++;
+            OpenFile of;
+            of.path = "anon_inode:[timerfd]";
+            of.is_timerfd = true;
+            of.timerfd_clockid = clockid;
+            of.nonblock = (tflags & 04000ULL) != 0ULL;
+            of.fd_flags = ((tflags & 02000000ULL) != 0ULL) ? 1 : 0;
+            of.st_dev = 4ULL;
+            of.st_ino = ComputeGuestInode(of.path + "#" + std::to_string(fd));
+            fds.emplace(fd, std::move(of));
+            return fd;
+        }
+        case 86: { // timerfd_settime(fd, flags, new_value, old_value)
+            auto it = fds.find(static_cast<int>(st.x[0]));
+            if (it == fds.end() || !it->second.is_timerfd) return -9;
+            const uint64_t flags = st.x[1];
+            struct LinuxItimerspec {
+                int64_t it_interval[2];
+                int64_t it_value[2];
+            };
+            const int64_t now = NowSteadyNs();
+            if (st.x[3] != 0ULL) {
+                LinuxItimerspec old_spec{};
+                if (it->second.timerfd_next_expire_ns > now) {
+                    const int64_t rem = it->second.timerfd_next_expire_ns - now;
+                    old_spec.it_value[0] = rem / 1000000000LL;
+                    old_spec.it_value[1] = rem % 1000000000LL;
+                }
+                old_spec.it_interval[0] = it->second.timerfd_interval_ns / 1000000000LL;
+                old_spec.it_interval[1] = it->second.timerfd_interval_ns % 1000000000LL;
+                if (!WriteUserBytes(cpu, st.x[3], &old_spec, sizeof(old_spec))) return -14;
+            }
+            LinuxItimerspec new_spec{};
+            if (!ReadUserBytes(cpu, st.x[2], &new_spec, sizeof(new_spec))) return -14;
+            const int64_t val_ns = new_spec.it_value[0] * 1000000000LL + new_spec.it_value[1];
+            const int64_t iv_ns = new_spec.it_interval[0] * 1000000000LL + new_spec.it_interval[1];
+            if (val_ns < 0 || iv_ns < 0) return -22;
+            it->second.timerfd_expirations = 0ULL;
+            it->second.timerfd_interval_ns = iv_ns;
+            if (val_ns == 0) {
+                it->second.timerfd_next_expire_ns = 0;
+            } else if ((flags & 1ULL /* TFD_TIMER_ABSTIME */) != 0ULL) {
+                if (it->second.timerfd_clockid == 0) { // CLOCK_REALTIME
+                    const int64_t real_now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    it->second.timerfd_next_expire_ns = now + (val_ns - real_now);
+                } else {
+                    it->second.timerfd_next_expire_ns = val_ns;
+                }
+            } else {
+                it->second.timerfd_next_expire_ns = now + val_ns;
             }
             return 0;
         }
-        case 22: { // epoll_pwait(epfd, events, maxevents, timeout, sigmask)
+        case 87: { // timerfd_gettime(fd, curr_value)
             auto it = fds.find(static_cast<int>(st.x[0]));
-            if (it == fds.end() || !it->second.is_epoll) return -9;
-            const int timeout_ms = static_cast<int>(static_cast<int32_t>(st.x[3]));
-            if (timeout_ms > 0 && tasks_.size() > 1u) {
-                out_yield = true;
+            if (it == fds.end() || !it->second.is_timerfd) return -9;
+            struct LinuxItimerspec {
+                int64_t it_interval[2];
+                int64_t it_value[2];
+            } cur_spec{};
+            const int64_t now = NowSteadyNs();
+            if (it->second.timerfd_next_expire_ns > now) {
+                const int64_t rem = it->second.timerfd_next_expire_ns - now;
+                cur_spec.it_value[0] = rem / 1000000000LL;
+                cur_spec.it_value[1] = rem % 1000000000LL;
             }
-            return 0;
+            cur_spec.it_interval[0] = it->second.timerfd_interval_ns / 1000000000LL;
+            cur_spec.it_interval[1] = it->second.timerfd_interval_ns % 1000000000LL;
+            return WriteUserBytes(cpu, st.x[1], &cur_spec, sizeof(cur_spec)) ? 0 : -14;
         }
         case 23: { // dup(oldfd)
             int oldfd = static_cast<int>(st.x[0]);
@@ -1855,7 +2526,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             if (newfd <= 2) return newfd;
             auto existing = fds.find(newfd);
             if (existing != fds.end()) {
-                if (existing->second.host_fd >= 0) ::close(existing->second.host_fd);
+                CloseSingleOpenFile(existing->second);
                 fds.erase(existing);
             }
             fds.emplace(newfd, std::move(copy));
@@ -1899,7 +2570,16 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 case 3: // F_GETFL
                     return (fd <= 2) ? 2 : (it->second.nonblock ? 04000 : 0);
                 case 4: // F_SETFL
-                    if (fd > 2) it->second.nonblock = (arg & 04000ULL) != 0ULL;
+                    if (fd > 2) {
+                        it->second.nonblock = (arg & 04000ULL) != 0ULL;
+                        if (it->second.host_fd >= 0) {
+                            int hf = ::fcntl(it->second.host_fd, F_GETFL, 0);
+                            if (hf >= 0) {
+                                ::fcntl(it->second.host_fd, F_SETFL,
+                                        it->second.nonblock ? (hf | O_NONBLOCK) : (hf & ~O_NONBLOCK));
+                            }
+                        }
+                    }
                     return 0;
                 default:
                     return 0;
@@ -1948,7 +2628,8 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             if (nr == 43) {
                 std::string path;
                 if (!ReadUserString(cpu, st.x[0], path)) return -14;
-                const std::string norm = NormalizeGuestPath(path);
+                std::string norm;
+                if (!ResolveGuestPathWithDirfd(fds, -100, path, norm)) return -2;
                 std::string hp, rel;
                 if (!ResolveHostStoragePath(norm, hp, rel)) {
                     std::vector<uint8_t> tmp;
@@ -1990,9 +2671,10 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             int fd = static_cast<int>(st.x[0]);
             auto it = fds.find(fd);
             if (it == fds.end()) return -9;
-            if (it->second.is_memfd) {
+            if (it->second.is_memfd || it->second.is_ashmem) {
                 const size_t new_len = static_cast<size_t>(std::min<uint64_t>(st.x[1], 64ULL * 1024ULL * 1024ULL));
                 it->second.data.resize(new_len, 0u);
+                if (it->second.is_ashmem) it->second.ashmem_size = new_len;
                 return 0;
             }
             if (it->second.host_fd < 0) return -9;
@@ -2035,16 +2717,6 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             uint64_t arg = st.x[2];
             auto it = fds.find(fd);
             if (it != fds.end() && it->second.is_binder) {
-                if (req == 0x40046205ULL) { // BINDER_SET_MAX_THREADS
-                    return 0;
-                }
-                if (req == 0xC0046209ULL) { // BINDER_VERSION
-                    int32_t ver = 8;
-                    return WriteUserBytes(cpu, arg, &ver, sizeof(ver)) ? 0 : -14;
-                }
-                if (req == 0xC0306201ULL) { // BINDER_WRITE_READ
-                    return 0;
-                }
                 if (req == 0x424901ULL) { // HASEEB_BINDER_ADD_SERVICE(const char* name)
                     std::string svc_name;
                     if (!ReadUserString(cpu, arg, svc_name) || svc_name.empty()) return -14;
@@ -2059,7 +2731,47 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 if (req == 0x424902ULL) { // HASEEB_BINDER_LIST_COUNT
                     return static_cast<int64_t>(binder_services_.size());
                 }
-                return 0;
+                bool would_block = false;
+                auto dup_fd_fn = [this](int32_t sender_pid, int32_t target_pid, int32_t sender_fd) -> int32_t {
+                    GuestTask* sender = nullptr;
+                    GuestTask* target = nullptr;
+                    for (auto& t : tasks_) {
+                        if (!t || !t->files) continue;
+                        if (!sender && (t->pid == sender_pid || t->tgid == sender_pid)) sender = t.get();
+                        if (!target && (t->pid == target_pid || t->tgid == target_pid)) target = t.get();
+                    }
+                    if (!sender || !target) return -1;
+                    auto sit = sender->files->fds.find(sender_fd);
+                    if (sit == sender->files->fds.end()) return -1;
+                    OpenFile copy = sit->second;
+                    if (copy.host_fd >= 0) {
+                        copy.host_fd = ::dup(copy.host_fd);
+                        if (copy.host_fd < 0) return -1;
+                    }
+                    copy.fd_flags = 1; // FD_CLOEXEC
+                    const int nfd = target->files->next_fd++;
+                    target->files->fds.emplace(nfd, std::move(copy));
+                    return nfd;
+                };
+                const int64_t brc = binder_broker_.HandleIoctl(
+                    it->second.binder_client_id,
+                    static_cast<uint32_t>(req),
+                    arg,
+                    ram_,
+                    [&](uint64_t uva, void* dst, size_t len) { return ReadUserBytes(cpu, uva, dst, len); },
+                    [&](uint64_t uva, const void* src, size_t len) { return WriteUserBytes(cpu, uva, src, len); },
+                    dup_fd_fn,
+                    [this](int32_t target_pid) { WakeBinderWaitersForPid(target_pid); },
+                    it->second.nonblock,
+                    would_block);
+                if (would_block && cur != nullptr) {
+                    cur->state = TaskState::BinderWait;
+                    st.sys.elr_el1 -= 4ULL;
+                    out_retry = true;
+                    out_yield = true;
+                    return 0;
+                }
+                return brc;
             }
             if (it != fds.end() && it->second.is_framebuffer) {
                 const uint32_t w = gpu_ ? gpu_->DisplayWidth() : 720u;
@@ -2164,6 +2876,79 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                     }
                     return -22; // EINVAL
                 }
+            } else if (it != fds.end() && it->second.is_ashmem) {
+                const uint32_t ioc_type = static_cast<uint32_t>((req >> 8) & 0xFFu);
+                const uint32_t ioc_nr = static_cast<uint32_t>(req & 0xFFu);
+                if (ioc_type == 0x77u) { // '__ASHMEMIOC' = 0x77 ('w')
+                    if (ioc_nr == 1u) { // ASHMEM_SET_NAME
+                        std::string nm;
+                        if (!ReadUserString(cpu, arg, nm)) return -14;
+                        it->second.ashmem_name = nm;
+                        return 0;
+                    }
+                    if (ioc_nr == 2u) { // ASHMEM_GET_NAME
+                        char buf[256]{};
+                        std::snprintf(buf, sizeof(buf), "%s", it->second.ashmem_name.c_str());
+                        return WriteUserBytes(cpu, arg, buf, sizeof(buf)) ? 0 : -14;
+                    }
+                    if (ioc_nr == 3u) { // ASHMEM_SET_SIZE
+                        const size_t new_sz = static_cast<size_t>(
+                            std::min<uint64_t>(arg, 64ULL * 1024ULL * 1024ULL));
+                        it->second.ashmem_size = new_sz;
+                        it->second.data.resize(new_sz, 0u);
+                        return 0;
+                    }
+                    if (ioc_nr == 4u) { // ASHMEM_GET_SIZE
+                        return static_cast<int64_t>(it->second.ashmem_size);
+                    }
+                    if (ioc_nr == 5u) { // ASHMEM_SET_PROT_MASK
+                        it->second.ashmem_prot = static_cast<uint32_t>(arg);
+                        return 0;
+                    }
+                    if (ioc_nr == 6u) { // ASHMEM_GET_PROT_MASK
+                        return static_cast<int64_t>(it->second.ashmem_prot);
+                    }
+                    if (ioc_nr == 7u) { // ASHMEM_PIN
+                        it->second.ashmem_pinned = true;
+                        return 0; // ASHMEM_NOT_PURGED
+                    }
+                    if (ioc_nr == 8u) { // ASHMEM_UNPIN
+                        it->second.ashmem_pinned = false;
+                        return 0;
+                    }
+                    if (ioc_nr == 9u) { // ASHMEM_GET_PIN_STATUS
+                        return it->second.ashmem_pinned ? 0 : 1;
+                    }
+                }
+                return 0;
+            } else if (it != fds.end() && (it->second.is_dma_heap || it->second.is_ion)) {
+                if (req == 0xC0184800ULL /* DMA_HEAP_IOCTL_ALLOC */) {
+                    struct DmaHeapAllocationData {
+                        uint64_t len;
+                        uint32_t fd;
+                        uint32_t fd_flags;
+                        uint64_t heap_flags;
+                    } alloc_req{};
+                    if (!ReadUserBytes(cpu, arg, &alloc_req, sizeof(alloc_req))) return -14;
+                    const size_t sz = static_cast<size_t>(
+                        std::min<uint64_t>(AlignUp4K(alloc_req.len), 64ULL * 1024ULL * 1024ULL));
+                    const int buf_fd = next_fd++;
+                    OpenFile bof;
+                    bof.path = "/dev/dma_heap/system:buf#" + std::to_string(buf_fd);
+                    bof.is_memfd = true;
+                    bof.is_dma_heap = true;
+                    bof.is_writable_mem = true;
+                    bof.ashmem_size = sz;
+                    bof.data.resize(sz, 0u);
+                    bof.shared_pages = std::make_shared<std::vector<uint64_t>>();
+                    bof.fd_flags = ((alloc_req.fd_flags & 02000000u) != 0u) ? 1 : 0;
+                    bof.st_dev = 4ULL;
+                    bof.st_ino = ComputeGuestInode(bof.path);
+                    fds.emplace(buf_fd, std::move(bof));
+                    alloc_req.fd = static_cast<uint32_t>(buf_fd);
+                    return WriteUserBytes(cpu, arg, &alloc_req, sizeof(alloc_req)) ? 0 : -14;
+                }
+                return 0;
             } else if (it != fds.end() &&
                        (it->second.is_sensors || it->second.is_camera ||
                         it->second.is_magisk_su || it->second.is_gles)) {
@@ -2171,6 +2956,29 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                     it->second, req, arg, hardware_, soft_gles_, gpu_, uid_, gid_, active_binary_,
                     [&](uint64_t uva, void* dst, size_t len) { return ReadUserBytes(cpu, uva, dst, len); },
                     [&](uint64_t uva, const void* src, size_t len) { return WriteUserBytes(cpu, uva, src, len); });
+            } else if (it != fds.end()) {
+                if (req == 0x5421ULL) { // FIONBIO
+                    int32_t nb = 0;
+                    if (!ReadUserBytes(cpu, arg, &nb, sizeof(nb))) return -14;
+                    it->second.nonblock = (nb != 0);
+                    if (it->second.host_fd >= 0) {
+                        int hf = ::fcntl(it->second.host_fd, F_GETFL, 0);
+                        if (hf >= 0) {
+                            ::fcntl(it->second.host_fd, F_SETFL,
+                                    it->second.nonblock ? (hf | O_NONBLOCK) : (hf & ~O_NONBLOCK));
+                        }
+                    }
+                    return 0;
+                }
+                if (req == 0x541BULL) { // FIONREAD
+                    int32_t avail = 0;
+                    if (it->second.unix_sock && !it->second.unix_sock->rx_chunks.empty()) {
+                        avail = static_cast<int32_t>(it->second.unix_sock->rx_chunks.front().data.size());
+                    } else if (it->second.host_fd >= 0) {
+                        ::ioctl(it->second.host_fd, FIONREAD, &avail);
+                    }
+                    return WriteUserBytes(cpu, arg, &avail, sizeof(avail)) ? 0 : -14;
+                }
             }
             return 0;
         }
@@ -2201,7 +3009,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             if (fd <= 2) return 0;
             auto it = fds.find(fd);
             if (it == fds.end()) return -9;
-            if (it->second.host_fd >= 0) ::close(it->second.host_fd);
+            CloseSingleOpenFile(it->second);
             fds.erase(it);
             return 0;
         }
@@ -2272,11 +3080,72 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             if (it->second.is_eventfd) {
                 if (count < 8u) return -22;
                 if (it->second.eventfd_counter == 0ULL) {
-                    return -11; // EAGAIN
+                    if (it->second.nonblock || !cur) return -11; // EAGAIN
+                    cur->state = TaskState::PollWait;
+                    cur->poll_wait_epfd = -1;
+                    cur->poll_wait_fds = {EpollWatch{fd, 0x001u, 0ULL}};
+                    cur->poll_has_timeout = false;
+                    st.sys.elr_el1 -= 4ULL;
+                    out_retry = true;
+                    out_yield = true;
+                    return 0;
                 }
                 uint64_t val = it->second.eventfd_counter;
                 it->second.eventfd_counter = 0ULL;
                 return WriteUserBytes(cpu, buf, &val, sizeof(val)) ? 8 : -14;
+            }
+            if (it->second.is_timerfd) {
+                if (count < 8u) return -22;
+                const int64_t now = NowSteadyNs();
+                if (it->second.timerfd_next_expire_ns > 0 && now >= it->second.timerfd_next_expire_ns) {
+                    if (it->second.timerfd_interval_ns > 0) {
+                        const int64_t elapsed = now - it->second.timerfd_next_expire_ns;
+                        const int64_t ticks = 1 + (elapsed / it->second.timerfd_interval_ns);
+                        it->second.timerfd_expirations += static_cast<uint64_t>(ticks);
+                        it->second.timerfd_next_expire_ns += ticks * it->second.timerfd_interval_ns;
+                    } else {
+                        ++it->second.timerfd_expirations;
+                        it->second.timerfd_next_expire_ns = 0;
+                    }
+                }
+                if (it->second.timerfd_expirations == 0ULL) {
+                    if (it->second.nonblock || !cur) return -11; // EAGAIN
+                    cur->state = TaskState::PollWait;
+                    cur->poll_wait_epfd = -1;
+                    cur->poll_wait_fds = {EpollWatch{fd, 0x001u, 0ULL}};
+                    cur->poll_has_timeout = false;
+                    st.sys.elr_el1 -= 4ULL;
+                    out_retry = true;
+                    out_yield = true;
+                    return 0;
+                }
+                uint64_t val = it->second.timerfd_expirations;
+                it->second.timerfd_expirations = 0ULL;
+                return WriteUserBytes(cpu, buf, &val, sizeof(val)) ? 8 : -14;
+            }
+            if (it->second.unix_sock) {
+                auto& sock = *it->second.unix_sock;
+                if (sock.rx_chunks.empty()) {
+                    if (sock.peer_closed || sock.shutdown_rd) return 0;
+                    if (it->second.nonblock || !cur) return -11; // EAGAIN
+                    cur->state = TaskState::PollWait;
+                    cur->poll_wait_epfd = -1;
+                    cur->poll_wait_fds = {EpollWatch{fd, 0x001u, 0ULL}};
+                    cur->poll_has_timeout = false;
+                    st.sys.elr_el1 -= 4ULL;
+                    out_retry = true;
+                    out_yield = true;
+                    return 0;
+                }
+                auto& front = sock.rx_chunks.front();
+                const size_t n = std::min(count, front.data.size());
+                if (n > 0u && !WriteUserBytes(cpu, buf, front.data.data(), n)) return -14;
+                if (sock.sock_type == 1 /* SOCK_STREAM */ && n < front.data.size()) {
+                    front.data.erase(front.data.begin(), front.data.begin() + static_cast<std::ptrdiff_t>(n));
+                } else {
+                    sock.rx_chunks.pop_front();
+                }
+                return static_cast<int64_t>(n);
             }
             if (it->second.input_dev != nullptr) {
                 constexpr size_t kEvSize = sizeof(VirtioInputDevice::LinuxInputEvent);
@@ -2298,7 +3167,20 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             if (it->second.host_fd >= 0) {
                 std::vector<uint8_t> hbuf(count);
                 ssize_t r = ::read(it->second.host_fd, hbuf.data(), count);
-                if (r < 0) return -static_cast<int64_t>(errno);
+                if (r < 0) {
+                    const int err = errno;
+                    if ((err == EAGAIN || err == EWOULDBLOCK) && !it->second.nonblock && cur) {
+                        cur->state = TaskState::PollWait;
+                        cur->poll_wait_epfd = -1;
+                        cur->poll_wait_fds = {EpollWatch{fd, 0x001u, 0ULL}};
+                        cur->poll_has_timeout = false;
+                        st.sys.elr_el1 -= 4ULL;
+                        out_retry = true;
+                        out_yield = true;
+                        return 0;
+                    }
+                    return -static_cast<int64_t>(err);
+                }
                 if (r > 0 && !WriteUserBytes(cpu, buf, hbuf.data(), static_cast<size_t>(r))) return -14;
                 return static_cast<int64_t>(r);
             }
@@ -2356,8 +3238,13 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             }
             auto it = fds.find(fd);
             if (it == fds.end()) return -9;
-            if (it->second.is_stdio_out) {
+            if (it->second.is_stdio_out || it->second.is_tty) {
                 for (uint8_t b : tmp) uart_.Write(0x000ULL, 1, b);
+                return static_cast<int64_t>(count);
+            }
+            if (it->second.is_kmsg) {
+                std::string s(reinterpret_cast<const char*>(tmp.data()), tmp.size());
+                if (!s.empty()) LogToUart("[KMSG] " + s + (s.back() == '\n' ? "" : "\r\n"));
                 return static_cast<int64_t>(count);
             }
             if (it->second.is_dev_null || it->second.is_dev_zero) {
@@ -2368,13 +3255,35 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 uint64_t val = 0;
                 std::memcpy(&val, tmp.data(), sizeof(val));
                 it->second.eventfd_counter += val;
+                WakePollWaiters();
                 return 8;
+            }
+            if (it->second.unix_sock) {
+                auto& sock = *it->second.unix_sock;
+                if (sock.shutdown_wr) return -32; // EPIPE
+                if (sock.peer_path == "/dev/socket/property_service") {
+                    HandleBuiltInPropertyServicePacket(it->second.unix_sock, tmp);
+                    return static_cast<int64_t>(count);
+                }
+                if (sock.peer_path == "/dev/socket/logdw" || sock.peer_path == "/dev/socket/logd") {
+                    HandleBuiltInLogdPacket(tmp);
+                    return static_cast<int64_t>(count);
+                }
+                auto peer = sock.peer.lock();
+                if (!peer || sock.peer_closed) return -32; // EPIPE
+                UnixSocketEndpoint::Chunk ch;
+                ch.data = std::move(tmp);
+                ch.peer_addr = sock.bound_path;
+                peer->rx_chunks.push_back(std::move(ch));
+                WakePollWaiters();
+                return static_cast<int64_t>(count);
             }
             if (it->second.host_fd >= 0) {
                 ssize_t w = ::write(it->second.host_fd, tmp.data(), count);
+                if (w > 0) WakePollWaiters();
                 return (w >= 0) ? static_cast<int64_t>(w) : -static_cast<int64_t>(errno);
             }
-            if (it->second.is_memfd) {
+            if (it->second.is_memfd || it->second.is_ashmem) {
                 const size_t end = it->second.offset + count;
                 if (end > it->second.data.size()) it->second.data.resize(end, 0u);
                 if (count > 0u) std::memcpy(it->second.data.data() + it->second.offset, tmp.data(), count);
@@ -2402,6 +3311,39 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             if (iovcnt < 0) return -22;
             auto it = (fd > 2) ? fds.find(fd) : fds.end();
             if (fd < 0 || (fd > 2 && (it == fds.end() || it->second.is_dir))) return -9;
+            if (fd > 2 && it->second.unix_sock) {
+                auto& sock = *it->second.unix_sock;
+                if (sock.rx_chunks.empty()) {
+                    if (sock.peer_closed || sock.shutdown_rd) return 0;
+                    if (it->second.nonblock || !cur) return -11;
+                    cur->state = TaskState::PollWait;
+                    cur->poll_wait_epfd = -1;
+                    cur->poll_wait_fds = {EpollWatch{fd, 0x001u, 0ULL}};
+                    cur->poll_has_timeout = false;
+                    st.sys.elr_el1 -= 4ULL;
+                    out_retry = true;
+                    out_yield = true;
+                    return 0;
+                }
+                int64_t total = 0;
+                for (int i = 0; i < iovcnt && !sock.rx_chunks.empty(); ++i) {
+                    uint64_t vec[2]{};
+                    if (!ReadUserBytes(cpu, iov_va + static_cast<uint64_t>(i) * 16ULL, vec, 16)) return -14;
+                    const size_t len = static_cast<size_t>(vec[1]);
+                    if (len == 0u) continue;
+                    auto& front = sock.rx_chunks.front();
+                    const size_t n = std::min(len, front.data.size());
+                    if (n > 0u && !WriteUserBytes(cpu, vec[0], front.data.data(), n)) return -14;
+                    total += static_cast<int64_t>(n);
+                    if (sock.sock_type == 1 && n < front.data.size()) {
+                        front.data.erase(front.data.begin(), front.data.begin() + static_cast<std::ptrdiff_t>(n));
+                    } else {
+                        sock.rx_chunks.pop_front();
+                        if (sock.sock_type != 1) break;
+                    }
+                }
+                return total;
+            }
             int64_t total = 0;
             for (int i = 0; i < iovcnt; ++i) {
                 uint64_t vec[2]{};
@@ -2460,6 +3402,39 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             if (iovcnt < 0) return -22;
             auto it = (fd > 2) ? fds.find(fd) : fds.end();
             if (fd != 1 && fd != 2 && (fd < 0 || it == fds.end())) return -9;
+            if (fd > 2 && it->second.unix_sock) {
+                auto& sock = *it->second.unix_sock;
+                if (sock.shutdown_wr) return -32;
+                std::vector<uint8_t> combined;
+                for (int i = 0; i < iovcnt; ++i) {
+                    uint64_t vec[2]{};
+                    if (!ReadUserBytes(cpu, iov_va + static_cast<uint64_t>(i) * 16ULL, vec, 16)) return -14;
+                    if (vec[1] > 0) {
+                        const size_t old_sz = combined.size();
+                        combined.resize(old_sz + static_cast<size_t>(vec[1]));
+                        if (!ReadUserBytes(cpu, vec[0], combined.data() + old_sz, static_cast<size_t>(vec[1]))) {
+                            return -14;
+                        }
+                    }
+                }
+                const int64_t total = static_cast<int64_t>(combined.size());
+                if (sock.peer_path == "/dev/socket/property_service") {
+                    HandleBuiltInPropertyServicePacket(it->second.unix_sock, combined);
+                    return total;
+                }
+                if (sock.peer_path == "/dev/socket/logdw" || sock.peer_path == "/dev/socket/logd") {
+                    HandleBuiltInLogdPacket(combined);
+                    return total;
+                }
+                auto peer = sock.peer.lock();
+                if (!peer || sock.peer_closed) return -32;
+                UnixSocketEndpoint::Chunk ch;
+                ch.data = std::move(combined);
+                ch.peer_addr = sock.bound_path;
+                peer->rx_chunks.push_back(std::move(ch));
+                WakePollWaiters();
+                return total;
+            }
             int64_t total = 0;
             for (int i = 0; i < iovcnt; ++i) {
                 uint64_t vec[2]{};
@@ -2467,16 +3442,21 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 if (vec[1] > 0) {
                     std::vector<uint8_t> tmp(static_cast<size_t>(vec[1]));
                     if (!ReadUserBytes(cpu, vec[0], tmp.data(), tmp.size())) return -14;
-                    if (fd == 1 || fd == 2 || it->second.is_stdio_out) {
+                    if (fd == 1 || fd == 2 || it->second.is_stdio_out || it->second.is_tty) {
                         for (uint8_t b : tmp) uart_.Write(0x000ULL, 1, b);
+                        total += static_cast<int64_t>(vec[1]);
+                    } else if (it->second.is_kmsg) {
+                        std::string s(reinterpret_cast<const char*>(tmp.data()), tmp.size());
+                        if (!s.empty()) LogToUart("[KMSG] " + s + (s.back() == '\n' ? "" : "\r\n"));
                         total += static_cast<int64_t>(vec[1]);
                     } else if (it->second.is_dev_null || it->second.is_dev_zero) {
                         total += static_cast<int64_t>(vec[1]);
                     } else if (it->second.host_fd >= 0) {
                         ssize_t w = ::write(it->second.host_fd, tmp.data(), tmp.size());
                         if (w < 0) return total > 0 ? total : -static_cast<int64_t>(errno);
+                        if (w > 0) WakePollWaiters();
                         total += static_cast<int64_t>(w);
-                    } else if (it->second.is_memfd) {
+                    } else if (it->second.is_memfd || it->second.is_ashmem) {
                         const size_t end = it->second.offset + tmp.size();
                         if (end > it->second.data.size()) it->second.data.resize(end, 0u);
                         std::memcpy(it->second.data.data() + it->second.offset, tmp.data(), tmp.size());
@@ -2532,6 +3512,73 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             }
             return -9;
         }
+        case 72: { // pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)
+            const int nfds = std::clamp(static_cast<int>(static_cast<int32_t>(st.x[0])), 0, 1024);
+            const uint64_t rfds_va = st.x[1];
+            const uint64_t wfds_va = st.x[2];
+            const uint64_t efds_va = st.x[3];
+            const uint64_t tmo_va = st.x[4];
+            bool zero_timeout = false;
+            int64_t dur_ns = -1;
+            if (tmo_va != 0ULL) {
+                int64_t ts[2]{};
+                if (!ReadUserBytes(cpu, tmo_va, ts, sizeof(ts))) return -14;
+                dur_ns = ts[0] * 1000000000LL + ts[1];
+                if (dur_ns < 0) return -22;
+                zero_timeout = (dur_ns == 0);
+            }
+            const size_t mask_bytes = static_cast<size_t>((nfds + 63) / 64) * 8u;
+            std::vector<uint64_t> rm(mask_bytes / 8u, 0ULL), wm(mask_bytes / 8u, 0ULL), em(mask_bytes / 8u, 0ULL);
+            if (mask_bytes > 0u) {
+                if (rfds_va && !ReadUserBytes(cpu, rfds_va, rm.data(), mask_bytes)) return -14;
+                if (wfds_va && !ReadUserBytes(cpu, wfds_va, wm.data(), mask_bytes)) return -14;
+                if (efds_va && !ReadUserBytes(cpu, efds_va, em.data(), mask_bytes)) return -14;
+            }
+            std::vector<uint64_t> out_r(rm.size(), 0ULL), out_w(wm.size(), 0ULL), out_e(em.size(), 0ULL);
+            std::vector<EpollWatch> watches;
+            int ready = 0;
+            for (int fd = 0; fd < nfds; ++fd) {
+                const size_t word = static_cast<size_t>(fd) / 64u;
+                const uint64_t bit = 1ULL << (static_cast<unsigned>(fd) % 64u);
+                const bool want_r = rfds_va && (rm[word] & bit) != 0ULL;
+                const bool want_w = wfds_va && (wm[word] & bit) != 0ULL;
+                const bool want_e = efds_va && (em[word] & bit) != 0ULL;
+                if (!want_r && !want_w && !want_e) continue;
+                const uint32_t rev = ComputeGuestFdPollEvents(fds, fd);
+                if ((rev & 0x020u) != 0u) return -9; // EBADF
+                if (want_r && (rev & (0x001u | 0x010u)) != 0u) { out_r[word] |= bit; ++ready; }
+                if (want_w && (rev & 0x004u) != 0u)            { out_w[word] |= bit; ++ready; }
+                if (want_e && (rev & 0x008u) != 0u)            { out_e[word] |= bit; ++ready; }
+                uint32_t wmask = 0u;
+                if (want_r) wmask |= 0x001u;
+                if (want_w) wmask |= 0x004u;
+                if (want_e) wmask |= 0x008u;
+                watches.push_back(EpollWatch{fd, wmask, 0ULL});
+            }
+            if (ready == 0 && !zero_timeout && cur != nullptr && (!watches.empty() || dur_ns > 0)) {
+                if (watches.empty()) {
+                    cur->state = TaskState::Sleeping;
+                    cur->wakeup_ns = NowSteadyNs() + std::min<int64_t>(dur_ns, 5000000000LL);
+                    out_yield = true;
+                    return 0;
+                }
+                cur->state = TaskState::PollWait;
+                cur->poll_wait_epfd = -1;
+                cur->poll_wait_fds = std::move(watches);
+                cur->poll_has_timeout = (dur_ns > 0);
+                cur->poll_deadline_ns = (dur_ns > 0) ? (NowSteadyNs() + dur_ns) : 0;
+                st.sys.elr_el1 -= 4ULL;
+                out_retry = true;
+                out_yield = true;
+                return 0;
+            }
+            if (mask_bytes > 0u) {
+                if (rfds_va && !WriteUserBytes(cpu, rfds_va, out_r.data(), mask_bytes)) return -14;
+                if (wfds_va && !WriteUserBytes(cpu, wfds_va, out_w.data(), mask_bytes)) return -14;
+                if (efds_va && !WriteUserBytes(cpu, efds_va, out_e.data(), mask_bytes)) return -14;
+            }
+            return ready;
+        }
         case 73: { // ppoll(struct pollfd* fds, nfds_t nfds, const struct timespec* tmo_p, sigmask)
             struct LinuxPollFd {
                 int32_t fd;
@@ -2539,49 +3586,53 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 int16_t revents;
             };
             const uint64_t fds_va = st.x[0];
-            const size_t nfds = std::min<size_t>(static_cast<size_t>(st.x[1]), 64u);
+            const size_t nfds = std::min<size_t>(static_cast<size_t>(st.x[1]), 128u);
             const uint64_t tmo_va = st.x[2];
             bool zero_timeout = false;
+            int64_t dur_ns = -1;
             if (tmo_va != 0ULL) {
                 int64_t ts[2]{};
                 if (!ReadUserBytes(cpu, tmo_va, ts, sizeof(ts))) return -14;
-                zero_timeout = (ts[0] == 0 && ts[1] == 0);
+                dur_ns = ts[0] * 1000000000LL + ts[1];
+                if (dur_ns < 0) return -22;
+                zero_timeout = (dur_ns == 0);
             }
             std::vector<LinuxPollFd> pfds(nfds);
             if (nfds > 0u && !ReadUserBytes(cpu, fds_va, pfds.data(), nfds * sizeof(LinuxPollFd))) {
                 return -14;
             }
             int ready = 0;
+            std::vector<EpollWatch> watches;
             for (auto& p : pfds) {
                 p.revents = 0;
                 if (p.fd < 0) continue;
-                bool readable = false;
-                if (p.fd == 0) {
-                    readable = (uart_.Read(0x018ULL, 4) & (1u << 4)) == 0u;
-                } else {
-                    auto f_it = fds.find(p.fd);
-                    if (f_it == fds.end()) {
-                        p.revents = 0x20; // POLLNVAL
-                        ++ready;
-                        continue;
-                    }
-                    if (f_it->second.input_dev != nullptr) {
-                        readable = f_it->second.input_dev->HasPendingEvdev();
-                    } else if (f_it->second.is_eventfd) {
-                        readable = f_it->second.eventfd_counter > 0ULL;
-                    } else {
-                        readable = true;
-                    }
-                }
-                if (readable && (p.events & 1 /* POLLIN */) != 0) {
-                    p.revents = 1;
+                const uint32_t rev = ComputeGuestFdPollEvents(fds, p.fd);
+                if ((rev & 0x020u /* POLLNVAL */) != 0u) {
+                    p.revents = 0x20;
                     ++ready;
+                    continue;
                 }
+                const uint32_t want = static_cast<uint32_t>(static_cast<uint16_t>(p.events));
+                const uint32_t hit = rev & (want | 0x008u | 0x010u); // POLLERR|POLLHUP
+                p.revents = static_cast<int16_t>(hit);
+                if (hit != 0u) ++ready;
+                watches.push_back(EpollWatch{p.fd, want, 0ULL});
             }
-            if (ready == 0 && !zero_timeout && nfds > 0u) {
-                st.waiting_for_interrupt = true;
+            if (ready == 0 && !zero_timeout && cur != nullptr && (!watches.empty() || dur_ns > 0)) {
+                if (watches.empty()) {
+                    cur->state = TaskState::Sleeping;
+                    cur->wakeup_ns = NowSteadyNs() + std::min<int64_t>(dur_ns, 5000000000LL);
+                    out_yield = true;
+                    return 0;
+                }
+                cur->state = TaskState::PollWait;
+                cur->poll_wait_epfd = -1;
+                cur->poll_wait_fds = std::move(watches);
+                cur->poll_has_timeout = (dur_ns > 0);
+                cur->poll_deadline_ns = (dur_ns > 0) ? (NowSteadyNs() + dur_ns) : 0;
                 st.sys.elr_el1 -= 4ULL;
                 out_retry = true;
+                out_yield = true;
                 return 0;
             }
             if (nfds > 0u && !WriteUserBytes(cpu, fds_va, pfds.data(), nfds * sizeof(LinuxPollFd))) {
@@ -2703,24 +3754,51 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 out_halt = true;
                 return 0;
             }
-            const int32_t dead_pid = cur->pid;
-            const int32_t ppid = cur->ppid;
-            if (cur->clear_child_tid != 0ULL) {
-                uint32_t zero = 0u;
-                WriteUserBytes(cpu, cur->clear_child_tid, &zero, sizeof(zero));
-            }
-            CloseTaskOpenFds(*cur);
-            cur->state = TaskState::Zombie;
-            cur->exit_status = status;
+            const int32_t cur_tgid = cur->tgid;
+            const int32_t cur_ppid = cur->ppid;
+            auto clear_and_wake_tid = [&](GuestTask& task) {
+                if (task.clear_child_tid != 0ULL) {
+                    uint32_t zero = 0u;
+                    WriteUserBytes(cpu, task.clear_child_tid, &zero, sizeof(zero));
+                    const auto tr = cpu.Mmu().Translate(st, task.clear_child_tid, MemAccessType::Read, false);
+                    if (tr.ok) {
+                        WakeFutexWaiters(tr.phys_addr, 1, 0xFFFFFFFFu);
+                    }
+                }
+            };
 
-            for (auto& t : tasks_) {
-                if (t && t->pid == ppid && t->state == TaskState::WaitingChild &&
-                    (t->wait_target_pid == -1 || t->wait_target_pid == 0 ||
-                     t->wait_target_pid == dead_pid)) {
-                    t->state = TaskState::Runnable;
+            if (nr == 94) { // exit_group kills all threads sharing tgid
+                for (auto& t : tasks_) {
+                    if (!t || t->state == TaskState::Zombie || t->tgid != cur_tgid) continue;
+                    clear_and_wake_tid(*t);
+                    CloseTaskOpenFds(*t);
+                    t->state = TaskState::Zombie;
+                    t->exit_status = status;
+                }
+            } else { // exit terminates calling thread only
+                clear_and_wake_tid(*cur);
+                CloseTaskOpenFds(*cur);
+                cur->state = TaskState::Zombie;
+                cur->exit_status = status;
+            }
+
+            bool group_still_alive = false;
+            for (const auto& t : tasks_) {
+                if (t && t->tgid == cur_tgid && t->state != TaskState::Zombie) {
+                    group_still_alive = true;
+                    break;
                 }
             }
-            if (dead_pid == 1 || ActiveTaskCount() == 0u) {
+            if (!group_still_alive) {
+                for (auto& t : tasks_) {
+                    if (t && t->tgid == cur_ppid && t->state == TaskState::WaitingChild &&
+                        (t->wait_target_pid == -1 || t->wait_target_pid == 0 ||
+                         t->wait_target_pid == cur_tgid)) {
+                        t->state = TaskState::Runnable;
+                    }
+                }
+            }
+            if ((cur_tgid == 1 && !group_still_alive) || ActiveTaskCount() == 0u) {
                 exit_status_ = status;
                 exited_ = true;
                 out_halt = true;
@@ -2734,15 +3812,115 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             return cur ? cur->pid : 1;
         }
         case 98: { // futex(uaddr, futex_op, val, timeout, uaddr2, val3)
-            const uint32_t op = static_cast<uint32_t>(st.x[1]) & 0x7Fu;
-            if (op == 0u) { // FUTEX_WAIT
+            const uint32_t raw_op = static_cast<uint32_t>(st.x[1]);
+            const uint32_t op = raw_op & 0x7Fu;
+            const auto tr1 = cpu.Mmu().Translate(st, st.x[0], MemAccessType::Read, false);
+            if (!tr1.ok) return -14; // EFAULT
+            const uint64_t pa1 = tr1.phys_addr;
+
+            if (op == 0u || op == 9u) { // FUTEX_WAIT / FUTEX_WAIT_BITSET
+                const uint32_t bitset = (op == 9u) ? static_cast<uint32_t>(st.x[5]) : 0xFFFFFFFFu;
+                if (bitset == 0u) return -22; // EINVAL
                 uint32_t cur_val = 0u;
                 if (!ReadUserBytes(cpu, st.x[0], &cur_val, sizeof(cur_val))) return -14;
                 if (cur_val != static_cast<uint32_t>(st.x[2])) return -11; // EAGAIN
+                bool has_tmo = false;
+                int64_t deadline_ns = 0;
+                if (st.x[3] != 0ULL) {
+                    int64_t ts[2]{};
+                    if (!ReadUserBytes(cpu, st.x[3], ts, sizeof(ts))) return -14;
+                    if (ts[0] < 0 || ts[1] < 0 || ts[1] >= 1000000000LL) return -22;
+                    const int64_t tns = ts[0] * 1000000000LL + ts[1];
+                    has_tmo = true;
+                    if (op == 9u) { // FUTEX_WAIT_BITSET uses absolute deadline
+                        if ((raw_op & 256u /* FUTEX_CLOCK_REALTIME */) != 0u) {
+                            const int64_t real_now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count();
+                            deadline_ns = NowSteadyNs() + (tns - real_now);
+                        } else {
+                            deadline_ns = tns;
+                        }
+                    } else { // FUTEX_WAIT uses relative duration
+                        deadline_ns = NowSteadyNs() + tns;
+                    }
+                    if (deadline_ns <= NowSteadyNs()) return -110; // ETIMEDOUT
+                }
+                if (cur) {
+                    cur->state = TaskState::FutexWait;
+                    cur->futex_pa = pa1;
+                    cur->futex_bitset = bitset;
+                    cur->futex_has_timeout = has_tmo;
+                    cur->futex_deadline_ns = deadline_ns;
+                }
                 out_yield = true;
                 return 0;
             }
-            return 0; // FUTEX_WAKE / others
+            if (op == 1u || op == 10u) { // FUTEX_WAKE / FUTEX_WAKE_BITSET
+                const uint32_t bitset = (op == 10u) ? static_cast<uint32_t>(st.x[5]) : 0xFFFFFFFFu;
+                if (bitset == 0u) return -22;
+                const int max_wake = std::max(0, static_cast<int>(static_cast<int32_t>(st.x[2])));
+                return WakeFutexWaiters(pa1, max_wake, bitset);
+            }
+            if (op == 3u || op == 4u) { // FUTEX_REQUEUE / FUTEX_CMP_REQUEUE
+                if (op == 4u) {
+                    uint32_t cur_val = 0u;
+                    if (!ReadUserBytes(cpu, st.x[0], &cur_val, sizeof(cur_val))) return -14;
+                    if (cur_val != static_cast<uint32_t>(st.x[5])) return -11; // EAGAIN
+                }
+                const auto tr2 = cpu.Mmu().Translate(st, st.x[4], MemAccessType::Read, false);
+                if (!tr2.ok) return -14;
+                const int max_wake = std::max(0, static_cast<int>(static_cast<int32_t>(st.x[2])));
+                const int max_requeue = std::max(0, static_cast<int>(static_cast<int32_t>(st.x[3])));
+                int woken = WakeFutexWaiters(pa1, max_wake, 0xFFFFFFFFu);
+                int requeued = 0;
+                if (max_requeue > 0) {
+                    for (auto& t : tasks_) {
+                        if (!t || t->state != TaskState::FutexWait || t->futex_pa != pa1) continue;
+                        t->futex_pa = tr2.phys_addr;
+                        ++requeued;
+                        if (requeued >= max_requeue) break;
+                    }
+                }
+                return woken + requeued;
+            }
+            if (op == 5u) { // FUTEX_WAKE_OP
+                const auto tr2 = cpu.Mmu().Translate(st, st.x[4], MemAccessType::Read, false);
+                if (!tr2.ok) return -14;
+                uint32_t oldval = 0u;
+                if (!ReadUserBytes(cpu, st.x[4], &oldval, sizeof(oldval))) return -14;
+                const uint32_t val3 = static_cast<uint32_t>(st.x[5]);
+                const uint32_t op_type = (val3 >> 28) & 0xFu;
+                const uint32_t cmp_type = (val3 >> 24) & 0xFu;
+                const uint32_t oparg_raw = (val3 >> 12) & 0xFFFu;
+                const uint32_t oparg = ((op_type & 8u) != 0u) ? (1u << (oparg_raw & 31u)) : oparg_raw;
+                const uint32_t cmparg = val3 & 0xFFFu;
+                uint32_t newval = oldval;
+                switch (op_type & 7u) {
+                    case 0u: newval = oparg; break;
+                    case 1u: newval = oldval + oparg; break;
+                    case 2u: newval = oldval | oparg; break;
+                    case 3u: newval = oldval & ~oparg; break;
+                    case 4u: newval = oldval ^ oparg; break;
+                    default: break;
+                }
+                if (!WriteUserBytes(cpu, st.x[4], &newval, sizeof(newval))) return -14;
+                const int max_wake1 = std::max(0, static_cast<int>(static_cast<int32_t>(st.x[2])));
+                const int max_wake2 = std::max(0, static_cast<int>(static_cast<int32_t>(st.x[3])));
+                int woken = WakeFutexWaiters(pa1, max_wake1, 0xFFFFFFFFu);
+                bool cmp_ok = false;
+                switch (cmp_type) {
+                    case 0u: cmp_ok = (oldval == cmparg); break;
+                    case 1u: cmp_ok = (oldval != cmparg); break;
+                    case 2u: cmp_ok = (oldval < cmparg); break;
+                    case 3u: cmp_ok = (oldval <= cmparg); break;
+                    case 4u: cmp_ok = (oldval > cmparg); break;
+                    case 5u: cmp_ok = (oldval >= cmparg); break;
+                    default: break;
+                }
+                if (cmp_ok) woken += WakeFutexWaiters(tr2.phys_addr, max_wake2, 0xFFFFFFFFu);
+                return woken;
+            }
+            return 0;
         }
         case 99: // set_robust_list
             return 0;
@@ -2910,6 +4088,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             return 0;
         }
         case 172: // getpid
+            return cur ? cur->tgid : 1;
         case 178: // gettid
             return cur ? cur->pid : 1;
         case 173: // getppid
@@ -2920,47 +4099,736 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
         case 176: // getgid
         case 177: // getegid
             return static_cast<int64_t>(gid_);
+        case 198: { // socket(domain, type, protocol)
+            const int domain = static_cast<int>(st.x[0]);
+            const int raw_type = static_cast<int>(st.x[1]);
+            const int protocol = static_cast<int>(st.x[2]);
+            const int base_type = raw_type & 0xF;
+            const bool nb = (raw_type & 04000) != 0;
+            const int clo = ((raw_type & 02000000) != 0) ? 1 : 0;
+
+            if (domain == 1 /* AF_UNIX */) {
+                auto ep = std::make_shared<UnixSocketEndpoint>();
+                ep->domain = 1;
+                ep->sock_type = (base_type == 0) ? 1 : base_type;
+                const int sfd = next_fd++;
+                OpenFile of;
+                of.path = "socket:[unix#" + std::to_string(sfd) + "]";
+                of.fd_flags = clo;
+                of.nonblock = nb;
+                of.unix_sock = std::move(ep);
+                of.st_dev = 4ULL;
+                of.st_ino = ComputeGuestInode(of.path);
+                fds.emplace(sfd, std::move(of));
+                return sfd;
+            }
+            if (domain == 2 /* AF_INET */ || domain == 10 /* AF_INET6 */) {
+                const int host_dom = (domain == 10) ? AF_INET6 : AF_INET;
+                const int htype = (base_type == 2) ? SOCK_DGRAM : SOCK_STREAM;
+                int hfd = ::socket(host_dom, htype, protocol);
+                if (hfd < 0) return -static_cast<int64_t>(errno);
+                if (nb) {
+                    const int fl = ::fcntl(hfd, F_GETFL, 0);
+                    if (fl >= 0) ::fcntl(hfd, F_SETFL, fl | O_NONBLOCK);
+                }
+                ::fcntl(hfd, F_SETFD, FD_CLOEXEC);
+                const int sfd = next_fd++;
+                OpenFile of;
+                of.path = "socket:[inet#" + std::to_string(sfd) + "]";
+                of.host_fd = hfd;
+                of.is_host_inet_sock = true;
+                of.host_sock_domain = host_dom;
+                of.host_sock_type = htype;
+                of.fd_flags = clo;
+                of.nonblock = nb;
+                of.st_dev = 4ULL;
+                of.st_ino = ComputeGuestInode(of.path);
+                fds.emplace(sfd, std::move(of));
+                return sfd;
+            }
+            return -97; // EAFNOSUPPORT
+        }
         case 199: { // socketpair(domain, type, protocol, sv[2])
             const int domain = static_cast<int>(st.x[0]);
             const int raw_type = static_cast<int>(st.x[1]);
             const int base_type = raw_type & 0xF;
             if (domain != 1 /* AF_UNIX */) return -97;
-            int sv[2]{-1, -1};
-            if (::socketpair(AF_UNIX, base_type == 2 ? SOCK_DGRAM : SOCK_STREAM, 0, sv) != 0) {
-                return -static_cast<int64_t>(errno);
-            }
             const bool nb = (raw_type & 04000) != 0;
             const int clo = ((raw_type & 02000000) != 0) ? 1 : 0;
-            if (nb) {
-                ::fcntl(sv[0], F_SETFL, O_NONBLOCK);
-                ::fcntl(sv[1], F_SETFL, O_NONBLOCK);
-            }
-            int fd0 = next_fd++;
-            int fd1 = next_fd++;
+
+            auto ep0 = std::make_shared<UnixSocketEndpoint>();
+            auto ep1 = std::make_shared<UnixSocketEndpoint>();
+            ep0->domain = 1;
+            ep1->domain = 1;
+            ep0->sock_type = (base_type == 0) ? 1 : base_type;
+            ep1->sock_type = ep0->sock_type;
+            ep0->peer = ep1;
+            ep1->peer = ep0;
+
+            const int fd0 = next_fd++;
+            const int fd1 = next_fd++;
             OpenFile f0, f1;
-            f0.path = "socket:[0]";
-            f0.host_fd = sv[0];
+            f0.path = "socket:[pair#" + std::to_string(fd0) + "]";
+            f0.unix_sock = ep0;
             f0.fd_flags = clo;
             f0.nonblock = nb;
             f0.st_dev = 4ULL;
-            f0.st_ino = ComputeGuestInode(f0.path + "#" + std::to_string(fd0));
-            f1.path = "socket:[1]";
-            f1.host_fd = sv[1];
+            f0.st_ino = ComputeGuestInode(f0.path);
+            f1.path = "socket:[pair#" + std::to_string(fd1) + "]";
+            f1.unix_sock = ep1;
             f1.fd_flags = clo;
             f1.nonblock = nb;
             f1.st_dev = 4ULL;
-            f1.st_ino = ComputeGuestInode(f1.path + "#" + std::to_string(fd1));
+            f1.st_ino = ComputeGuestInode(f1.path);
             fds.emplace(fd0, std::move(f0));
             fds.emplace(fd1, std::move(f1));
             int32_t out[2] = {fd0, fd1};
             if (!WriteUserBytes(cpu, st.x[3], out, sizeof(out))) return -14;
             return 0;
         }
-        case 198: // socket
-        case 203: // connect
-        case 208: // setsockopt
-        case 209: // getsockopt
-            return (nr == 198) ? -97 : 0; // -EAFNOSUPPORT / ok
+        case 200: { // bind(fd, addr, addrlen)
+            const int sfd = static_cast<int>(st.x[0]);
+            auto it = fds.find(sfd);
+            if (it == fds.end()) return -9;
+            const size_t alen = std::min<size_t>(static_cast<size_t>(st.x[2]), 256u);
+            if (alen < 2u) return -22;
+            std::vector<uint8_t> sa(alen);
+            if (!ReadUserBytes(cpu, st.x[1], sa.data(), alen)) return -14;
+            if (it->second.unix_sock) {
+                std::string key;
+                if (!ParseGuestUnixPath(sa.data(), alen, key)) return -22;
+                auto existing = unix_bound_sockets_.find(key);
+                if (existing != unix_bound_sockets_.end() && !existing->second.expired()) {
+                    return -98; // EADDRINUSE
+                }
+                it->second.unix_sock->bound_path = key;
+                unix_bound_sockets_[key] = it->second.unix_sock;
+                return 0;
+            }
+            if (it->second.is_host_inet_sock && it->second.host_fd >= 0) {
+                const int rc = ::bind(it->second.host_fd,
+                                      reinterpret_cast<const struct sockaddr*>(sa.data()),
+                                      static_cast<socklen_t>(alen));
+                return (rc == 0) ? 0 : -static_cast<int64_t>(errno);
+            }
+            return -88; // ENOTSOCK
+        }
+        case 201: { // listen(fd, backlog)
+            const int sfd = static_cast<int>(st.x[0]);
+            auto it = fds.find(sfd);
+            if (it == fds.end()) return -9;
+            const int backlog = std::max(1, static_cast<int>(st.x[1]));
+            if (it->second.unix_sock) {
+                it->second.unix_sock->listening = true;
+                it->second.unix_sock->backlog = backlog;
+                return 0;
+            }
+            if (it->second.is_host_inet_sock && it->second.host_fd >= 0) {
+                return (::listen(it->second.host_fd, backlog) == 0) ? 0 : -static_cast<int64_t>(errno);
+            }
+            return -88;
+        }
+        case 202:   // accept(fd, addr, addrlen)
+        case 242: { // accept4(fd, addr, addrlen, flags)
+            const int sfd = static_cast<int>(st.x[0]);
+            auto it = fds.find(sfd);
+            if (it == fds.end()) return -9;
+            const uint64_t aflags = (nr == 242) ? st.x[3] : 0ULL;
+            const bool nb = (aflags & 04000ULL) != 0ULL;
+            const int clo = ((aflags & 02000000ULL) != 0ULL) ? 1 : 0;
+
+            if (it->second.unix_sock) {
+                auto& lsock = *it->second.unix_sock;
+                if (!lsock.listening) return -22;
+                if (lsock.pending_accept.empty()) {
+                    if (it->second.nonblock || !cur) return -11; // EAGAIN
+                    cur->state = TaskState::PollWait;
+                    cur->poll_wait_epfd = -1;
+                    cur->poll_wait_fds = {EpollWatch{sfd, 0x001u, 0ULL}};
+                    cur->poll_has_timeout = false;
+                    st.sys.elr_el1 -= 4ULL;
+                    out_retry = true;
+                    out_yield = true;
+                    return 0;
+                }
+                auto conn = lsock.pending_accept.front();
+                lsock.pending_accept.pop_front();
+                const int nfd = next_fd++;
+                OpenFile nof;
+                nof.path = "socket:[accepted#" + std::to_string(nfd) + "]";
+                nof.unix_sock = conn;
+                nof.fd_flags = clo;
+                nof.nonblock = nb;
+                nof.st_dev = 4ULL;
+                nof.st_ino = ComputeGuestInode(nof.path);
+                fds.emplace(nfd, std::move(nof));
+
+                if (st.x[1] != 0ULL && st.x[2] != 0ULL) {
+                    uint32_t ulen = 0u;
+                    if (ReadUserBytes(cpu, st.x[2], &ulen, sizeof(ulen))) {
+                        struct sockaddr_un un{};
+                        un.sun_family = 1;
+                        uint32_t actual = 2u;
+                        if (!conn->peer_path.empty()) {
+                            if (conn->peer_path.front() == '@') {
+                                const size_t copy_n = std::min(conn->peer_path.size() - 1u, sizeof(un.sun_path) - 1u);
+                                un.sun_path[0] = '\0';
+                                std::memcpy(un.sun_path + 1, conn->peer_path.data() + 1u, copy_n);
+                                actual = static_cast<uint32_t>(3u + copy_n);
+                            } else {
+                                const size_t copy_n = std::min(conn->peer_path.size(), sizeof(un.sun_path) - 1u);
+                                std::memcpy(un.sun_path, conn->peer_path.data(), copy_n);
+                                actual = static_cast<uint32_t>(2u + copy_n + 1u);
+                            }
+                        }
+                        const size_t wr = std::min<size_t>(ulen, actual);
+                        if (wr > 0u) WriteUserBytes(cpu, st.x[1], &un, wr);
+                        WriteUserBytes(cpu, st.x[2], &actual, sizeof(actual));
+                    }
+                }
+                return nfd;
+            }
+            if (it->second.is_host_inet_sock && it->second.host_fd >= 0) {
+                uint8_t sa[128]{};
+                socklen_t slen = sizeof(sa);
+                int hnew = ::accept(it->second.host_fd, reinterpret_cast<struct sockaddr*>(sa), &slen);
+                if (hnew < 0) return -static_cast<int64_t>(errno);
+                if (nb) {
+                    const int fl = ::fcntl(hnew, F_GETFL, 0);
+                    if (fl >= 0) ::fcntl(hnew, F_SETFL, fl | O_NONBLOCK);
+                }
+                ::fcntl(hnew, F_SETFD, FD_CLOEXEC);
+                const int nfd = next_fd++;
+                OpenFile nof;
+                nof.path = "socket:[inet_acc#" + std::to_string(nfd) + "]";
+                nof.host_fd = hnew;
+                nof.is_host_inet_sock = true;
+                nof.host_sock_domain = it->second.host_sock_domain;
+                nof.host_sock_type = it->second.host_sock_type;
+                nof.fd_flags = clo;
+                nof.nonblock = nb;
+                nof.st_dev = 4ULL;
+                nof.st_ino = ComputeGuestInode(nof.path);
+                fds.emplace(nfd, std::move(nof));
+                if (st.x[1] != 0ULL && st.x[2] != 0ULL) {
+                    uint32_t ulen = 0u;
+                    if (ReadUserBytes(cpu, st.x[2], &ulen, sizeof(ulen))) {
+                        const uint32_t actual = static_cast<uint32_t>(slen);
+                        const size_t wr = std::min<size_t>(ulen, actual);
+                        if (wr > 0u) WriteUserBytes(cpu, st.x[1], sa, wr);
+                        WriteUserBytes(cpu, st.x[2], &actual, sizeof(actual));
+                    }
+                }
+                return nfd;
+            }
+            return -88;
+        }
+        case 203: { // connect(fd, addr, addrlen)
+            const int sfd = static_cast<int>(st.x[0]);
+            auto it = fds.find(sfd);
+            if (it == fds.end()) return -9;
+            const size_t alen = std::min<size_t>(static_cast<size_t>(st.x[2]), 256u);
+            if (alen < 2u) return -22;
+            std::vector<uint8_t> sa(alen);
+            if (!ReadUserBytes(cpu, st.x[1], sa.data(), alen)) return -14;
+            if (it->second.unix_sock) {
+                std::string target;
+                if (!ParseGuestUnixPath(sa.data(), alen, target)) return -22;
+                if (target == "/dev/socket/property_service" ||
+                    target == "/dev/socket/logdw" ||
+                    target == "/dev/socket/logd") {
+                    it->second.unix_sock->peer_path = target;
+                    it->second.unix_sock->peer_closed = false;
+                    return 0;
+                }
+                auto bit = unix_bound_sockets_.find(target);
+                if (bit == unix_bound_sockets_.end()) return -111; // ECONNREFUSED
+                auto target_ep = bit->second.lock();
+                if (!target_ep) return -111;
+                if (target_ep->listening) {
+                    auto srv_ep = std::make_shared<UnixSocketEndpoint>();
+                    srv_ep->domain = 1;
+                    srv_ep->sock_type = it->second.unix_sock->sock_type;
+                    srv_ep->bound_path = target;
+                    srv_ep->peer_path = it->second.unix_sock->bound_path;
+                    srv_ep->peer = it->second.unix_sock;
+                    it->second.unix_sock->peer = srv_ep;
+                    it->second.unix_sock->peer_path = target;
+                    it->second.unix_sock->peer_closed = false;
+                    target_ep->pending_accept.push_back(std::move(srv_ep));
+                    WakePollWaiters();
+                    return 0;
+                }
+                it->second.unix_sock->peer = target_ep;
+                it->second.unix_sock->peer_path = target;
+                it->second.unix_sock->peer_closed = false;
+                return 0;
+            }
+            if (it->second.is_host_inet_sock && it->second.host_fd >= 0) {
+                const int rc = ::connect(it->second.host_fd,
+                                         reinterpret_cast<const struct sockaddr*>(sa.data()),
+                                         static_cast<socklen_t>(alen));
+                if (rc == 0) return 0;
+                it->second.so_error = errno;
+                return -static_cast<int64_t>(errno);
+            }
+            return -88;
+        }
+        case 204:   // getsockname(fd, addr, addrlen)
+        case 205: { // getpeername(fd, addr, addrlen)
+            const int sfd = static_cast<int>(st.x[0]);
+            auto it = fds.find(sfd);
+            if (it == fds.end()) return -9;
+            if (it->second.unix_sock) {
+                const std::string& p = (nr == 204) ? it->second.unix_sock->bound_path
+                                                   : it->second.unix_sock->peer_path;
+                uint32_t ulen = 0u;
+                if (!ReadUserBytes(cpu, st.x[2], &ulen, sizeof(ulen))) return -14;
+                struct sockaddr_un un{};
+                un.sun_family = 1;
+                uint32_t actual = 2u;
+                if (!p.empty()) {
+                    if (p.front() == '@') {
+                        const size_t copy_n = std::min(p.size() - 1u, sizeof(un.sun_path) - 1u);
+                        un.sun_path[0] = '\0';
+                        std::memcpy(un.sun_path + 1, p.data() + 1u, copy_n);
+                        actual = static_cast<uint32_t>(3u + copy_n);
+                    } else {
+                        const size_t copy_n = std::min(p.size(), sizeof(un.sun_path) - 1u);
+                        std::memcpy(un.sun_path, p.data(), copy_n);
+                        actual = static_cast<uint32_t>(2u + copy_n + 1u);
+                    }
+                }
+                const size_t wr = std::min<size_t>(ulen, actual);
+                if (wr > 0u && !WriteUserBytes(cpu, st.x[1], &un, wr)) return -14;
+                if (!WriteUserBytes(cpu, st.x[2], &actual, sizeof(actual))) return -14;
+                return 0;
+            }
+            if (it->second.is_host_inet_sock && it->second.host_fd >= 0) {
+                uint32_t ulen = 0u;
+                if (!ReadUserBytes(cpu, st.x[2], &ulen, sizeof(ulen))) return -14;
+                uint8_t sa[128]{};
+                socklen_t slen = sizeof(sa);
+                const int rc = (nr == 204)
+                    ? ::getsockname(it->second.host_fd, reinterpret_cast<struct sockaddr*>(sa), &slen)
+                    : ::getpeername(it->second.host_fd, reinterpret_cast<struct sockaddr*>(sa), &slen);
+                if (rc != 0) return -static_cast<int64_t>(errno);
+                const uint32_t actual = static_cast<uint32_t>(slen);
+                const size_t wr = std::min<size_t>(ulen, actual);
+                if (wr > 0u && !WriteUserBytes(cpu, st.x[1], sa, wr)) return -14;
+                if (!WriteUserBytes(cpu, st.x[2], &actual, sizeof(actual))) return -14;
+                return 0;
+            }
+            return -88;
+        }
+        case 206: { // sendto(fd, buf, len, flags, dest_addr, addrlen)
+            const int sfd = static_cast<int>(st.x[0]);
+            auto it = fds.find(sfd);
+            if (it == fds.end()) return -9;
+            const size_t len = static_cast<size_t>(st.x[2]);
+            std::vector<uint8_t> tmp(len);
+            if (len > 0u && !ReadUserBytes(cpu, st.x[1], tmp.data(), len)) return -14;
+
+            if (it->second.unix_sock) {
+                auto& sock = *it->second.unix_sock;
+                if (sock.shutdown_wr) return -32;
+                std::string dest_key = sock.peer_path;
+                if (st.x[4] != 0ULL && st.x[5] >= 2ULL) {
+                    const size_t alen = std::min<size_t>(static_cast<size_t>(st.x[5]), 256u);
+                    std::vector<uint8_t> sa(alen);
+                    if (!ReadUserBytes(cpu, st.x[4], sa.data(), alen)) return -14;
+                    ParseGuestUnixPath(sa.data(), alen, dest_key);
+                }
+                if (dest_key == "/dev/socket/property_service") {
+                    HandleBuiltInPropertyServicePacket(it->second.unix_sock, tmp);
+                    return static_cast<int64_t>(len);
+                }
+                if (dest_key == "/dev/socket/logdw" || dest_key == "/dev/socket/logd") {
+                    HandleBuiltInLogdPacket(tmp);
+                    return static_cast<int64_t>(len);
+                }
+                std::shared_ptr<UnixSocketEndpoint> target_ep = sock.peer.lock();
+                if (!target_ep && !dest_key.empty()) {
+                    auto bit = unix_bound_sockets_.find(dest_key);
+                    if (bit != unix_bound_sockets_.end()) target_ep = bit->second.lock();
+                }
+                if (!target_ep || sock.peer_closed) return -107; // ENOTCONN / EPIPE
+                UnixSocketEndpoint::Chunk ch;
+                ch.data = std::move(tmp);
+                ch.peer_addr = sock.bound_path;
+                target_ep->rx_chunks.push_back(std::move(ch));
+                WakePollWaiters();
+                return static_cast<int64_t>(len);
+            }
+            if (it->second.host_fd >= 0) {
+                std::vector<uint8_t> sa;
+                socklen_t alen = 0;
+                if (st.x[4] != 0ULL && st.x[5] > 0ULL) {
+                    alen = static_cast<socklen_t>(std::min<uint64_t>(st.x[5], 256ULL));
+                    sa.resize(alen);
+                    if (!ReadUserBytes(cpu, st.x[4], sa.data(), alen)) return -14;
+                }
+                ssize_t w = ::sendto(it->second.host_fd, tmp.data(), len, static_cast<int>(st.x[3]),
+                                     sa.empty() ? nullptr : reinterpret_cast<const struct sockaddr*>(sa.data()),
+                                     alen);
+                return (w >= 0) ? static_cast<int64_t>(w) : -static_cast<int64_t>(errno);
+            }
+            return -88;
+        }
+        case 207: { // recvfrom(fd, buf, len, flags, src_addr, addrlen)
+            const int sfd = static_cast<int>(st.x[0]);
+            auto it = fds.find(sfd);
+            if (it == fds.end()) return -9;
+            const size_t len = static_cast<size_t>(st.x[2]);
+            const int rflags = static_cast<int>(st.x[3]);
+            const bool dontwait = it->second.nonblock || ((rflags & 0x40 /* MSG_DONTWAIT */) != 0);
+
+            if (it->second.unix_sock) {
+                auto& sock = *it->second.unix_sock;
+                if (sock.rx_chunks.empty()) {
+                    if (sock.peer_closed || sock.shutdown_rd) return 0;
+                    if (dontwait || !cur) return -11; // EAGAIN
+                    cur->state = TaskState::PollWait;
+                    cur->poll_wait_epfd = -1;
+                    cur->poll_wait_fds = {EpollWatch{sfd, 0x001u, 0ULL}};
+                    cur->poll_has_timeout = false;
+                    st.sys.elr_el1 -= 4ULL;
+                    out_retry = true;
+                    out_yield = true;
+                    return 0;
+                }
+                auto& front = sock.rx_chunks.front();
+                const std::string sender_addr = front.peer_addr;
+                const size_t n = std::min(len, front.data.size());
+                if (n > 0u && !WriteUserBytes(cpu, st.x[1], front.data.data(), n)) return -14;
+                if (st.x[4] != 0ULL && st.x[5] != 0ULL) {
+                    uint32_t ulen = 0u;
+                    if (ReadUserBytes(cpu, st.x[5], &ulen, sizeof(ulen))) {
+                        struct sockaddr_un un{};
+                        un.sun_family = 1;
+                        uint32_t actual = 2u;
+                        if (!sender_addr.empty()) {
+                            if (sender_addr.front() == '@') {
+                                const size_t copy_n = std::min(sender_addr.size() - 1u, sizeof(un.sun_path) - 1u);
+                                un.sun_path[0] = '\0';
+                                std::memcpy(un.sun_path + 1, sender_addr.data() + 1u, copy_n);
+                                actual = static_cast<uint32_t>(3u + copy_n);
+                            } else {
+                                const size_t copy_n = std::min(sender_addr.size(), sizeof(un.sun_path) - 1u);
+                                std::memcpy(un.sun_path, sender_addr.data(), copy_n);
+                                actual = static_cast<uint32_t>(2u + copy_n + 1u);
+                            }
+                        }
+                        const size_t wr = std::min<size_t>(ulen, actual);
+                        if (wr > 0u) WriteUserBytes(cpu, st.x[4], &un, wr);
+                        WriteUserBytes(cpu, st.x[5], &actual, sizeof(actual));
+                    }
+                }
+                if (sock.sock_type == 1 && n < front.data.size()) {
+                    front.data.erase(front.data.begin(), front.data.begin() + static_cast<std::ptrdiff_t>(n));
+                } else {
+                    sock.rx_chunks.pop_front();
+                }
+                return static_cast<int64_t>(n);
+            }
+            if (it->second.host_fd >= 0) {
+                std::vector<uint8_t> hbuf(len);
+                uint8_t sa[128]{};
+                socklen_t alen = (st.x[4] != 0ULL && st.x[5] != 0ULL) ? sizeof(sa) : 0;
+                ssize_t r = ::recvfrom(it->second.host_fd, hbuf.data(), len, rflags,
+                                       alen ? reinterpret_cast<struct sockaddr*>(sa) : nullptr,
+                                       alen ? &alen : nullptr);
+                if (r < 0) return -static_cast<int64_t>(errno);
+                if (r > 0 && !WriteUserBytes(cpu, st.x[1], hbuf.data(), static_cast<size_t>(r))) return -14;
+                if (alen > 0 && st.x[4] != 0ULL && st.x[5] != 0ULL) {
+                    uint32_t ulen = 0u;
+                    if (ReadUserBytes(cpu, st.x[5], &ulen, sizeof(ulen))) {
+                        const uint32_t actual = static_cast<uint32_t>(alen);
+                        const size_t wr = std::min<size_t>(ulen, actual);
+                        if (wr > 0u) WriteUserBytes(cpu, st.x[4], sa, wr);
+                        WriteUserBytes(cpu, st.x[5], &actual, sizeof(actual));
+                    }
+                }
+                return static_cast<int64_t>(r);
+            }
+            return -88;
+        }
+        case 208: { // setsockopt(fd, level, optname, optval, optlen)
+            const int sfd = static_cast<int>(st.x[0]);
+            auto it = fds.find(sfd);
+            if (it == fds.end()) return -9;
+            if (it->second.is_host_inet_sock && it->second.host_fd >= 0) {
+                const socklen_t olen = static_cast<socklen_t>(std::min<uint64_t>(st.x[4], 256ULL));
+                std::vector<uint8_t> val(olen);
+                if (olen > 0 && !ReadUserBytes(cpu, st.x[3], val.data(), olen)) return -14;
+                const int rc = ::setsockopt(it->second.host_fd, static_cast<int>(st.x[1]),
+                                            static_cast<int>(st.x[2]), val.data(), olen);
+                return (rc == 0) ? 0 : -static_cast<int64_t>(errno);
+            }
+            return 0;
+        }
+        case 209: { // getsockopt(fd, level, optname, optval, optlen)
+            const int sfd = static_cast<int>(st.x[0]);
+            auto it = fds.find(sfd);
+            if (it == fds.end()) return -9;
+            const int level = static_cast<int>(st.x[1]);
+            const int optname = static_cast<int>(st.x[2]);
+            if (it->second.is_host_inet_sock && it->second.host_fd >= 0) {
+                uint32_t ulen = 0u;
+                if (!ReadUserBytes(cpu, st.x[4], &ulen, sizeof(ulen))) return -14;
+                socklen_t hlen = static_cast<socklen_t>(std::min<uint32_t>(ulen, 256u));
+                std::vector<uint8_t> val(std::max<socklen_t>(hlen, 4));
+                const int rc = ::getsockopt(it->second.host_fd, level, optname, val.data(), &hlen);
+                if (rc != 0) return -static_cast<int64_t>(errno);
+                const uint32_t out_len = static_cast<uint32_t>(hlen);
+                if (out_len > 0u && !WriteUserBytes(cpu, st.x[3], val.data(), std::min(out_len, ulen))) return -14;
+                if (!WriteUserBytes(cpu, st.x[4], &out_len, sizeof(out_len))) return -14;
+                return 0;
+            }
+            if (level == 1 /* SOL_SOCKET */) {
+                uint32_t ulen = 0u;
+                if (!ReadUserBytes(cpu, st.x[4], &ulen, sizeof(ulen))) return -14;
+                if (optname == 17 /* SO_PEERCRED */ && ulen >= 12u) {
+                    struct LinuxUcred { int32_t pid; uint32_t uid; uint32_t gid; } uc{
+                        cur ? cur->tgid : 1, uid_, gid_};
+                    const uint32_t sz = sizeof(uc);
+                    if (!WriteUserBytes(cpu, st.x[3], &uc, sz)) return -14;
+                    if (!WriteUserBytes(cpu, st.x[4], &sz, sizeof(sz))) return -14;
+                    return 0;
+                }
+                if (optname == 4 /* SO_ERROR */ && ulen >= 4u) {
+                    const int32_t err = it->second.so_error;
+                    it->second.so_error = 0;
+                    const uint32_t sz = 4u;
+                    if (!WriteUserBytes(cpu, st.x[3], &err, sz)) return -14;
+                    if (!WriteUserBytes(cpu, st.x[4], &sz, sizeof(sz))) return -14;
+                    return 0;
+                }
+                if ((optname == 7 || optname == 8) && ulen >= 4u) {
+                    const int32_t bsz = 65536;
+                    const uint32_t sz = 4u;
+                    if (!WriteUserBytes(cpu, st.x[3], &bsz, sz)) return -14;
+                    if (!WriteUserBytes(cpu, st.x[4], &sz, sizeof(sz))) return -14;
+                    return 0;
+                }
+            }
+            return 0;
+        }
+        case 210: { // shutdown(fd, how)
+            const int sfd = static_cast<int>(st.x[0]);
+            auto it = fds.find(sfd);
+            if (it == fds.end()) return -9;
+            const int how = static_cast<int>(st.x[1]);
+            if (it->second.unix_sock) {
+                auto& sock = *it->second.unix_sock;
+                if (how == 0 || how == 2) sock.shutdown_rd = true;
+                if (how == 1 || how == 2) {
+                    sock.shutdown_wr = true;
+                    if (auto p = sock.peer.lock()) p->peer_closed = true;
+                }
+                WakePollWaiters();
+                return 0;
+            }
+            if (it->second.host_fd >= 0) {
+                return (::shutdown(it->second.host_fd, how) == 0) ? 0 : -static_cast<int64_t>(errno);
+            }
+            return -88;
+        }
+        case 211: { // sendmsg(fd, msg, flags)
+            const int sfd = static_cast<int>(st.x[0]);
+            auto it = fds.find(sfd);
+            if (it == fds.end()) return -9;
+            struct LinuxMsghdrA64 {
+                uint64_t msg_name;
+                uint32_t msg_namelen;
+                uint32_t pad0;
+                uint64_t msg_iov;
+                uint64_t msg_iovlen;
+                uint64_t msg_control;
+                uint64_t msg_controllen;
+                int32_t msg_flags;
+                int32_t pad1;
+            } hdr{};
+            if (!ReadUserBytes(cpu, st.x[1], &hdr, sizeof(hdr))) return -14;
+            std::vector<uint8_t> combined;
+            const size_t iov_cnt = std::min<size_t>(hdr.msg_iovlen, 1024u);
+            for (size_t i = 0; i < iov_cnt; ++i) {
+                uint64_t vec[2]{};
+                if (!ReadUserBytes(cpu, hdr.msg_iov + i * 16ULL, vec, 16)) return -14;
+                if (vec[1] > 0) {
+                    const size_t old_sz = combined.size();
+                    combined.resize(old_sz + static_cast<size_t>(vec[1]));
+                    if (!ReadUserBytes(cpu, vec[0], combined.data() + old_sz, static_cast<size_t>(vec[1]))) {
+                        return -14;
+                    }
+                }
+            }
+            if (it->second.unix_sock) {
+                auto& sock = *it->second.unix_sock;
+                if (sock.shutdown_wr) return -32;
+                std::vector<std::shared_ptr<OpenFile>> passed;
+                if (hdr.msg_control != 0ULL && hdr.msg_controllen >= 16ULL) {
+                    const size_t clen = std::min<size_t>(hdr.msg_controllen, 4096u);
+                    std::vector<uint8_t> cbuf(clen);
+                    if (!ReadUserBytes(cpu, hdr.msg_control, cbuf.data(), clen)) return -14;
+                    size_t off = 0u;
+                    while (off + 16u <= clen) {
+                        uint64_t cmsg_len = 0;
+                        int32_t clevel = 0, ctype = 0;
+                        std::memcpy(&cmsg_len, cbuf.data() + off, 8);
+                        std::memcpy(&clevel, cbuf.data() + off + 8, 4);
+                        std::memcpy(&ctype, cbuf.data() + off + 12, 4);
+                        if (cmsg_len < 16u || off + cmsg_len > clen) break;
+                        if (clevel == 1 /* SOL_SOCKET */ && ctype == 1 /* SCM_RIGHTS */) {
+                            for (size_t foff = 16u; foff + 4u <= cmsg_len; foff += 4u) {
+                                int32_t send_fd = -1;
+                                std::memcpy(&send_fd, cbuf.data() + off + foff, 4);
+                                auto s_it = fds.find(send_fd);
+                                if (s_it == fds.end()) return -9;
+                                OpenFile dup_f = s_it->second;
+                                if (dup_f.host_fd >= 0) {
+                                    dup_f.host_fd = ::dup(dup_f.host_fd);
+                                    if (dup_f.host_fd < 0) return -static_cast<int64_t>(errno);
+                                }
+                                passed.push_back(std::make_shared<OpenFile>(std::move(dup_f)));
+                            }
+                        }
+                        off += (cmsg_len + 7u) & ~size_t(7u);
+                    }
+                }
+                std::string dest_key = sock.peer_path;
+                if (hdr.msg_name != 0ULL && hdr.msg_namelen >= 2u) {
+                    const size_t alen = std::min<size_t>(hdr.msg_namelen, 256u);
+                    std::vector<uint8_t> sa(alen);
+                    if (!ReadUserBytes(cpu, hdr.msg_name, sa.data(), alen)) return -14;
+                    ParseGuestUnixPath(sa.data(), alen, dest_key);
+                }
+                const int64_t sent = static_cast<int64_t>(combined.size());
+                if (dest_key == "/dev/socket/property_service") {
+                    HandleBuiltInPropertyServicePacket(it->second.unix_sock, combined);
+                    return sent;
+                }
+                if (dest_key == "/dev/socket/logdw" || dest_key == "/dev/socket/logd") {
+                    HandleBuiltInLogdPacket(combined);
+                    return sent;
+                }
+                std::shared_ptr<UnixSocketEndpoint> target_ep = sock.peer.lock();
+                if (!target_ep && !dest_key.empty()) {
+                    auto bit = unix_bound_sockets_.find(dest_key);
+                    if (bit != unix_bound_sockets_.end()) target_ep = bit->second.lock();
+                }
+                if (!target_ep || sock.peer_closed) return -32;
+                UnixSocketEndpoint::Chunk ch;
+                ch.data = std::move(combined);
+                ch.passed_fds = std::move(passed);
+                ch.peer_addr = sock.bound_path;
+                target_ep->rx_chunks.push_back(std::move(ch));
+                WakePollWaiters();
+                return sent;
+            }
+            if (it->second.host_fd >= 0) {
+                ssize_t w = ::send(it->second.host_fd, combined.data(), combined.size(),
+                                   static_cast<int>(st.x[2]));
+                return (w >= 0) ? static_cast<int64_t>(w) : -static_cast<int64_t>(errno);
+            }
+            return -88;
+        }
+        case 212: { // recvmsg(fd, msg, flags)
+            const int sfd = static_cast<int>(st.x[0]);
+            auto it = fds.find(sfd);
+            if (it == fds.end()) return -9;
+            const int rflags = static_cast<int>(st.x[2]);
+            struct LinuxMsghdrA64 {
+                uint64_t msg_name;
+                uint32_t msg_namelen;
+                uint32_t pad0;
+                uint64_t msg_iov;
+                uint64_t msg_iovlen;
+                uint64_t msg_control;
+                uint64_t msg_controllen;
+                int32_t msg_flags;
+                int32_t pad1;
+            } hdr{};
+            if (!ReadUserBytes(cpu, st.x[1], &hdr, sizeof(hdr))) return -14;
+            if (it->second.unix_sock) {
+                auto& sock = *it->second.unix_sock;
+                const bool dontwait = it->second.nonblock || ((rflags & 0x40 /* MSG_DONTWAIT */) != 0);
+                if (sock.rx_chunks.empty()) {
+                    if (sock.peer_closed || sock.shutdown_rd) {
+                        hdr.msg_controllen = 0ULL;
+                        hdr.msg_flags = 0;
+                        WriteUserBytes(cpu, st.x[1], &hdr, sizeof(hdr));
+                        return 0;
+                    }
+                    if (dontwait || !cur) return -11;
+                    cur->state = TaskState::PollWait;
+                    cur->poll_wait_epfd = -1;
+                    cur->poll_wait_fds = {EpollWatch{sfd, 0x001u, 0ULL}};
+                    cur->poll_has_timeout = false;
+                    st.sys.elr_el1 -= 4ULL;
+                    out_retry = true;
+                    out_yield = true;
+                    return 0;
+                }
+                auto& front = sock.rx_chunks.front();
+                size_t data_pos = 0u;
+                const size_t iov_cnt = std::min<size_t>(hdr.msg_iovlen, 1024u);
+                for (size_t i = 0; i < iov_cnt && data_pos < front.data.size(); ++i) {
+                    uint64_t vec[2]{};
+                    if (!ReadUserBytes(cpu, hdr.msg_iov + i * 16ULL, vec, 16)) return -14;
+                    const size_t avail = front.data.size() - data_pos;
+                    const size_t n = std::min(avail, static_cast<size_t>(vec[1]));
+                    if (n > 0u && !WriteUserBytes(cpu, vec[0], front.data.data() + data_pos, n)) {
+                        return -14;
+                    }
+                    data_pos += n;
+                }
+                uint64_t written_ctrl = 0ULL;
+                hdr.msg_flags = 0;
+                if (!front.passed_fds.empty()) {
+                    const int new_clo = ((rflags & 0x40000000 /* MSG_CMSG_CLOEXEC */) != 0) ? 1 : 0;
+                    if (hdr.msg_control != 0ULL && hdr.msg_controllen >= 16ULL) {
+                        const size_t max_fds = static_cast<size_t>((hdr.msg_controllen - 16ULL) / 4ULL);
+                        const size_t emit_cnt = std::min(max_fds, front.passed_fds.size());
+                        if (emit_cnt < front.passed_fds.size()) hdr.msg_flags |= 0x08; // MSG_CTRUNC
+                        if (emit_cnt > 0u) {
+                            const uint64_t cmsg_len = 16ULL + emit_cnt * 4ULL;
+                            const size_t buf_len = static_cast<size_t>((cmsg_len + 7ULL) & ~7ULL);
+                            std::vector<uint8_t> cbuf(buf_len, 0u);
+                            const int32_t clevel = 1; // SOL_SOCKET
+                            const int32_t ctype = 1;  // SCM_RIGHTS
+                            std::memcpy(cbuf.data() + 0u, &cmsg_len, 8);
+                            std::memcpy(cbuf.data() + 8u, &clevel, 4);
+                            std::memcpy(cbuf.data() + 12u, &ctype, 4);
+                            for (size_t j = 0; j < emit_cnt; ++j) {
+                                auto& pof = front.passed_fds[j];
+                                OpenFile rcv = *pof;
+                                pof->host_fd = -1; // ownership transferred to receiver fd table
+                                rcv.fd_flags = new_clo;
+                                const int rfd = next_fd++;
+                                fds.emplace(rfd, std::move(rcv));
+                                std::memcpy(cbuf.data() + 16u + j * 4u, &rfd, 4);
+                            }
+                            const size_t write_len = std::min<size_t>(buf_len, hdr.msg_controllen);
+                            if (!WriteUserBytes(cpu, hdr.msg_control, cbuf.data(), write_len)) return -14;
+                            written_ctrl = cmsg_len;
+                        }
+                    } else {
+                        hdr.msg_flags |= 0x08; // MSG_CTRUNC
+                    }
+                    front.passed_fds.clear();
+                }
+                hdr.msg_controllen = written_ctrl;
+                if (sock.sock_type == 1 && data_pos < front.data.size()) {
+                    front.data.erase(front.data.begin(), front.data.begin() + static_cast<std::ptrdiff_t>(data_pos));
+                } else {
+                    sock.rx_chunks.pop_front();
+                }
+                if (!WriteUserBytes(cpu, st.x[1], &hdr, sizeof(hdr))) return -14;
+                return static_cast<int64_t>(data_pos);
+            }
+            return -88;
+        }
         case 214: { // brk(addr)
             uint64_t req = st.x[0];
             if (req == 0ULL || req <= current_brk_) return static_cast<int64_t>(current_brk_);
@@ -2974,6 +4842,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 }
             }
             current_brk_ = end_pg;
+            if (cur && cur->vm) cur->vm->current_brk = current_brk_;
             return static_cast<int64_t>(req);
         }
         case 215: { // munmap(addr, len)
@@ -2996,6 +4865,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             if ((mflags & 1ULL /* MREMAP_MAYMOVE */) == 0ULL) return -12;
             const uint64_t new_addr = mmap_cursor_;
             mmap_cursor_ += new_sz + 4096ULL;
+            if (cur && cur->vm) cur->vm->mmap_cursor = mmap_cursor_;
             uint8_t page_buf[4096]{};
             for (uint64_t off = 0ULL; off < new_sz; off += 4096ULL) {
                 uint64_t new_pa = 0;
@@ -3026,19 +4896,20 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             const uint64_t flags = st.x[0];
             const uint64_t child_stack = st.x[1];
             const bool share_vm = (flags & 0x00000100ULL /* CLONE_VM */) != 0ULL;
+            const bool share_files = (flags & 0x00000400ULL /* CLONE_FILES */) != 0ULL;
+            const bool same_thread_group = (flags & 0x00010000ULL /* CLONE_THREAD */) != 0ULL;
 
             SaveTaskContext(st, *cur);
 
             auto child = std::make_unique<GuestTask>();
             child->pid = next_pid_++;
-            child->ppid = cur->pid;
+            child->tgid = same_thread_group ? cur->tgid : child->pid;
+            child->ppid = same_thread_group ? cur->ppid : cur->tgid;
             child->uid = uid_;
             child->gid = gid_;
             child->binary = cur->binary;
-            child->current_brk = current_brk_;
-            child->mmap_cursor = mmap_cursor_;
+            child->cwd = cur->cwd;
             child->stack_top = cur->stack_top;
-            child->next_fd = cur->next_fd;
             child->state = TaskState::Runnable;
             child->cpu = cur->cpu;
             child->cpu.x[0] = 0ULL; // child returns 0
@@ -3051,25 +4922,59 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             if ((flags & 0x00200000ULL /* CLONE_CHILD_CLEARTID */) != 0ULL) {
                 child->clear_child_tid = st.x[4];
             }
-            if (share_vm) {
-                child->ttbr0_pa = ttbr0_pa_;
+
+            if (share_vm && cur->vm) {
+                child->vm = cur->vm;
             } else {
                 uint64_t child_ttbr0 = 0ULL;
                 if (!CloneUserAddressSpace(ram_, ttbr0_pa_, child_ttbr0, phys_cursor_, arena_limit_)) {
                     return -12; // ENOMEM
                 }
-                child->ttbr0_pa = child_ttbr0;
+                child->vm = std::make_shared<VmSpace>();
+                child->vm->ttbr0_pa = child_ttbr0;
+                child->vm->current_brk = current_brk_;
+                child->vm->mmap_cursor = mmap_cursor_;
+                if (cur->vm) child->vm->fb_mapped_pas = cur->vm->fb_mapped_pas;
             }
-            for (const auto& kv : cur->open_fds) {
-                OpenFile dup_of = kv.second;
-                if (dup_of.host_fd >= 0) {
-                    dup_of.host_fd = ::dup(dup_of.host_fd);
+
+            if (share_files && cur->files) {
+                child->files = cur->files;
+            } else {
+                child->files = std::make_shared<FdTable>();
+                child->files->next_fd = next_fd;
+                for (const auto& kv : fds) {
+                    OpenFile dup_of = kv.second;
+                    if (dup_of.host_fd >= 0) {
+                        dup_of.host_fd = ::dup(dup_of.host_fd);
+                    }
+                    child->files->fds.emplace(kv.first, std::move(dup_of));
                 }
-                child->open_fds.emplace(kv.first, std::move(dup_of));
             }
+
             if ((flags & 0x00100000ULL /* CLONE_PARENT_SETTID */) != 0ULL && st.x[2] != 0ULL) {
-                int32_t cpid = child->pid;
+                const int32_t cpid = child->pid;
                 WriteUserBytes(cpu, st.x[2], &cpid, sizeof(cpid));
+            }
+            if ((flags & 0x01000000ULL /* CLONE_CHILD_SETTID */) != 0ULL && st.x[4] != 0ULL) {
+                const int32_t cpid = child->pid;
+                if (share_vm) {
+                    WriteUserBytes(cpu, st.x[4], &cpid, sizeof(cpid));
+                } else if (child->vm && child->vm->ttbr0_pa != 0ULL) {
+                    const auto* bytes = reinterpret_cast<const uint8_t*>(&cpid);
+                    for (size_t b = 0; b < sizeof(cpid); ++b) {
+                        const uint64_t va = st.x[4] + b;
+                        uint64_t d1 = 0, d2 = 0, leaf = 0;
+                        const uint64_t l1_idx = (va >> 30) & 0x1FFULL;
+                        const uint64_t l2_idx = (va >> 21) & 0x1FFULL;
+                        const uint64_t l3_idx = (va >> 12) & 0x1FFULL;
+                        if (ram_.ReadU64(child->vm->ttbr0_pa + l1_idx * 8ULL, d1) && (d1 & 3ULL) == 3ULL &&
+                            ram_.ReadU64((d1 & 0x0000FFFFFFFFF000ULL) + l2_idx * 8ULL, d2) && (d2 & 3ULL) == 3ULL &&
+                            ram_.ReadU64((d2 & 0x0000FFFFFFFFF000ULL) + l3_idx * 8ULL, leaf) && (leaf & 3ULL) == 3ULL) {
+                            const uint64_t pa = (leaf & 0x0000FFFFFFFFF000ULL) | (va & 0xFFFULL);
+                            ram_.WriteBytes(pa, bytes + b, 1u);
+                        }
+                    }
+                }
             }
             const int32_t ret_pid = child->pid;
             tasks_.push_back(std::move(child));
@@ -3086,18 +4991,57 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             std::vector<std::string> argv = {path};
             if (st.x[1] != 0ULL) {
                 argv.clear();
-                for (size_t idx = 0; idx < 16u; ++idx) {
+                for (size_t idx = 0; idx < 32u; ++idx) {
                     uint64_t ptr = 0;
                     if (!ReadUserBytes(cpu, st.x[1] + idx * 8ULL, &ptr, 8) || ptr == 0ULL) break;
                     std::string arg;
-                    if (ReadUserString(cpu, ptr, arg)) argv.push_back(arg);
+                    if (ReadUserString(cpu, ptr, arg)) argv.push_back(std::move(arg));
                 }
                 if (argv.empty()) argv.push_back(path);
             }
+            std::vector<std::string> envp;
+            bool has_envp = false;
+            if (st.x[2] != 0ULL) {
+                for (size_t idx = 0; idx < 64u; ++idx) {
+                    uint64_t ptr = 0;
+                    if (!ReadUserBytes(cpu, st.x[2] + idx * 8ULL, &ptr, 8) || ptr == 0ULL) break;
+                    std::string ev;
+                    if (ReadUserString(cpu, ptr, ev)) envp.push_back(std::move(ev));
+                }
+                has_envp = !envp.empty();
+            }
+
+            // Unshare FdTable if shared via CLONE_FILES, then close all FD_CLOEXEC descriptors
+            if (cur && cur->files) {
+                if (cur->files.use_count() > 1) {
+                    auto fresh = std::make_shared<FdTable>();
+                    fresh->next_fd = cur->files->next_fd;
+                    for (const auto& kv : cur->files->fds) {
+                        if ((kv.second.fd_flags & 1) != 0) continue; // skip FD_CLOEXEC
+                        OpenFile dup_of = kv.second;
+                        if (dup_of.host_fd >= 0) dup_of.host_fd = ::dup(dup_of.host_fd);
+                        fresh->fds.emplace(kv.first, std::move(dup_of));
+                    }
+                    cur->files = std::move(fresh);
+                } else {
+                    for (auto it = cur->files->fds.begin(); it != cur->files->fds.end(); ) {
+                        if ((it->second.fd_flags & 1) != 0) {
+                            CloseSingleOpenFile(it->second);
+                            it = cur->files->fds.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+            }
+            if (cur && cur->vm && cur->vm.use_count() > 1) {
+                cur->vm = std::make_shared<VmSpace>();
+            }
+
             std::string err;
             active_binary_ = path;
             const bool reset_arena = (tasks_.size() <= 1u);
-            if (!MapFreshAddressSpace(cpu, elf_bytes, argv, err, reset_arena)) {
+            if (!MapFreshAddressSpace(cpu, elf_bytes, argv, err, reset_arena, has_envp ? &envp : nullptr)) {
                 last_trap_detail_ = "execve(" + path + ") failed: " + err;
                 LogToUart("[TRAP] " + last_trap_detail_ + "\r\n");
                 return -8;
@@ -3135,6 +5079,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             const uint64_t file_offset = st.x[5];
             if (len == 0ULL) return -22;
 
+            const bool is_shared = (mflags & 0x01ULL /* MAP_SHARED */) != 0ULL;
             const bool is_fixed = (mflags & 0x10ULL /* MAP_FIXED */) != 0ULL;
             const bool is_anon = (mflags & 0x20ULL /* MAP_ANONYMOUS */) != 0ULL || fd < 0;
 
@@ -3165,6 +5110,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                     mmap_cursor_ = addr + len + 4096ULL;
                 }
             }
+            if (cur && cur->vm) cur->vm->mmap_cursor = mmap_cursor_;
 
             const bool r_perm = (prot & 1ULL) != 0;
             const bool w_perm = (prot & 2ULL) != 0;
@@ -3172,7 +5118,11 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             const bool el0_allow = (r_perm || w_perm || x_perm);
 
             const bool is_fb_map = (fd_it != fds.end() && fd_it->second.is_framebuffer);
+            const bool is_binder_map = (!is_anon && fd_it != fds.end() && fd_it->second.is_binder);
             if (is_fb_map) fb_pas.clear();
+
+            std::vector<uint64_t> binder_pa_pages;
+            if (is_binder_map) binder_pa_pages.reserve(static_cast<size_t>(len >> 12));
 
             uint8_t page_buf[4096];
             for (uint64_t va = addr; va < addr + len; va += 4096ULL) {
@@ -3180,25 +5130,50 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 if (LookupL3Pte(va, old_ep, old_leaf)) {
                     cpu.Cache().InvalidatePhysPage(old_leaf & 0x0000FFFFFFFFF000ULL);
                 }
+
                 uint64_t pa = 0;
-                if (!AllocZeroPage(ram_, phys_cursor_, arena_limit_, pa)) {
-                    return -12; // ENOMEM
+                bool reused_shared_page = false;
+                const uint64_t pg_off = file_offset + (va - addr);
+                const size_t pg_idx = static_cast<size_t>(pg_off >> 12);
+                if (!is_anon && is_shared && fd_it != fds.end() && fd_it->second.shared_pages &&
+                    pg_idx < fd_it->second.shared_pages->size() &&
+                    (*fd_it->second.shared_pages)[pg_idx] != 0ULL) {
+                    pa = (*fd_it->second.shared_pages)[pg_idx];
+                    reused_shared_page = true;
                 }
-                if (!is_anon && !is_fb_map && fd_it != fds.end() && !fd_it->second.is_dev_zero) {
-                    const uint64_t pg_off = file_offset + (va - addr);
-                    if (fd_it->second.host_fd >= 0) {
-                        std::memset(page_buf, 0, sizeof(page_buf));
-                        ssize_t got = ::pread(fd_it->second.host_fd, page_buf, sizeof(page_buf),
-                                              static_cast<off_t>(pg_off));
-                        if (got > 0) {
-                            ram_.WriteBytes(pa, page_buf, static_cast<size_t>(got));
+
+                if (!reused_shared_page) {
+                    if (!AllocZeroPage(ram_, phys_cursor_, arena_limit_, pa)) {
+                        return -12; // ENOMEM
+                    }
+                    if (!is_anon && !is_fb_map && fd_it != fds.end() && !fd_it->second.is_dev_zero) {
+                        if (fd_it->second.host_fd >= 0) {
+                            std::memset(page_buf, 0, sizeof(page_buf));
+                            ssize_t got = ::pread(fd_it->second.host_fd, page_buf, sizeof(page_buf),
+                                                  static_cast<off_t>(pg_off));
+                            if (got > 0) {
+                                ram_.WriteBytes(pa, page_buf, static_cast<size_t>(got));
+                            }
+                        } else if (!fd_it->second.data.empty() && pg_off < fd_it->second.data.size()) {
+                            const size_t avail = static_cast<size_t>(
+                                std::min<uint64_t>(4096ULL, fd_it->second.data.size() - pg_off));
+                            ram_.WriteBytes(pa, fd_it->second.data.data() + pg_off, avail);
                         }
-                    } else if (!fd_it->second.data.empty() && pg_off < fd_it->second.data.size()) {
-                        const size_t avail = static_cast<size_t>(
-                            std::min<uint64_t>(4096ULL, fd_it->second.data.size() - pg_off));
-                        ram_.WriteBytes(pa, fd_it->second.data.data() + pg_off, avail);
+                    }
+                    if (!is_anon && is_shared && fd_it != fds.end() &&
+                        (fd_it->second.is_ashmem || fd_it->second.is_memfd ||
+                         fd_it->second.is_dma_heap || fd_it->second.is_ion) &&
+                        pg_idx < 1048576u) {
+                        if (!fd_it->second.shared_pages) {
+                            fd_it->second.shared_pages = std::make_shared<std::vector<uint64_t>>();
+                        }
+                        if (pg_idx >= fd_it->second.shared_pages->size()) {
+                            fd_it->second.shared_pages->resize(pg_idx + 1u, 0ULL);
+                        }
+                        (*fd_it->second.shared_pages)[pg_idx] = pa;
                     }
                 }
+
                 if (!Elf64GuestLoader::MapPage4K(ram_, ttbr0_pa_, phys_cursor_, arena_limit_,
                                                  va, pa, el0_allow, w_perm, x_perm)) {
                     return -12;
@@ -3206,6 +5181,11 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 cpu.Mmu().InvalidateVa(va, true, 0);
                 cpu.Cache().InvalidatePhysPage(pa);
                 if (is_fb_map) fb_pas.push_back(pa);
+                if (is_binder_map) binder_pa_pages.push_back(pa);
+            }
+            if (is_binder_map) {
+                binder_broker_.RegisterMmap(fd_it->second.binder_client_id, addr, len,
+                                            std::move(binder_pa_pages));
             }
             return static_cast<int64_t>(addr);
         }
@@ -3227,29 +5207,55 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             return 0;
         case 260: { // wait4(pid, wstatus, options, rusage)
             if (!cur) return -10;
+            const int32_t caller_tgid = cur->tgid;
             const int32_t target = static_cast<int32_t>(static_cast<int64_t>(st.x[0]));
             const uint64_t wstatus_uva = st.x[1];
             const uint64_t options = st.x[2];
 
             bool has_matching_child = false;
-            for (size_t i = 0; i < tasks_.size(); ++i) {
-                GuestTask* t = tasks_[i].get();
-                if (!t || t->ppid != cur->pid) continue;
-                if (target > 0 && t->pid != target) continue;
+            int32_t reap_tgid = -1;
+            int reap_status = 0;
+            for (const auto& up : tasks_) {
+                const GuestTask* t = up.get();
+                if (!t || t->ppid != caller_tgid) continue;
+                if (target > 0 && t->tgid != target) continue;
                 has_matching_child = true;
-                if (t->state == TaskState::Zombie) {
-                    const int32_t reaped_pid = t->pid;
-                    const uint32_t wstatus = static_cast<uint32_t>((t->exit_status & 0xFF) << 8);
-                    if (wstatus_uva != 0ULL &&
-                        !WriteUserBytes(cpu, wstatus_uva, &wstatus, sizeof(wstatus))) {
-                        return -14;
+
+                bool group_all_zombie = true;
+                for (const auto& gp : tasks_) {
+                    if (gp && gp->tgid == t->tgid && gp->state != TaskState::Zombie) {
+                        group_all_zombie = false;
+                        break;
                     }
-                    tasks_.erase(tasks_.begin() + static_cast<std::ptrdiff_t>(i));
-                    if (i < current_task_idx_) {
-                        --current_task_idx_;
-                    }
-                    return reaped_pid;
                 }
+                if (group_all_zombie) {
+                    reap_tgid = t->tgid;
+                    reap_status = t->exit_status;
+                    break;
+                }
+            }
+            if (reap_tgid > 0) {
+                const uint32_t wstatus = static_cast<uint32_t>((reap_status & 0xFF) << 8);
+                if (wstatus_uva != 0ULL &&
+                    !WriteUserBytes(cpu, wstatus_uva, &wstatus, sizeof(wstatus))) {
+                    return -14;
+                }
+                const GuestTask* cur_ptr = CurrentTask();
+                for (size_t i = 0; i < tasks_.size(); ) {
+                    if (tasks_[i] && tasks_[i]->tgid == reap_tgid) {
+                        tasks_.erase(tasks_.begin() + static_cast<std::ptrdiff_t>(i));
+                    } else {
+                        ++i;
+                    }
+                }
+                current_task_idx_ = 0;
+                for (size_t i = 0; i < tasks_.size(); ++i) {
+                    if (tasks_[i].get() == cur_ptr) {
+                        current_task_idx_ = i;
+                        break;
+                    }
+                }
+                return reap_tgid;
             }
             if (!has_matching_child) return -10; // ECHILD
             if ((options & 1ULL /* WNOHANG */) != 0ULL) return 0;
@@ -3359,7 +5365,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             }
             return 0;
         }
-        case 39: case 40: case 49: case 50: case 51:
+        case 39: case 40: case 51:
         case 119: case 122: case 141: case 154: case 158: case 159:
         case 161: case 162: case 233: case 274:
             return 0;

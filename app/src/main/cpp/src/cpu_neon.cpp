@@ -131,6 +131,66 @@ void NeonSetLane(NeonReg& r, uint32_t esize, uint32_t idx, uint64_t val) {
     else r.u64[idx] = val;
 }
 
+constexpr uint8_t kAesSbox[256] = {
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+};
+
+constexpr uint8_t kAesInvSbox[256] = {
+    0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
+    0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
+    0x54,0x7b,0x94,0x32,0xa6,0xc2,0x23,0x3d,0xee,0x4c,0x95,0x0b,0x42,0xfa,0xc3,0x4e,
+    0x08,0x2e,0xa1,0x66,0x28,0xd9,0x24,0xb2,0x76,0x5b,0xa2,0x49,0x6d,0x8b,0xd1,0x25,
+    0x72,0xf8,0xf6,0x64,0x86,0x68,0x98,0x16,0xd4,0xa4,0x5c,0xcc,0x5d,0x65,0xb6,0x92,
+    0x6c,0x70,0x48,0x50,0xfd,0xed,0xb9,0xda,0x5e,0x15,0x46,0x57,0xa7,0x8d,0x9d,0x84,
+    0x90,0xd8,0xab,0x00,0x8c,0xbc,0xd3,0x0a,0xf7,0xe4,0x58,0x05,0xb8,0xb3,0x45,0x06,
+    0xd0,0x2c,0x1e,0x8f,0xca,0x3f,0x0f,0x02,0xc1,0xaf,0xbd,0x03,0x01,0x13,0x8a,0x6b,
+    0x3a,0x91,0x11,0x41,0x4f,0x67,0xdc,0xea,0x97,0xf2,0xcf,0xce,0xf0,0xb4,0xe6,0x73,
+    0x96,0xac,0x74,0x22,0xe7,0xad,0x35,0x85,0xe2,0xf9,0x37,0xe8,0x1c,0x75,0xdf,0x6e,
+    0x47,0xf1,0x1a,0x71,0x1d,0x29,0xc5,0x89,0x6f,0xb7,0x62,0x0e,0xaa,0x18,0xbe,0x1b,
+    0xfc,0x56,0x3e,0x4b,0xc6,0xd2,0x79,0x20,0x9a,0xdb,0xc0,0xfe,0x78,0xcd,0x5a,0xf4,
+    0x1f,0xdd,0xa8,0x33,0x88,0x07,0xc7,0x31,0xb1,0x12,0x10,0x59,0x27,0x80,0xec,0x5f,
+    0x60,0x51,0x7f,0xa9,0x19,0xb5,0x4a,0x0d,0x2d,0xe5,0x7a,0x9f,0x93,0xc9,0x9c,0xef,
+    0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
+    0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d
+};
+
+uint8_t GfMul(uint8_t a, uint8_t b) {
+    uint8_t res = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (b & 1u) res ^= a;
+        const bool hi = (a & 0x80u) != 0;
+        a = static_cast<uint8_t>(a << 1);
+        if (hi) a ^= 0x1Bu;
+        b >>= 1;
+    }
+    return res;
+}
+
+uint32_t Rol32(uint32_t v, unsigned r) {
+    r &= 31u;
+    return r ? ((v << r) | (v >> (32u - r))) : v;
+}
+
+uint32_t Ror32(uint32_t v, unsigned r) {
+    r &= 31u;
+    return r ? ((v >> r) | (v << (32u - r))) : v;
+}
+
 } // namespace
 
 bool AArch64CpuCore::CheckFpSimdEnabled() {
@@ -1157,7 +1217,7 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
             const bool is_accum = (u == 0u && opcode == 0x19u);
             if (is_accum) out = state_.v[rd];
             const bool is_pairwise = is_vec_three_same && (u == 1u) &&
-                                     (opcode == 0x1Au || opcode == 0x1Eu || opcode == 0x18u);
+                                     ((opcode == 0x1Au && !op_hi) || opcode == 0x1Eu || opcode == 0x18u);
 
             auto eval_fp = [&](double av, double bv, double cur, bool& is_cmp, bool& cmp_out) -> double {
                 is_cmp = false;
@@ -1167,8 +1227,9 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
                 if (opcode == 0x19u && u == 0u) { // FMLA / FMLS
                     return op_hi ? (cur - av * bv) : (cur + av * bv);
                 }
-                if (opcode == 0x1Au) { // FADD / FSUB / FADDP
-                    return (u == 0u && op_hi) ? (av - bv) : (av + bv);
+                if (opcode == 0x1Au) { // FADD / FSUB / FADDP / FABD (u=1, op_hi=1)
+                    if (op_hi) return (u == 1u) ? std::fabs(av - bv) : (av - bv);
+                    return av + bv;
                 }
                 if (opcode == 0x1Bu && !op_hi) { // FMUL (u=1) / FMULX (u=0)
                     if (u == 0u && ((av == 0.0 && std::isinf(bv)) || (std::isinf(av) && bv == 0.0))) return 2.0;
@@ -1537,6 +1598,151 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
         return true;
     }
 
+    // 5a. ARMv8 Crypto AES (01001110 00101000 opcode(5) 10 Rn Rd)
+    if ((insn & 0xFFFF0C00u) == 0x4E280800u) {
+        const uint32_t opcode = (insn >> 12) & 0x1Fu;
+        if (opcode == 4u || opcode == 5u) { // AESE (4) / AESD (5)
+            const bool dec = (opcode == 5u);
+            NeonReg st{};
+            for (int i = 0; i < 16; ++i) st.u8[i] = state_.v[rd].u8[i] ^ state_.v[rn].u8[i];
+            NeonReg out{};
+            for (int c = 0; c < 4; ++c) {
+                for (int r = 0; r < 4; ++r) {
+                    const int src_c = dec ? ((c + 4 - r) & 3) : ((c + r) & 3);
+                    const uint8_t b = st.u8[src_c * 4 + r];
+                    out.u8[c * 4 + r] = dec ? kAesInvSbox[b] : kAesSbox[b];
+                }
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+        if (opcode == 6u || opcode == 7u) { // AESMC (6) / AESIMC (7)
+            const bool inv = (opcode == 7u);
+            const NeonReg in = state_.v[rn];
+            NeonReg out{};
+            for (int c = 0; c < 4; ++c) {
+                const uint8_t a0 = in.u8[c * 4 + 0], a1 = in.u8[c * 4 + 1];
+                const uint8_t a2 = in.u8[c * 4 + 2], a3 = in.u8[c * 4 + 3];
+                if (!inv) {
+                    out.u8[c * 4 + 0] = GfMul(a0, 2) ^ GfMul(a1, 3) ^ a2 ^ a3;
+                    out.u8[c * 4 + 1] = a0 ^ GfMul(a1, 2) ^ GfMul(a2, 3) ^ a3;
+                    out.u8[c * 4 + 2] = a0 ^ a1 ^ GfMul(a2, 2) ^ GfMul(a3, 3);
+                    out.u8[c * 4 + 3] = GfMul(a0, 3) ^ a1 ^ a2 ^ GfMul(a3, 2);
+                } else {
+                    out.u8[c * 4 + 0] = GfMul(a0, 0x0E) ^ GfMul(a1, 0x0B) ^ GfMul(a2, 0x0D) ^ GfMul(a3, 0x09);
+                    out.u8[c * 4 + 1] = GfMul(a0, 0x09) ^ GfMul(a1, 0x0E) ^ GfMul(a2, 0x0B) ^ GfMul(a3, 0x0D);
+                    out.u8[c * 4 + 2] = GfMul(a0, 0x0D) ^ GfMul(a1, 0x09) ^ GfMul(a2, 0x0E) ^ GfMul(a3, 0x0B);
+                    out.u8[c * 4 + 3] = GfMul(a0, 0x0B) ^ GfMul(a1, 0x0D) ^ GfMul(a2, 0x09) ^ GfMul(a3, 0x0E);
+                }
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+    }
+
+    // 5b. ARMv8 Crypto SHA Two-Reg (01011110 00101000 opcode(5) 10 Rn Rd)
+    if ((insn & 0xFFFF0C00u) == 0x5E280800u) {
+        const uint32_t opcode = (insn >> 12) & 0x1Fu;
+        const NeonReg a = state_.v[rd];
+        const NeonReg b = state_.v[rn];
+        NeonReg out{};
+        if (opcode == 0u) { // SHA1H
+            out.u32[0] = Rol32(b.u32[0], 30u);
+            state_.v[rd] = out;
+            return true;
+        }
+        if (opcode == 1u) { // SHA1SU1
+            uint32_t t0 = a.u32[0] ^ b.u32[1];
+            uint32_t t1 = a.u32[1] ^ b.u32[2];
+            uint32_t t2 = a.u32[2] ^ b.u32[3];
+            uint32_t t3 = a.u32[3];
+            out.u32[0] = Rol32(t0, 1u);
+            out.u32[1] = Rol32(t1, 1u);
+            out.u32[2] = Rol32(t2, 1u);
+            out.u32[3] = Rol32(t3 ^ out.u32[0], 1u);
+            state_.v[rd] = out;
+            return true;
+        }
+        if (opcode == 2u) { // SHA256SU0
+            auto s0 = [](uint32_t x) { return Ror32(x, 7u) ^ Ror32(x, 18u) ^ (x >> 3); };
+            uint32_t t[4] = { a.u32[1], a.u32[2], a.u32[3], b.u32[0] };
+            for (int i = 0; i < 4; ++i) out.u32[i] = a.u32[i] + s0(t[i]);
+            state_.v[rd] = out;
+            return true;
+        }
+    }
+
+    // 5c. ARMv8 Crypto SHA Three-Reg (01011110 000 Rm 0 opcode(3) 00 Rn Rd)
+    if ((insn & 0xFFE08C00u) == 0x5E000000u) {
+        const uint32_t opcode = (insn >> 12) & 7u;
+        const NeonReg a = state_.v[rd];
+        const NeonReg b = state_.v[rn];
+        const NeonReg c = state_.v[rm];
+        NeonReg out{};
+        if (opcode <= 2u) { // SHA1C (0), SHA1P (1), SHA1M (2)
+            uint32_t X[4] = { a.u32[0], a.u32[1], a.u32[2], a.u32[3] };
+            uint32_t E = b.u32[0];
+            for (int e = 0; e < 4; ++e) {
+                uint32_t t = 0;
+                if (opcode == 0u) t = (X[1] & X[2]) ^ (~X[1] & X[3]);
+                else if (opcode == 1u) t = X[1] ^ X[2] ^ X[3];
+                else t = (X[1] & X[2]) | ((X[1] | X[2]) & X[3]);
+                uint32_t next = E + Rol32(X[0], 5u) + t + c.u32[e];
+                X[1] = Rol32(X[1], 30u);
+                E = X[3];
+                X[3] = X[2]; X[2] = X[1]; X[1] = X[0]; X[0] = next;
+            }
+            for (int i = 0; i < 4; ++i) out.u32[i] = X[i];
+            state_.v[rd] = out;
+            return true;
+        }
+        if (opcode == 3u) { // SHA1SU0
+            out.u32[0] = a.u32[2] ^ a.u32[0] ^ c.u32[0];
+            out.u32[1] = a.u32[3] ^ a.u32[1] ^ c.u32[1];
+            out.u32[2] = b.u32[0] ^ a.u32[2] ^ c.u32[2];
+            out.u32[3] = b.u32[1] ^ a.u32[3] ^ c.u32[3];
+            state_.v[rd] = out;
+            return true;
+        }
+        if (opcode == 4u || opcode == 5u) { // SHA256H (4) / SHA256H2 (5)
+            auto S0 = [](uint32_t x) { return Ror32(x, 2u) ^ Ror32(x, 13u) ^ Ror32(x, 22u); };
+            auto S1 = [](uint32_t x) { return Ror32(x, 6u) ^ Ror32(x, 11u) ^ Ror32(x, 25u); };
+            const bool part1 = (opcode == 4u);
+            uint32_t X[4] = {
+                part1 ? a.u32[0] : b.u32[0],
+                part1 ? a.u32[1] : b.u32[1],
+                part1 ? a.u32[2] : b.u32[2],
+                part1 ? a.u32[3] : b.u32[3],
+            };
+            uint32_t Y[4] = {
+                part1 ? b.u32[0] : a.u32[0],
+                part1 ? b.u32[1] : a.u32[1],
+                part1 ? b.u32[2] : a.u32[2],
+                part1 ? b.u32[3] : a.u32[3],
+            };
+            for (int e = 0; e < 4; ++e) {
+                uint32_t ch = (Y[0] & Y[1]) ^ (~Y[0] & Y[2]);
+                uint32_t maj = (X[0] & X[1]) ^ (X[0] & X[2]) ^ (X[1] & X[2]);
+                uint32_t t1 = Y[3] + S1(Y[0]) + ch + c.u32[e];
+                uint32_t t2 = S0(X[0]) + maj;
+                Y[3] = Y[2]; Y[2] = Y[1]; Y[1] = Y[0]; Y[0] = t1 + X[3];
+                X[3] = X[2]; X[2] = X[1]; X[1] = X[0]; X[0] = t1 + t2;
+            }
+            for (int i = 0; i < 4; ++i) out.u32[i] = part1 ? X[i] : Y[i];
+            state_.v[rd] = out;
+            return true;
+        }
+        if (opcode == 6u) { // SHA256SU1
+            auto s1 = [](uint32_t x) { return Ror32(x, 17u) ^ Ror32(x, 19u) ^ (x >> 10); };
+            out.u32[0] = a.u32[0] + b.u32[1] + s1(c.u32[2]);
+            out.u32[1] = a.u32[1] + b.u32[2] + s1(c.u32[3]);
+            out.u32[2] = a.u32[2] + b.u32[3] + s1(out.u32[0]);
+            out.u32[3] = a.u32[3] + c.u32[0] + s1(out.u32[1]);
+            state_.v[rd] = out;
+            return true;
+        }
+    }
+
     // 6/6a. AdvSIMD Vector & Scalar Two-reg misc:
     //   Vector: 0 Q U 01110 size 10000 opcode(5) 10 Rn Rd
     //   Scalar: 0 1 U 11110 size 10000 opcode(5) 10 Rn Rd
@@ -1548,6 +1754,36 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
         const NeonReg a = state_.v[rn];
         NeonReg out{};
         const uint32_t count = is_sca_misc ? 1u : (lanes_bytes >> size);
+
+        // SUQADD (u=0, op=0x03) / USQADD (u=1, op=0x03) — Vector & Scalar
+        if (opcode == 0x03u) {
+            const uint32_t elem_bits = 8u << size;
+            const NeonReg cur_d = state_.v[rd];
+            for (uint32_t i = 0; i < count; ++i) {
+                if (u == 0u) {
+                    __int128 sum = static_cast<__int128>(NeonGetLaneSigned(cur_d, size, i)) +
+                                   static_cast<__int128>(NeonGetLane(a, size, i));
+                    NeonSetLane(out, size, i, static_cast<uint64_t>(SatSigned128(sum, elem_bits)));
+                } else {
+                    __int128 sum = static_cast<__int128>(NeonGetLane(cur_d, size, i)) +
+                                   static_cast<__int128>(NeonGetLaneSigned(a, size, i));
+                    NeonSetLane(out, size, i, SatUnsigned128(sum, elem_bits));
+                }
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+        // SQABS (u=0, op=0x07) / SQNEG (u=1, op=0x07) — Vector & Scalar
+        if (opcode == 0x07u) {
+            const uint32_t elem_bits = 8u << size;
+            for (uint32_t i = 0; i < count; ++i) {
+                const __int128 v = static_cast<__int128>(NeonGetLaneSigned(a, size, i));
+                const __int128 r = (u == 1u) ? -v : ((v < 0) ? -v : v);
+                NeonSetLane(out, size, i, static_cast<uint64_t>(SatSigned128(r, elem_bits)));
+            }
+            state_.v[rd] = out;
+            return true;
+        }
 
         if (is_vec_misc && u == 0u && opcode == 0x00u) {
             // REV64 Vd.T, Vn.T
@@ -1760,18 +1996,76 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
             state_.v[rd] = out;
             return true;
         }
-        // FCVTZS (u=0, op=0x1B, fp_hi_size) / FCVTZU (u=1, op=0x1B, fp_hi_size) — Vector & Scalar
-        if (opcode == 0x1Bu && fp_hi_size) {
+        // FCVTNS/U (0x1A, !fp_hi_size), FCVTPS/U (0x1A, fp_hi_size),
+        // FCVTMS/U (0x1B, !fp_hi_size), FCVTZS/U (0x1B, fp_hi_size),
+        // FCVTAS/U (0x1C, !fp_hi_size) — Vector & Scalar
+        if ((opcode == 0x1Au || opcode == 0x1Bu || (opcode == 0x1Cu && !fp_hi_size))) {
+            auto round_mode = [&](double v) -> double {
+                if (opcode == 0x1Au) return fp_hi_size ? std::ceil(v) : std::nearbyint(v);
+                if (opcode == 0x1Bu) return fp_hi_size ? std::trunc(v) : std::floor(v);
+                return std::round(v); // FCVTAS / FCVTAU
+            };
             if (!fp_is_f64) {
                 for (uint32_t i = 0; i < fcnt; ++i) {
-                    double t = std::trunc(static_cast<double>(a.f32[i]));
+                    double t = round_mode(static_cast<double>(a.f32[i]));
                     out.u32[i] = (u == 1u) ? ClampToUint32(t) : static_cast<uint32_t>(ClampToInt32(t));
                 }
             } else if (is_sca_misc || q) {
                 for (uint32_t i = 0; i < fcnt; ++i) {
-                    double t = std::trunc(a.f64[i]);
+                    double t = round_mode(a.f64[i]);
                     out.u64[i] = (u == 1u) ? ClampToUint64(t) : ClampToInt64(t);
                 }
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+        // URECPE (u=0, 0x1C, size=2) & URSQRTE (u=1, 0x1C, size=2) — Vector 32-bit
+        if (is_vec_misc && opcode == 0x1Cu && size == 2u) {
+            for (uint32_t i = 0; i < fcnt; ++i) {
+                const uint32_t val = a.u32[i];
+                if (u == 0u) {
+                    out.u32[i] = (val == 0u) ? 0xFFFFFFFFu : static_cast<uint32_t>(0x100000000ULL / val);
+                } else {
+                    if (val == 0u) out.u32[i] = 0xFFFFFFFFu;
+                    else {
+                        double est = std::floor(4294967296.0 / std::sqrt(static_cast<double>(val)));
+                        out.u32[i] = (est >= 4294967295.0) ? 0xFFFFFFFFu : static_cast<uint32_t>(est);
+                    }
+                }
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+        // FRINTN / FRINTM / FRINTP / FRINTZ / FRINTA / FRINTX / FRINTI — Vector
+        if (is_vec_misc && (opcode == 0x18u || opcode == 0x19u) && !(u == 1u && fp_hi_size && opcode == 0x19u)) {
+            auto do_rint = [&](double v) -> double {
+                if (opcode == 0x18u && u == 0u && !fp_hi_size) return std::nearbyint(v); // FRINTN
+                if (opcode == 0x19u && u == 0u && !fp_hi_size) return std::floor(v);     // FRINTM
+                if (opcode == 0x18u && u == 0u && fp_hi_size)  return std::ceil(v);      // FRINTP
+                if (opcode == 0x19u && u == 0u && fp_hi_size)  return std::trunc(v);     // FRINTZ
+                if (opcode == 0x18u && u == 1u && !fp_hi_size) return std::round(v);     // FRINTA
+                return std::nearbyint(v);                                                // FRINTX / FRINTI
+            };
+            if (!fp_is_f64) {
+                for (uint32_t i = 0; i < fcnt; ++i) out.f32[i] = static_cast<float>(do_rint(a.f32[i]));
+                state_.v[rd] = out;
+                return true;
+            } else if (q) {
+                for (uint32_t i = 0; i < 2u; ++i) out.f64[i] = do_rint(a.f64[i]);
+                state_.v[rd] = out;
+                return true;
+            }
+        }
+        // FRECPX (scalar, u=0, op=0x1F, fp_hi_size)
+        if (is_sca_misc && u == 0u && opcode == 0x1Fu && fp_hi_size) {
+            if (!fp_is_f64) {
+                int exp = 0;
+                std::frexp(a.f32[0], &exp);
+                out.f32[0] = std::ldexp(1.0f, -exp);
+            } else {
+                int exp = 0;
+                std::frexp(a.f64[0], &exp);
+                out.f64[0] = std::ldexp(1.0, -exp);
             }
             state_.v[rd] = out;
             return true;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "haseeb/binder_ipc.hpp"
 #include "haseeb/boot_image.hpp"
 #include "haseeb/cpio_reader.hpp"
 #include "haseeb/cpu_core.hpp"
@@ -17,6 +18,8 @@
 
 #include <array>
 #include <cstdint>
+#include <deque>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -79,10 +82,41 @@ public:
 // Multi-process EL1 supervisor + Linux AArch64 SVC ABI runtime for booting CPIO initramfs
 // (/magiskinit, /init) and ext4 Android framework services (/system/bin/init, servicemanager,
 // zygote64, system_server, surfaceflinger), plus /dev/fb0, /dev/input/event*, /dev/binder,
-// /dev/haseeb_sensors, /dev/video0, /dev/magisk_su, /dev/haseeb_gles, /dev/snd/pcmC0D0*,
-// /dev/__properties__, and /storage/emulated/0.
+// /dev/ashmem, /dev/dma_heap/system, /dev/haseeb_sensors, /dev/video0, /dev/magisk_su,
+// /dev/haseeb_gles, /dev/snd/pcmC0D0*, /dev/__properties__, and /storage/emulated/0.
 class LinuxGuestSupervisor {
 public:
+    struct OpenFile;
+
+    struct EpollWatch {
+        int32_t fd = -1;
+        uint32_t events = 0;
+        uint64_t data = 0;
+    };
+
+    struct UnixSocketEndpoint {
+        struct Chunk {
+            std::vector<uint8_t> data;
+            std::vector<std::shared_ptr<OpenFile>> passed_fds;
+            std::string peer_addr;
+        };
+
+        int domain = 1;    // AF_UNIX
+        int sock_type = 1; // SOCK_STREAM
+        std::string bound_path;
+        std::string peer_path;
+        bool listening = false;
+        int backlog = 128;
+        bool peer_closed = false;
+        bool shutdown_rd = false;
+        bool shutdown_wr = false;
+        std::weak_ptr<UnixSocketEndpoint> peer;
+        std::deque<std::shared_ptr<UnixSocketEndpoint>> pending_accept;
+        std::deque<Chunk> rx_chunks;
+
+        ~UnixSocketEndpoint();
+    };
+
     struct OpenFile {
         std::string path;
         std::string host_path;
@@ -96,26 +130,60 @@ public:
         bool is_camera = false;
         bool is_gles = false;
         bool is_binder = false;
+        uint32_t binder_client_id = 0;
         bool is_snd_play = false;
         bool is_snd_cap = false;
         bool is_magisk_su = false;
         bool is_host_storage = false;
         bool is_eventfd = false;
         uint64_t eventfd_counter = 0;
+        bool is_timerfd = false;
+        int timerfd_clockid = 1;
+        int64_t timerfd_next_expire_ns = 0;
+        int64_t timerfd_interval_ns = 0;
+        uint64_t timerfd_expirations = 0;
         bool is_epoll = false;
         std::vector<int> epoll_fds;
+        std::vector<EpollWatch> epoll_watches;
         bool is_memfd = false;
+        bool is_ashmem = false;
+        bool is_dma_heap = false;
+        bool is_ion = false;
+        std::string ashmem_name;
+        size_t ashmem_size = 0;
+        uint32_t ashmem_prot = 7u;
+        bool ashmem_pinned = true;
+        std::shared_ptr<std::vector<uint64_t>> shared_pages;
         bool is_writable_mem = false;
         bool is_dev_null = false;
         bool is_dev_zero = false;
         bool is_dev_urandom = false;
+        bool is_kmsg = false;
+        bool is_tty = false;
         bool is_stdio_out = false;
         bool nonblock = false;
+        std::shared_ptr<UnixSocketEndpoint> unix_sock;
+        bool is_host_inet_sock = false;
+        int host_sock_domain = 0;
+        int host_sock_type = 0;
+        int32_t so_error = 0;
         VirtioInputDevice* input_dev = nullptr;
         std::vector<std::string> dir_children;
         size_t dir_cursor = 0;
         uint64_t st_dev = 1ULL;
         uint64_t st_ino = 1ULL;
+    };
+
+    struct VmSpace {
+        uint64_t ttbr0_pa = 0;
+        uint64_t current_brk = 0;
+        uint64_t mmap_cursor = 0x0000001000000000ULL;
+        std::vector<uint64_t> fb_mapped_pas;
+    };
+
+    struct FdTable {
+        int next_fd = 3;
+        std::unordered_map<int, OpenFile> fds;
     };
 
     struct SyscallTraceEntry {
@@ -133,6 +201,9 @@ public:
         Runnable = 0,
         WaitingChild,
         Sleeping,
+        FutexWait,
+        PollWait,
+        BinderWait,
         Zombie,
     };
 
@@ -148,24 +219,32 @@ public:
     };
 
     struct GuestTask {
-        int32_t pid = 1;
+        int32_t pid = 1;  // TID in Linux kernel terms
+        int32_t tgid = 1; // Thread group leader PID (returned by getpid)
         int32_t ppid = 0;
         uint32_t uid = 0;
         uint32_t gid = 0;
         std::string binary;
-        uint64_t ttbr0_pa = 0;
-        uint64_t current_brk = 0;
-        uint64_t mmap_cursor = 0x0000001000000000ULL;
+        std::string cwd = "/";
         uint64_t stack_top = 0x000000007FFF0000ULL;
-        int next_fd = 3;
-        std::unordered_map<int, OpenFile> open_fds;
-        std::vector<uint64_t> fb_mapped_pas;
+        std::shared_ptr<VmSpace> vm = std::make_shared<VmSpace>();
+        std::shared_ptr<FdTable> files = std::make_shared<FdTable>();
         SavedTaskCpu cpu{};
         TaskState state = TaskState::Runnable;
         int exit_status = 0;
         int32_t wait_target_pid = -1;
         uint64_t wait_status_uva = 0;
         int64_t wakeup_ns = 0;
+        uint64_t futex_pa = 0;
+        uint32_t futex_bitset = 0xFFFFFFFFu;
+        bool futex_has_timeout = false;
+        int64_t futex_deadline_ns = 0;
+        int32_t poll_wait_epfd = -1;
+        std::vector<EpollWatch> poll_wait_fds;
+        uint64_t poll_events_uva = 0;
+        int32_t poll_maxevents = 0;
+        bool poll_has_timeout = false;
+        int64_t poll_deadline_ns = 0;
         uint64_t clear_child_tid = 0;
         uint64_t sigaltstack_sp = 0ULL;
         int32_t sigaltstack_flags = 2; // SS_DISABLE
@@ -223,6 +302,7 @@ public:
 private:
     static constexpr uint16_t kSyscallHypercallImm = 0x4C58u; // "LX"
 
+    void CloseSingleOpenFile(OpenFile& of);
     void CloseTaskOpenFds(GuestTask& task);
     void CloseAllOpenFds();
     GuestTask* CurrentTask();
@@ -235,7 +315,8 @@ private:
                               const std::vector<uint8_t>& elf_bytes,
                               const std::vector<std::string>& argv,
                               std::string& out_error,
-                              bool reset_phys_cursor);
+                              bool reset_phys_cursor,
+                              const std::vector<std::string>* envp_override = nullptr);
     bool ResolveHostStoragePath(const std::string& norm_guest_path,
                                 std::string& out_host_path,
                                 std::string& out_rel) const;
@@ -278,6 +359,14 @@ private:
                           uint64_t flags,
                           uint64_t mode,
                           bool check_access_only);
+    uint32_t ComputeFdPollEvents(const OpenFile& of) const;
+    uint32_t ComputeGuestFdPollEvents(const std::unordered_map<int, OpenFile>& fds, int fd) const;
+    void WakeBinderWaitersForPid(int32_t target_pid);
+    void WakePollWaiters();
+    int WakeFutexWaiters(uint64_t pa, int max_wake, uint32_t bitset);
+    void HandleBuiltInPropertyServicePacket(const std::shared_ptr<UnixSocketEndpoint>& client_ep,
+                                            const std::vector<uint8_t>& pkt);
+    void HandleBuiltInLogdPacket(const std::vector<uint8_t>& pkt);
     void RecordSyscall(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2,
                        int64_t ret, uint64_t pc, int32_t pid, const std::string& note = "");
     void LogToUart(const std::string& msg) const;
@@ -300,6 +389,7 @@ private:
     SoftGlesContext* soft_gles_ = nullptr;
     VirtioSndDevice* snd_ = nullptr;
     haseeb::prop::PropertyAreaManager* prop_mgr_ = nullptr;
+    BinderIpcBroker binder_broker_;
 
     std::string shared_storage_root_;
     std::vector<CpioEntry> initramfs_;
@@ -328,6 +418,7 @@ private:
 
     int next_fd_ = 3;
     std::unordered_map<int, OpenFile> open_fds_;
+    std::unordered_map<std::string, std::weak_ptr<UnixSocketEndpoint>> unix_bound_sockets_;
     int32_t next_pid_ = 1;
     std::vector<std::unique_ptr<GuestTask>> tasks_;
     size_t current_task_idx_ = 0;

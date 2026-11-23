@@ -340,10 +340,13 @@ VmError AArch64CpuCore::Run(uint64_t max_insns) {
     TranslatedBlock* prev_tb = nullptr;
     int prev_link_slot = -1;
     uint32_t consecutive_fetch_faults = 0u;
+    uint32_t block_iter = 0u;
 
     while (!state_.halted && !stop_requested_ &&
            (state_.instructions_executed - start_count) < max_insns) {
-        EvaluateTimersAndIrqs();
+        if ((block_iter++ & 63u) == 0u || state_.waiting_for_interrupt) {
+            EvaluateTimersAndIrqs();
+        }
         if (state_.waiting_for_interrupt && (state_.pending_irq || state_.pending_fiq)) {
             state_.waiting_for_interrupt = false;
         }

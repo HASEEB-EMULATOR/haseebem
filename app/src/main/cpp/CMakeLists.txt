@@ -41,6 +41,7 @@ add_library(
     src/guest_vfs_bridge.cpp
     src/compression.cpp
     src/cpio_reader.cpp
+    src/binder_ipc.cpp
     src/kernel_boot.cpp
     src/engine_rom_builder.cpp
 )
@@ -120,6 +121,7 @@ if(HASEEB_BUILD_HOST_TESTS OR HASEEB_BUILD_GUEST_TEST)
         haseeb_m7_magisk_phone_tests:tests/m7_magisk_phone_test.cpp
         haseeb_m8_softgles_snd_net_tests:tests/m8_softgles_snd_net_test.cpp
         haseeb_m9_engine_rom_framework_tests:tests/m9_engine_rom_framework_test.cpp
+        haseeb_m10_android_ipc_threading_tests:tests/m10_android_ipc_threading_test.cpp
     )
 
     foreach(entry IN LISTS HASEEB_TEST_TARGETS)

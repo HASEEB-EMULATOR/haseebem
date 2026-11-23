@@ -458,6 +458,41 @@ bool AArch64CpuCore::ExecuteAtomicLse(const DecodedInsn& d) {
     // CAS / CASP (bits[29:24] == 001000)
     if ((insn & 0x3F000000u) == 0x08000000u) {
         const uint8_t rs = static_cast<uint8_t>((insn >> 16) & 31u);
+        const bool is_casp = ((insn & 0xBFA07C00u) == 0x08207C00u);
+        if (is_casp) {
+            const bool is_64 = ((insn >> 30) & 1u) != 0;
+            const uint8_t rs2 = static_cast<uint8_t>((rs + 1u) & 31u);
+            const uint8_t rt2 = static_cast<uint8_t>((rt + 1u) & 31u);
+            if (!is_64) {
+                uint64_t raw = 0;
+                if (!ReadMem(addr, 8u, raw, true)) return false;
+                const uint32_t cur0 = static_cast<uint32_t>(raw & 0xFFFFFFFFULL);
+                const uint32_t cur1 = static_cast<uint32_t>((raw >> 32) & 0xFFFFFFFFULL);
+                const uint32_t exp0 = static_cast<uint32_t>(state_.ReadRegOrZero(rs));
+                const uint32_t exp1 = static_cast<uint32_t>(state_.ReadRegOrZero(rs2));
+                if (cur0 == exp0 && cur1 == exp1) {
+                    const uint64_t new_pair =
+                        (state_.ReadRegOrZero(rt) & 0xFFFFFFFFULL) |
+                        ((state_.ReadRegOrZero(rt2) & 0xFFFFFFFFULL) << 32);
+                    if (!WriteMem(addr, 8u, new_pair, true)) return false;
+                }
+                state_.WriteRegOrDiscard(rs, cur0);
+                state_.WriteRegOrDiscard(rs2, cur1);
+            } else {
+                uint64_t cur0 = 0, cur1 = 0;
+                if (!ReadMem128(addr, cur0, cur1)) return false;
+                const uint64_t exp0 = state_.ReadRegOrZero(rs);
+                const uint64_t exp1 = state_.ReadRegOrZero(rs2);
+                if (cur0 == exp0 && cur1 == exp1) {
+                    if (!WriteMem128(addr, state_.ReadRegOrZero(rt), state_.ReadRegOrZero(rt2))) {
+                        return false;
+                    }
+                }
+                state_.WriteRegOrDiscard(rs, cur0);
+                state_.WriteRegOrDiscard(rs2, cur1);
+            }
+            return true;
+        }
         uint64_t expected = state_.ReadRegOrZero(rs);
         uint64_t desired = state_.ReadRegOrZero(rt);
         uint64_t mask = (datasize == 8u) ? ~0ULL : ((1ULL << (datasize * 8u)) - 1ULL);

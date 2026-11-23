@@ -203,10 +203,12 @@ DecodedInsn TranslationCache::DecodeOne(uint32_t insn) {
             d.kind = InsnKind::LoadStoreSimdStruct;
             return d;
         }
-        // Load/Store Exclusive & Ordered + CAS (bits[29:24] == 001000)
+        // Load/Store Exclusive & Ordered + CAS/CASP (bits[29:24] == 001000)
         if ((insn & 0x3F000000u) == 0x08000000u) {
-            // Distinguish CAS/CASP (bit21 == 1 and bits[14:10] == 11111) vs Exclusives (bit21 == 0)
-            if ((insn & 0x00207C00u) == 0x00207C00u) {
+            // CAS: o2(bit23)=1, o1(bit21)=1, Rt2=31; CASP: bit31=0, o2(bit23)=0, o1(bit21)=1, Rt2=31
+            const bool is_cas = ((insn & 0x3FA07C00u) == 0x08A07C00u);
+            const bool is_casp = ((insn & 0xBFA07C00u) == 0x08207C00u);
+            if (is_cas || is_casp) {
                 d.kind = InsnKind::AtomicLse;
             } else {
                 d.kind = InsnKind::Exclusive;
