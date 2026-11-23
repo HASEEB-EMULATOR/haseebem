@@ -114,6 +114,8 @@ public:
         VirtioInputDevice* input_dev = nullptr;
         std::vector<std::string> dir_children;
         size_t dir_cursor = 0;
+        uint64_t st_dev = 1ULL;
+        uint64_t st_ino = 1ULL;
     };
 
     struct SyscallTraceEntry {
@@ -241,12 +243,32 @@ private:
                                    int dirfd,
                                    const std::string& raw_path,
                                    std::string& out_norm) const;
-    bool ResolveSymlinkTarget(const std::string& norm_path,
+    struct GuestStatMeta {
+        uint64_t st_dev = 1ULL;
+        uint64_t st_ino = 1ULL;
+        uint32_t st_mode = 0100755u;
+        uint64_t st_size = 0ULL;
+    };
+
+    bool ResolveProcSymlinkTarget(const std::unordered_map<int, OpenFile>& fds,
+                                  const std::string& norm_path,
+                                  std::string& out_target) const;
+    bool ResolveSymlinkTarget(const std::unordered_map<int, OpenFile>& fds,
+                              const std::string& norm_path,
                               std::string& out_target) const;
     bool ResolveVfsFile(const std::string& path,
                         std::vector<uint8_t>& out_data,
                         bool& out_is_dir,
-                        std::vector<std::string>& out_children) const;
+                        std::vector<std::string>& out_children,
+                        std::string* out_resolved_path = nullptr,
+                        const std::unordered_map<int, OpenFile>* fds = nullptr) const;
+    int64_t StatFd(const std::unordered_map<int, OpenFile>& fds, int fd, GuestStatMeta& out) const;
+    int64_t StatGuestPath(const std::unordered_map<int, OpenFile>& fds,
+                          int dirfd,
+                          const std::string& raw_path,
+                          uint64_t flags,
+                          std::string* out_note,
+                          GuestStatMeta& out) const;
     bool LookupL3Pte(uint64_t va, uint64_t& out_l3_entry_pa, uint64_t& out_leaf) const;
     void UnmapRange4K(AArch64CpuCore& cpu, uint64_t addr, uint64_t len);
     bool ProtectRange4K(AArch64CpuCore& cpu, uint64_t addr, uint64_t len, bool r, bool w, bool x);
@@ -314,7 +336,7 @@ private:
     bool exited_ = false;
     int exit_status_ = 0;
 
-    static constexpr size_t kSyscallTraceSize = 48;
+    static constexpr size_t kSyscallTraceSize = 64;
     std::array<SyscallTraceEntry, kSyscallTraceSize> syscall_ring_{};
     size_t syscall_head_ = 0;
     uint64_t syscall_total_ = 0;

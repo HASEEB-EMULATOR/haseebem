@@ -860,6 +860,212 @@ void TestElfPhdrTlsMmapCoherencyAndSyscalls() {
     std::cout << "[PASS] Test 5: PT_PHDR/PT_TLS, mmap/mprotect DBT coherency, A6/A7 syscalls & failure trace\n";
 }
 
+// Test 6: Unique per-file st_ino across fstat/newfstatat/statx, /proc/self/fd/<fd> & /proc/self/exe readlinkat,
+// sysinfo(179), and rt_tgsigqueueinfo(240) without ENOSYS.
+void TestUniqueInodesProcSelfFdAndSigQueue() {
+    auto ldr_x = [](uint8_t xt, uint8_t xn, uint16_t imm_bytes) -> uint32_t {
+        return 0xF9400000u | (static_cast<uint32_t>((imm_bytes / 8u) & 0xFFFu) << 10) |
+               (static_cast<uint32_t>(xn & 31u) << 5) | (xt & 31u);
+    };
+    auto str_x = [](uint8_t xt, uint8_t xn, uint16_t imm_bytes) -> uint32_t {
+        return 0xF9000000u | (static_cast<uint32_t>((imm_bytes / 8u) & 0xFFFu) << 10) |
+               (static_cast<uint32_t>(xn & 31u) << 5) | (xt & 31u);
+    };
+    auto cmp_x = [](uint8_t xn, uint8_t xm) -> uint32_t {
+        return 0xEB00001Fu | (static_cast<uint32_t>(xm & 31u) << 16) |
+               (static_cast<uint32_t>(xn & 31u) << 5);
+    };
+
+    CodeBlobBuilder cb;
+    const size_t path_lib_a = cb.AddString("/system/lib64/liba.so");
+    const size_t path_lib_b = cb.AddString("/system/lib64/libb.so");
+    const size_t path_exe = cb.AddString("/proc/self/exe");
+    // Ensure 8-byte alignment isn't needed for LdrX (unaligned ok in VM), exact 16 bytes "/proc/self/fd/0\0"
+    const size_t tmpl_proc_fd = cb.AddString("/proc/self/fd/0");
+    const size_t ok_msg = cb.AddString("[INODE-PROC-OK]\n");
+
+    cb.insns.push_back(SubImm64(31, 31, 1024u));
+
+    // x20 = openat(AT_FDCWD, "/system/lib64/liba.so", O_RDONLY)
+    EmitImm64(cb.insns, 0, static_cast<uint64_t>(-100));
+    cb.EmitAdrPlaceholder(1, path_lib_a);
+    cb.insns.push_back(Movz(2, 0u));
+    cb.insns.push_back(Movz(3, 0u));
+    cb.insns.push_back(Movz(8, 56u));
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(0xAA0003F4u); // MOV X20, X0
+
+    // x21 = openat(AT_FDCWD, "/system/lib64/libb.so", O_RDONLY)
+    EmitImm64(cb.insns, 0, static_cast<uint64_t>(-100));
+    cb.EmitAdrPlaceholder(1, path_lib_b);
+    cb.insns.push_back(Movz(2, 0u));
+    cb.insns.push_back(Movz(3, 0u));
+    cb.insns.push_back(Movz(8, 56u));
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(0xAA0003F5u); // MOV X21, X0
+
+    // fstat(x20, sp+0), fstat(x21, sp+128)
+    cb.insns.push_back(0xAA1403E0u); // MOV X0, X20
+    cb.insns.push_back(AddImm64(1, 31, 0u));
+    cb.insns.push_back(Movz(8, 80u)); // fstat
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 0u));
+    const size_t f1 = cb.insns.size(); cb.insns.push_back(0);
+
+    cb.insns.push_back(0xAA1503E0u); // MOV X0, X21
+    cb.insns.push_back(AddImm64(1, 31, 128u));
+    cb.insns.push_back(Movz(8, 80u)); // fstat
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 0u));
+    const size_t f2 = cb.insns.size(); cb.insns.push_back(0);
+
+    // Check st_ino(liba) != 0, st_ino(libb) != 0, and st_ino(liba) != st_ino(libb)
+    cb.insns.push_back(ldr_x(22, 31, 8u));   // ino_a
+    cb.insns.push_back(ldr_x(23, 31, 136u)); // ino_b
+    cb.insns.push_back(Cbz64(22, 0));
+    const size_t f3 = cb.insns.size() - 1u;
+    cb.insns.push_back(Cbz64(23, 0));
+    const size_t f4 = cb.insns.size() - 1u;
+    cb.insns.push_back(cmp_x(22, 23));
+    const size_t f5 = cb.insns.size(); cb.insns.push_back(0); // BEQ -> fail
+
+    // newfstatat(AT_FDCWD, "/system/lib64/libb.so", sp+256, 0) -> st_ino must equal ino_b (x23)
+    EmitImm64(cb.insns, 0, static_cast<uint64_t>(-100));
+    cb.EmitAdrPlaceholder(1, path_lib_b);
+    cb.insns.push_back(AddImm64(2, 31, 256u));
+    cb.insns.push_back(Movz(3, 0u));
+    cb.insns.push_back(Movz(8, 79u)); // newfstatat
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(ldr_x(10, 31, 264u));
+    cb.insns.push_back(cmp_x(10, 23));
+    const size_t f6 = cb.insns.size(); cb.insns.push_back(0); // BNE -> fail
+
+    // statx(AT_FDCWD, "/system/lib64/libb.so", 0, 0x7FF, sp+512) -> stx_ino@32 must equal ino_b (x23)
+    EmitImm64(cb.insns, 0, static_cast<uint64_t>(-100));
+    cb.EmitAdrPlaceholder(1, path_lib_b);
+    cb.insns.push_back(Movz(2, 0u));
+    cb.insns.push_back(Movz(3, 0x7FFu));
+    cb.insns.push_back(AddImm64(4, 31, 512u));
+    cb.insns.push_back(Movz(8, 291u)); // statx
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 0u));
+    const size_t f7 = cb.insns.size(); cb.insns.push_back(0);
+    cb.insns.push_back(ldr_x(10, 31, 544u)); // sp + 512 + 32
+    cb.insns.push_back(cmp_x(10, 23));
+    const size_t f8 = cb.insns.size(); cb.insns.push_back(0);
+
+    // Format "/proc/self/fd/<x21>" at sp+896 and call readlinkat -> len == 19 ("/system/lib64/libb.so")
+    cb.EmitAdrPlaceholder(9, tmpl_proc_fd);
+    cb.insns.push_back(ldr_x(10, 9, 0u));
+    cb.insns.push_back(str_x(10, 31, 896u));
+    cb.insns.push_back(ldr_x(10, 9, 8u));
+    cb.insns.push_back(str_x(10, 31, 904u));
+    cb.insns.push_back(AddImm64(10, 21, static_cast<uint16_t>('0')));
+    cb.insns.push_back(Strb(10, 31, 910u));
+
+    EmitImm64(cb.insns, 0, static_cast<uint64_t>(-100));
+    cb.insns.push_back(AddImm64(1, 31, 896u));
+    cb.insns.push_back(AddImm64(2, 31, 768u));
+    cb.insns.push_back(Movz(3, 128u));
+    cb.insns.push_back(Movz(8, 78u)); // readlinkat
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 21u)); // "/system/lib64/libb.so" length is 21
+    const size_t f9 = cb.insns.size(); cb.insns.push_back(0);
+
+    // readlinkat("/proc/self/exe") -> len == 5 ("/init")
+    EmitImm64(cb.insns, 0, static_cast<uint64_t>(-100));
+    cb.EmitAdrPlaceholder(1, path_exe);
+    cb.insns.push_back(AddImm64(2, 31, 768u));
+    cb.insns.push_back(Movz(3, 128u));
+    cb.insns.push_back(Movz(8, 78u)); // readlinkat
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 5u));
+    const size_t f10 = cb.insns.size(); cb.insns.push_back(0);
+
+    // sysinfo(sp+768) -> 0
+    cb.insns.push_back(AddImm64(0, 31, 768u));
+    cb.insns.push_back(Movz(8, 179u)); // sysinfo
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 0u));
+    const size_t f11 = cb.insns.size(); cb.insns.push_back(0);
+
+    // rt_tgsigqueueinfo(1, 1, 0, 0) -> 0 (not ENOSYS)
+    cb.insns.push_back(Movz(0, 1u));
+    cb.insns.push_back(Movz(1, 1u));
+    cb.insns.push_back(Movz(2, 0u));
+    cb.insns.push_back(Movz(3, 0u));
+    cb.insns.push_back(Movz(8, 240u)); // rt_tgsigqueueinfo
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 0u));
+    const size_t f12 = cb.insns.size(); cb.insns.push_back(0);
+
+    // Print "[INODE-PROC-OK]\n" and send rt_tgsigqueueinfo(1, 1, SIGABRT=6, 0)
+    cb.insns.push_back(Movz(0, 1u));
+    cb.EmitAdrPlaceholder(1, ok_msg);
+    cb.insns.push_back(Movz(2, 16u));
+    cb.insns.push_back(Movz(8, 64u)); // write
+    cb.insns.push_back(Svc(0));
+
+    cb.insns.push_back(Movz(0, 1u));
+    cb.insns.push_back(Movz(1, 1u));
+    cb.insns.push_back(Movz(2, 6u)); // SIGABRT
+    cb.insns.push_back(Movz(3, 0u));
+    cb.insns.push_back(Movz(8, 240u)); // rt_tgsigqueueinfo
+    cb.insns.push_back(Svc(0));
+
+    const size_t fail_idx = cb.insns.size();
+    cb.insns.push_back(Movz(0, 98u));
+    cb.insns.push_back(Movz(8, 94u));
+    cb.insns.push_back(Svc(0));
+
+    cb.insns[f1] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f1));
+    cb.insns[f2] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f2));
+    cb.insns[f3] = Cbz64(22, static_cast<int32_t>(fail_idx - f3));
+    cb.insns[f4] = Cbz64(23, static_cast<int32_t>(fail_idx - f4));
+    cb.insns[f5] = BCond(0u /* EQ */, static_cast<int32_t>(fail_idx - f5));
+    cb.insns[f6] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f6));
+    cb.insns[f7] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f7));
+    cb.insns[f8] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f8));
+    cb.insns[f9] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f9));
+    cb.insns[f10] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f10));
+    cb.insns[f11] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f11));
+    cb.insns[f12] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f12));
+
+    std::vector<uint8_t> init_elf = BuildMinimalAArch64Elf64(cb.Finalize());
+    std::vector<uint8_t> rd = GzipVec(CpioArchive::Build({
+        MakeCpio("init", 0100755u, init_elf),
+        MakeCpio("system", 0040755u),
+        MakeCpio("system/lib64", 0040755u),
+        MakeCpio("system/lib64/liba.so", 0100644u, {'A', 'A', 'A', 'A'}),
+        MakeCpio("system/lib64/libb.so", 0100644u, {'B', 'B', 'B', 'B'}),
+    }));
+
+    std::vector<uint8_t> boot_bytes = BuildBootImgV2({}, rd, "androidboot.selinux=permissive");
+    ParsedBootImage parsed;
+    std::string err;
+    assert(BootImageParser::ParseBootBytes(boot_bytes, parsed, err) == VmError::Ok);
+
+    VirtualMachineSkeleton vm;
+    MachineBootConfig cfg;
+    cfg.ram_mb = 64u;
+    assert(vm.InitializeAndStage(cfg, &parsed, err) == VmError::Ok);
+
+    std::string target;
+    assert(vm.BootGuest(false, target, err) == VmError::Ok);
+    assert(target == "/init");
+
+    assert(vm.StepGuest(50000ULL) == VmError::Ok);
+    assert(vm.CpuState().halted);
+    assert(vm.Supervisor()->Exited());
+    assert(vm.Supervisor()->ExitStatus() == 134); // 128 + SIGABRT(6)
+
+    const std::string uart = vm.Uart().CapturedOutput();
+    assert(uart.find("[INODE-PROC-OK]") != std::string::npos);
+    assert(uart.find("[SIGNAL] pid=1 sig=6") != std::string::npos);
+    assert(uart.find("[SYS-ENOSYS]") == std::string::npos);
+    std::cout << "[PASS] Test 6: Unique per-file st_ino, /proc/self/fd readlinkat, sysinfo & rt_tgsigqueueinfo\n";
+}
+
 } // namespace
 
 int main() {
@@ -868,6 +1074,7 @@ int main() {
     TestCompressedArm64KernelDirectBoot();
     TestEl0MagiskInitToShellPrompt();
     TestElfPhdrTlsMmapCoherencyAndSyscalls();
+    TestUniqueInodesProcSelfFdAndSigQueue();
     std::cout << "ALL M4 KERNEL & INIT BOOT TESTS PASSED.\n";
     return 0;
 }
