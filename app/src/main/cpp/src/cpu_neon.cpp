@@ -72,6 +72,65 @@ uint64_t VfpExpandImm64(uint8_t imm8) {
     return (sign << 63) | (exp_top << 62) | (rep << 54) | (exp_rest << 52) | (mant << 48);
 }
 
+int64_t SatSigned128(__int128 v, uint32_t bits) {
+    const unsigned __int128 half = static_cast<unsigned __int128>(1) << (bits - 1u);
+    const __int128 max_v = static_cast<__int128>(half - 1u);
+    const __int128 min_v = -max_v - 1;
+    if (v < min_v) return static_cast<int64_t>(min_v);
+    if (v > max_v) return static_cast<int64_t>(max_v);
+    return static_cast<int64_t>(v);
+}
+
+uint64_t SatUnsigned128(__int128 v, uint32_t bits) {
+    if (v < 0) return 0ULL;
+    const unsigned __int128 uv = static_cast<unsigned __int128>(v);
+    const unsigned __int128 max_v = (bits == 64u)
+        ? static_cast<unsigned __int128>(UINT64_MAX)
+        : ((static_cast<unsigned __int128>(1) << bits) - 1u);
+    return (uv > max_v) ? static_cast<uint64_t>(max_v) : static_cast<uint64_t>(uv);
+}
+
+uint16_t PolyMul8(uint8_t a, uint8_t b) {
+    uint16_t res = 0;
+    for (uint32_t k = 0; k < 8u; ++k) {
+        if ((a >> k) & 1u) res ^= static_cast<uint16_t>(b) << k;
+    }
+    return res;
+}
+
+void PolyMul64(uint64_t a, uint64_t b, uint64_t& out_lo, uint64_t& out_hi) {
+    uint64_t lo = 0, hi = 0;
+    for (uint32_t k = 0; k < 64u; ++k) {
+        if ((a >> k) & 1ULL) {
+            lo ^= (b << k);
+            if (k != 0u) hi ^= (b >> (64u - k));
+        }
+    }
+    out_lo = lo;
+    out_hi = hi;
+}
+
+uint64_t NeonGetLane(const NeonReg& r, uint32_t esize, uint32_t idx) {
+    if (esize == 0u) return r.u8[idx];
+    if (esize == 1u) return r.u16[idx];
+    if (esize == 2u) return r.u32[idx];
+    return r.u64[idx];
+}
+
+int64_t NeonGetLaneSigned(const NeonReg& r, uint32_t esize, uint32_t idx) {
+    if (esize == 0u) return r.i8[idx];
+    if (esize == 1u) return r.i16[idx];
+    if (esize == 2u) return r.i32[idx];
+    return r.i64[idx];
+}
+
+void NeonSetLane(NeonReg& r, uint32_t esize, uint32_t idx, uint64_t val) {
+    if (esize == 0u) r.u8[idx] = static_cast<uint8_t>(val);
+    else if (esize == 1u) r.u16[idx] = static_cast<uint16_t>(val);
+    else if (esize == 2u) r.u32[idx] = static_cast<uint32_t>(val);
+    else r.u64[idx] = val;
+}
+
 } // namespace
 
 bool AArch64CpuCore::CheckFpSimdEnabled() {
@@ -269,6 +328,28 @@ bool AArch64CpuCore::ExecuteFpScalar(uint32_t insn) {
         return true;
     }
 
+    // Floating-point conditional compare (FCCMP / FCCMPE): bit21=1, bit11..10=01
+    if ((insn & 0x5FA00C00u) == 0x1E200400u && ((insn >> 21) & 1u) == 1u) {
+        const uint8_t cond = static_cast<uint8_t>((insn >> 12) & 0xFu);
+        const uint32_t nzcv = static_cast<uint32_t>(insn & 0xFu) << 28;
+        if (!EvalCond(cond)) {
+            state_.pstate.UnpackNzcv(nzcv);
+            return true;
+        }
+        double a = (ftype == 0u) ? state_.v[rn].f32[0] : state_.v[rn].f64[0];
+        double b = (ftype == 0u) ? state_.v[rm].f32[0] : state_.v[rm].f64[0];
+        if (std::isnan(a) || std::isnan(b)) {
+            state_.pstate.n = false; state_.pstate.z = false; state_.pstate.c = true; state_.pstate.v = true;
+        } else if (a == b) {
+            state_.pstate.n = false; state_.pstate.z = true; state_.pstate.c = true; state_.pstate.v = false;
+        } else if (a < b) {
+            state_.pstate.n = true; state_.pstate.z = false; state_.pstate.c = false; state_.pstate.v = false;
+        } else {
+            state_.pstate.n = false; state_.pstate.z = false; state_.pstate.c = true; state_.pstate.v = false;
+        }
+        return true;
+    }
+
     // Floating-point conditional select (FCSEL): bit21=1, bit11..10=11
     if ((insn & 0x5FA00C00u) == 0x1E200C00u && ((insn >> 21) & 1u) == 1u) {
         const uint8_t cond = static_cast<uint8_t>((insn >> 12) & 0xFu);
@@ -295,9 +376,14 @@ bool AArch64CpuCore::ExecuteFpScalar(uint32_t insn) {
                 case 1: r = a / b; break;
                 case 2: r = a + b; break;
                 case 3: r = a - b; break;
-                case 4: r = std::fmax(a, b); break;
-                case 5: r = std::fmin(a, b); break;
-                default: break;
+                case 4: r = (std::isnan(a) || std::isnan(b)) ? (a + b) : std::fmax(a, b); break;
+                case 5: r = (std::isnan(a) || std::isnan(b)) ? (a + b) : std::fmin(a, b); break;
+                case 6: r = std::fmax(a, b); break; // FMAXNM
+                case 7: r = std::fmin(a, b); break; // FMINNM
+                case 8: r = -(a * b); break;        // FNMUL
+                default:
+                    RaiseException(ec::kUnknown, 0, 0, false, state_.pc);
+                    return false;
             }
             state_.v[rd].f32[0] = r;
             state_.v[rd].u32[1] = 0;
@@ -311,9 +397,14 @@ bool AArch64CpuCore::ExecuteFpScalar(uint32_t insn) {
                 case 1: r = a / b; break;
                 case 2: r = a + b; break;
                 case 3: r = a - b; break;
-                case 4: r = std::fmax(a, b); break;
-                case 5: r = std::fmin(a, b); break;
-                default: break;
+                case 4: r = (std::isnan(a) || std::isnan(b)) ? (a + b) : std::fmax(a, b); break;
+                case 5: r = (std::isnan(a) || std::isnan(b)) ? (a + b) : std::fmin(a, b); break;
+                case 6: r = std::fmax(a, b); break; // FMAXNM
+                case 7: r = std::fmin(a, b); break; // FMINNM
+                case 8: r = -(a * b); break;        // FNMUL
+                default:
+                    RaiseException(ec::kUnknown, 0, 0, false, state_.pc);
+                    return false;
             }
             state_.v[rd].f64[0] = r;
             state_.v[rd].u64[1] = 0;
@@ -437,8 +528,12 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
         return true;
     }
 
-    // 1b. AdvSIMD Shift by immediate: 0 Q U 011110 immh(4)!=0 immb(3) opcode(5) 1 Rn Rd
-    if ((insn & 0x9F800400u) == 0x0F000400u && ((insn >> 19) & 0xFu) != 0u) {
+    // 1b/1c. AdvSIMD Vector & Scalar Shift by immediate:
+    //   Vector: 0 Q U 011110 immh(4)!=0 immb(3) opcode(5) 1 Rn Rd
+    //   Scalar: 0 1 U 111110 immh(4)!=0 immb(3) opcode(5) 1 Rn Rd
+    const bool is_vec_shift_imm = ((insn & 0x9F800400u) == 0x0F000400u) && (((insn >> 19) & 0xFu) != 0u);
+    const bool is_sca_shift_imm = ((insn & 0xDF800400u) == 0x5F000400u) && (((insn >> 19) & 0xFu) != 0u);
+    if (is_vec_shift_imm || is_sca_shift_imm) {
         const uint32_t u = (insn >> 29) & 1u;
         const uint32_t immh = (insn >> 19) & 0xFu;
         const uint32_t immb = (insn >> 16) & 7u;
@@ -451,152 +546,267 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
         else if (immh & 4u) esize = 2u;
         else if (immh & 2u) esize = 1u;
         else esize = 0u;
+        const uint32_t elem_bits = 8u << esize;
+        const uint32_t count = is_sca_shift_imm ? 1u : (lanes_bytes >> esize);
 
-        if (u == 0u && (opcode == 0x10u || opcode == 0x11u) && esize <= 2u) {
-            // SHRN / SHRN2 (0x10) & RSHRN / RSHRN2 (0x11): right-shift 2*elem_bits elements into low/high 64 bits
+        // Narrowing right-shifts: SHRN(u=0,0x10), RSHRN(u=0,0x11), SQSHRUN(u=1,0x10), SQRSHRUN(u=1,0x11),
+        //                         SQSHRN(u=0,0x12), UQSHRN(u=1,0x12), SQRSHRN(u=0,0x13), UQRSHRN(u=1,0x13)
+        if ((opcode == 0x10u || opcode == 0x11u || opcode == 0x12u || opcode == 0x13u) && esize <= 2u) {
             const uint32_t shift = (16u << esize) - imm7;
-            const bool rounding = (opcode == 0x11u);
-            NeonReg out = q ? state_.v[rd] : NeonReg{};
-            const uint32_t byte_off = q ? 8u : 0u;
-            if (esize == 0u) {
-                for (uint32_t i = 0; i < 8u; ++i) {
-                    uint64_t v = src_v.u16[i];
-                    out.u8[byte_off + i] = static_cast<uint8_t>(rounding ? LshrRound64(v, shift) : Lshr64(v, shift));
+            const bool rounding = (opcode == 0x11u || opcode == 0x13u);
+            const bool is_vec_hi = is_vec_shift_imm && q;
+            NeonReg out = is_vec_hi ? state_.v[rd] : NeonReg{};
+            const uint32_t dst_off = is_vec_hi ? (8u >> esize) : 0u;
+            const uint32_t n = is_sca_shift_imm ? 1u : (8u >> esize);
+            for (uint32_t i = 0; i < n; ++i) {
+                uint64_t val = 0;
+                if (opcode <= 0x11u && u == 0u) {
+                    uint64_t v = NeonGetLane(src_v, esize + 1u, i);
+                    val = rounding ? LshrRound64(v, shift) : Lshr64(v, shift);
+                } else if (opcode <= 0x11u && u == 1u) {
+                    int64_t v = NeonGetLaneSigned(src_v, esize + 1u, i);
+                    int64_t s = rounding ? AshrRound64(v, shift) : Ashr64(v, shift);
+                    val = SatUnsigned128(s, elem_bits);
+                } else if (u == 0u) {
+                    int64_t v = NeonGetLaneSigned(src_v, esize + 1u, i);
+                    int64_t s = rounding ? AshrRound64(v, shift) : Ashr64(v, shift);
+                    val = static_cast<uint64_t>(SatSigned128(s, elem_bits));
+                } else {
+                    uint64_t v = NeonGetLane(src_v, esize + 1u, i);
+                    uint64_t s = rounding ? LshrRound64(v, shift) : Lshr64(v, shift);
+                    val = SatUnsigned128(static_cast<__int128>(s), elem_bits);
                 }
-            } else if (esize == 1u) {
-                for (uint32_t i = 0; i < 4u; ++i) {
-                    uint64_t v = src_v.u32[i];
-                    out.u16[(byte_off / 2u) + i] = static_cast<uint16_t>(rounding ? LshrRound64(v, shift) : Lshr64(v, shift));
-                }
-            } else {
-                for (uint32_t i = 0; i < 2u; ++i) {
-                    uint64_t v = src_v.u64[i];
-                    out.u32[(byte_off / 4u) + i] = static_cast<uint32_t>(rounding ? LshrRound64(v, shift) : Lshr64(v, shift));
-                }
+                NeonSetLane(out, esize, dst_off + i, val);
             }
-            if (!q) out.u64[1] = 0ULL;
+            if (!is_vec_hi) out.u64[1] = 0ULL;
             state_.v[rd] = out;
             return true;
         }
-        if (opcode == 0x14u && esize <= 2u) {
-            // SSHLL / SSHLL2 (u=0, alias SXTL/SXTL2 when shift==0) & USHLL / USHLL2 (u=1, alias UXTL/UXTL2)
-            const uint32_t shift = imm7 - (8u << esize);
+        // Widening left-shift: SSHLL(u=0,0x14) / USHLL(u=1,0x14)
+        if (is_vec_shift_imm && opcode == 0x14u && esize <= 2u) {
+            const uint32_t shift = imm7 - elem_bits;
             const bool is_unsigned = (u == 1u);
+            const uint32_t src_off = q ? (8u >> esize) : 0u;
+            const uint32_t n = 8u >> esize;
             NeonReg out{};
-            if (esize == 0u) {
-                const uint32_t src_off = q ? 8u : 0u;
-                for (uint32_t i = 0; i < 8u; ++i) {
-                    uint16_t ext = is_unsigned
-                        ? static_cast<uint16_t>(src_v.u8[src_off + i])
-                        : static_cast<uint16_t>(static_cast<int16_t>(src_v.i8[src_off + i]));
-                    out.u16[i] = static_cast<uint16_t>(ext << shift);
-                }
-            } else if (esize == 1u) {
-                const uint32_t src_off = q ? 4u : 0u;
-                for (uint32_t i = 0; i < 4u; ++i) {
-                    uint32_t ext = is_unsigned
-                        ? static_cast<uint32_t>(src_v.u16[src_off + i])
-                        : static_cast<uint32_t>(static_cast<int32_t>(src_v.i16[src_off + i]));
-                    out.u32[i] = ext << shift;
-                }
-            } else {
-                const uint32_t src_off = q ? 2u : 0u;
-                for (uint32_t i = 0; i < 2u; ++i) {
-                    uint64_t ext = is_unsigned
-                        ? static_cast<uint64_t>(src_v.u32[src_off + i])
-                        : static_cast<uint64_t>(static_cast<int64_t>(src_v.i32[src_off + i]));
-                    out.u64[i] = ext << shift;
+            for (uint32_t i = 0; i < n; ++i) {
+                uint64_t ext = is_unsigned
+                    ? NeonGetLane(src_v, esize, src_off + i)
+                    : static_cast<uint64_t>(NeonGetLaneSigned(src_v, esize, src_off + i));
+                NeonSetLane(out, esize + 1u, i, ext << shift);
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+        // Fixed-point conversions: SCVTF(u=0,0x1C), UCVTF(u=1,0x1C), FCVTZS(u=0,0x1F), FCVTZU(u=1,0x1F)
+        if ((opcode == 0x1Cu || opcode == 0x1Fu) && (esize == 2u || esize == 3u)) {
+            const int fbits = static_cast<int>((16u << esize) - imm7);
+            NeonReg out{};
+            for (uint32_t i = 0; i < count; ++i) {
+                if (opcode == 0x1Cu) {
+                    double dv = (u == 1u)
+                        ? static_cast<double>(NeonGetLane(src_v, esize, i))
+                        : static_cast<double>(NeonGetLaneSigned(src_v, esize, i));
+                    double scaled = std::ldexp(dv, -fbits);
+                    if (esize == 2u) out.f32[i] = static_cast<float>(scaled);
+                    else out.f64[i] = scaled;
+                } else {
+                    double fv = (esize == 2u) ? static_cast<double>(src_v.f32[i]) : src_v.f64[i];
+                    double scaled = std::trunc(std::ldexp(fv, fbits));
+                    if (esize == 2u) {
+                        out.u32[i] = (u == 1u) ? ClampToUint32(scaled) : static_cast<uint32_t>(ClampToInt32(scaled));
+                    } else {
+                        out.u64[i] = (u == 1u) ? ClampToUint64(scaled) : ClampToInt64(scaled);
+                    }
                 }
             }
             state_.v[rd] = out;
             return true;
         }
+        // Core element-wise shift-by-imm:
+        //   0x00: SSHR/USHR, 0x02: SSRA/USRA, 0x04: SRSHR/URSHR, 0x06: SRSRA/URSRA,
+        //   0x08(u=1): SRI, 0x0A: SHL/SLI, 0x0C(u=1): SQSHLU, 0x0E: SQSHL/UQSHL
         if (opcode == 0x00u || opcode == 0x02u || opcode == 0x04u || opcode == 0x06u ||
-            (u == 1u && opcode == 0x08u) || opcode == 0x0Au) {
-            const bool is_left = (opcode == 0x0Au);
-            const uint32_t shift = is_left ? (imm7 - (8u << esize)) : ((16u << esize) - imm7);
-            const bool is_signed = !is_left && (u == 0u);
+            (u == 1u && opcode == 0x08u) || opcode == 0x0Au ||
+            (u == 1u && opcode == 0x0Cu) || opcode == 0x0Eu) {
+            const bool is_left = (opcode == 0x0Au || opcode == 0x0Cu || opcode == 0x0Eu);
+            const uint32_t shift = is_left ? (imm7 - elem_bits) : ((16u << esize) - imm7);
             const bool is_rounding = (opcode == 0x04u || opcode == 0x06u);
             const bool is_accum = (opcode == 0x02u || opcode == 0x06u);
-            const bool insert_right = (u == 1u && opcode == 0x08u); // SRI
-            const bool insert_left = is_left && (u == 1u);         // SLI
+            const bool insert_right = (u == 1u && opcode == 0x08u);
+            const bool insert_left = (opcode == 0x0Au && u == 1u);
             NeonReg out = (insert_left || insert_right || is_accum) ? state_.v[rd] : NeonReg{};
-            if (!q && (insert_left || insert_right || is_accum)) out.u64[1] = 0ULL;
-            if (esize == 0u) {
-                const uint8_t sri_keep = (shift >= 8u) ? 0xFFu : static_cast<uint8_t>(0xFFu ^ (0xFFu >> shift));
-                const uint8_t sli_mask = insert_left ? static_cast<uint8_t>((1u << shift) - 1u) : 0u;
-                for (uint32_t i = 0; i < lanes_bytes; ++i) {
-                    if (is_left) {
-                        uint8_t v = static_cast<uint8_t>(src_v.u8[i] << shift);
-                        out.u8[i] = insert_left ? static_cast<uint8_t>((out.u8[i] & sli_mask) | v) : v;
-                    } else if (insert_right) {
-                        uint8_t v = static_cast<uint8_t>(Lshr64(src_v.u8[i], shift));
-                        out.u8[i] = static_cast<uint8_t>((out.u8[i] & sri_keep) | (v & ~sri_keep));
-                    } else if (is_signed) {
-                        int64_t r = is_rounding ? AshrRound64(src_v.i8[i], shift) : Ashr64(src_v.i8[i], shift);
-                        out.i8[i] = is_accum ? static_cast<int8_t>(out.i8[i] + r) : static_cast<int8_t>(r);
-                    } else {
-                        uint64_t r = is_rounding ? LshrRound64(src_v.u8[i], shift) : Lshr64(src_v.u8[i], shift);
-                        out.u8[i] = is_accum ? static_cast<uint8_t>(out.u8[i] + r) : static_cast<uint8_t>(r);
+            if ((is_sca_shift_imm || !q) && (insert_left || insert_right || is_accum)) {
+                out.u64[1] = 0ULL;
+            }
+            const uint64_t lane_mask = (elem_bits == 64u) ? ~0ULL : ((1ULL << elem_bits) - 1ULL);
+            const uint64_t sri_keep = (shift >= elem_bits) ? lane_mask : (lane_mask ^ (lane_mask >> shift));
+            const uint64_t sli_mask = (shift == 0u) ? 0ULL : ((shift >= elem_bits) ? lane_mask : ((1ULL << shift) - 1ULL));
+
+            for (uint32_t i = 0; i < count; ++i) {
+                uint64_t res = 0;
+                if (opcode == 0x0Cu || opcode == 0x0Eu) {
+                    if (opcode == 0x0Cu) { // SQSHLU
+                        __int128 sv = static_cast<__int128>(NeonGetLaneSigned(src_v, esize, i));
+                        res = SatUnsigned128(sv << shift, elem_bits);
+                    } else if (u == 0u) { // SQSHL
+                        __int128 sv = static_cast<__int128>(NeonGetLaneSigned(src_v, esize, i));
+                        res = static_cast<uint64_t>(SatSigned128(sv << shift, elem_bits));
+                    } else { // UQSHL
+                        unsigned __int128 uv = static_cast<unsigned __int128>(NeonGetLane(src_v, esize, i)) << shift;
+                        const unsigned __int128 max_v = (elem_bits == 64u) ? UINT64_MAX : lane_mask;
+                        res = (uv > max_v) ? static_cast<uint64_t>(max_v) : static_cast<uint64_t>(uv);
                     }
+                } else if (opcode == 0x0Au) { // SHL / SLI
+                    uint64_t v = (shift >= elem_bits) ? 0ULL : ((NeonGetLane(src_v, esize, i) << shift) & lane_mask);
+                    res = insert_left ? ((NeonGetLane(out, esize, i) & sli_mask) | v) : v;
+                } else if (insert_right) { // SRI
+                    uint64_t v = Lshr64(NeonGetLane(src_v, esize, i), shift);
+                    res = (NeonGetLane(out, esize, i) & sri_keep) | (v & ~sri_keep);
+                } else if (u == 0u) { // Signed right shift (SSHR / SSRA / SRSHR / SRSRA)
+                    int64_t sv = NeonGetLaneSigned(src_v, esize, i);
+                    int64_t r = is_rounding ? AshrRound64(sv, shift) : Ashr64(sv, shift);
+                    res = is_accum ? static_cast<uint64_t>(NeonGetLaneSigned(out, esize, i) + r)
+                                   : static_cast<uint64_t>(r);
+                } else { // Unsigned right shift (USHR / USRA / URSHR / URSRA)
+                    uint64_t uv = NeonGetLane(src_v, esize, i);
+                    uint64_t r = is_rounding ? LshrRound64(uv, shift) : Lshr64(uv, shift);
+                    res = is_accum ? (NeonGetLane(out, esize, i) + r) : r;
                 }
-            } else if (esize == 1u) {
-                const uint16_t sri_keep = (shift >= 16u) ? 0xFFFFu : static_cast<uint16_t>(0xFFFFu ^ (0xFFFFu >> shift));
-                const uint16_t sli_mask = insert_left ? static_cast<uint16_t>((1u << shift) - 1u) : 0u;
-                for (uint32_t i = 0; i < lanes_bytes / 2u; ++i) {
-                    if (is_left) {
-                        uint16_t v = static_cast<uint16_t>(src_v.u16[i] << shift);
-                        out.u16[i] = insert_left ? static_cast<uint16_t>((out.u16[i] & sli_mask) | v) : v;
-                    } else if (insert_right) {
-                        uint16_t v = static_cast<uint16_t>(Lshr64(src_v.u16[i], shift));
-                        out.u16[i] = static_cast<uint16_t>((out.u16[i] & sri_keep) | (v & ~sri_keep));
-                    } else if (is_signed) {
-                        int64_t r = is_rounding ? AshrRound64(src_v.i16[i], shift) : Ashr64(src_v.i16[i], shift);
-                        out.i16[i] = is_accum ? static_cast<int16_t>(out.i16[i] + r) : static_cast<int16_t>(r);
-                    } else {
-                        uint64_t r = is_rounding ? LshrRound64(src_v.u16[i], shift) : Lshr64(src_v.u16[i], shift);
-                        out.u16[i] = is_accum ? static_cast<uint16_t>(out.u16[i] + r) : static_cast<uint16_t>(r);
-                    }
-                }
-            } else if (esize == 2u) {
-                const uint32_t sri_keep = (shift >= 32u) ? 0xFFFFFFFFu : (0xFFFFFFFFu ^ (0xFFFFFFFFu >> shift));
-                const uint32_t sli_mask = insert_left ? ((1u << shift) - 1u) : 0u;
-                for (uint32_t i = 0; i < lanes_bytes / 4u; ++i) {
-                    if (is_left) {
-                        uint32_t v = src_v.u32[i] << shift;
-                        out.u32[i] = insert_left ? ((out.u32[i] & sli_mask) | v) : v;
-                    } else if (insert_right) {
-                        uint32_t v = static_cast<uint32_t>(Lshr64(src_v.u32[i], shift));
-                        out.u32[i] = (out.u32[i] & sri_keep) | (v & ~sri_keep);
-                    } else if (is_signed) {
-                        int64_t r = is_rounding ? AshrRound64(src_v.i32[i], shift) : Ashr64(src_v.i32[i], shift);
-                        out.i32[i] = is_accum ? static_cast<int32_t>(out.i32[i] + r) : static_cast<int32_t>(r);
-                    } else {
-                        uint64_t r = is_rounding ? LshrRound64(src_v.u32[i], shift) : Lshr64(src_v.u32[i], shift);
-                        out.u32[i] = is_accum ? static_cast<uint32_t>(out.u32[i] + r) : static_cast<uint32_t>(r);
+                NeonSetLane(out, esize, i, res);
+            }
+            if (is_sca_shift_imm) {
+                for (uint32_t b = (1u << esize); b < 16u; ++b) out.u8[b] = 0u;
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+    }
+
+    // 1d/1e. AdvSIMD Vector & Scalar Indexed by Element:
+    //   Vector: 0 Q U 01111 size L M Rm(4) opcode(4) H 0 Rn Rd
+    //   Scalar: 0 1 U 11111 size L M Rm(4) opcode(4) H 0 Rn Rd
+    const bool is_vec_elem = ((insn & 0x9F000400u) == 0x0F000000u);
+    const bool is_sca_elem = ((insn & 0xDF000400u) == 0x5F000000u);
+    if (is_vec_elem || is_sca_elem) {
+        const uint32_t u = (insn >> 29) & 1u;
+        const uint32_t l = (insn >> 21) & 1u;
+        const uint32_t m = (insn >> 20) & 1u;
+        const uint32_t h = (insn >> 11) & 1u;
+        const uint32_t opcode = (insn >> 12) & 0xFu;
+        const NeonReg a = state_.v[rn];
+
+        // Floating-point indexed ops: FMLA(u=0,1), FMLS(u=0,5), FMUL(u=0,9), FMULX(u=1,9)
+        if ((opcode == 0x1u || opcode == 0x5u || opcode == 0x9u) && (size & 2u) != 0u) {
+            const bool is_f64 = (size & 1u) != 0u;
+            const uint32_t rm_reg = (insn >> 16) & 31u;
+            const uint32_t idx = is_f64 ? h : ((h << 1) | l);
+            const NeonReg b = state_.v[rm_reg];
+            if (is_vec_elem && is_f64 && !q) {
+                RaiseException(ec::kUnknown, 0, 0, false, state_.pc);
+                return false;
+            }
+            NeonReg out = (opcode == 0x1u || opcode == 0x5u) ? state_.v[rd] : NeonReg{};
+            if (is_sca_elem || !q) out.u64[1] = 0ULL;
+            const uint32_t cnt = is_sca_elem ? 1u : (is_f64 ? 2u : (q ? 4u : 2u));
+            if (is_f64) {
+                const double bv = b.f64[idx];
+                if (is_sca_elem) out.u64[1] = 0ULL;
+                for (uint32_t i = 0; i < cnt; ++i) {
+                    const double av = a.f64[i];
+                    if (opcode == 0x1u && u == 0u) out.f64[i] += av * bv;
+                    else if (opcode == 0x5u && u == 0u) out.f64[i] -= av * bv;
+                    else if (opcode == 0x9u && u == 0u) out.f64[i] = av * bv;
+                    else if (opcode == 0x9u && u == 1u) {
+                        out.f64[i] = ((av == 0.0 && std::isinf(bv)) || (std::isinf(av) && bv == 0.0)) ? 2.0 : (av * bv);
                     }
                 }
             } else {
-                const uint64_t sri_keep = (shift >= 64u) ? ~0ULL : (~0ULL ^ (~0ULL >> shift));
-                const uint64_t sli_mask = insert_left ? ((shift == 64u) ? ~0ULL : ((1ULL << shift) - 1ULL)) : 0ULL;
-                for (uint32_t i = 0; i < lanes_bytes / 8u; ++i) {
-                    if (is_left) {
-                        uint64_t v = (shift >= 64u) ? 0ULL : (src_v.u64[i] << shift);
-                        out.u64[i] = insert_left ? ((out.u64[i] & sli_mask) | v) : v;
-                    } else if (insert_right) {
-                        uint64_t v = Lshr64(src_v.u64[i], shift);
-                        out.u64[i] = (out.u64[i] & sri_keep) | (v & ~sri_keep);
-                    } else if (is_signed) {
-                        int64_t r = is_rounding ? AshrRound64(src_v.i64[i], shift) : Ashr64(src_v.i64[i], shift);
-                        out.i64[i] = is_accum ? (out.i64[i] + r) : r;
-                    } else {
-                        uint64_t r = is_rounding ? LshrRound64(src_v.u64[i], shift) : Lshr64(src_v.u64[i], shift);
-                        out.u64[i] = is_accum ? (out.u64[i] + r) : r;
+                const float bv = b.f32[idx];
+                if (is_sca_elem) { out.u32[1] = 0u; out.u64[1] = 0ULL; }
+                for (uint32_t i = 0; i < cnt; ++i) {
+                    const float av = a.f32[i];
+                    if (opcode == 0x1u && u == 0u) out.f32[i] += av * bv;
+                    else if (opcode == 0x5u && u == 0u) out.f32[i] -= av * bv;
+                    else if (opcode == 0x9u && u == 0u) out.f32[i] = av * bv;
+                    else if (opcode == 0x9u && u == 1u) {
+                        out.f32[i] = ((av == 0.0f && std::isinf(bv)) || (std::isinf(av) && bv == 0.0f)) ? 2.0f : (av * bv);
                     }
                 }
             }
             state_.v[rd] = out;
             return true;
+        }
+
+        // Integer indexed ops (size == 1 -> H[0..7], size == 2 -> S[0..3])
+        if (size == 1u || size == 2u) {
+            const uint32_t rm_reg = (size == 1u) ? ((insn >> 16) & 15u) : ((insn >> 16) & 31u);
+            const uint32_t idx = (size == 1u) ? ((h << 2) | (l << 1) | m) : ((h << 1) | l);
+            const NeonReg b = state_.v[rm_reg];
+            const bool is_unsigned = (u == 1u);
+            const uint32_t esize_bits = 8u << size;
+
+            // Widening indexed: SMULL/UMULL(0xA), SMLAL/UMLAL(0x2), SMLSL/UMLSL(0x6), SQDMULL(u=0,0xB)
+            if (opcode == 0x2u || opcode == 0x6u || opcode == 0xAu || (u == 0u && opcode == 0xBu)) {
+                const bool is_accum = (opcode == 0x2u || opcode == 0x6u);
+                const bool is_sub = (opcode == 0x6u);
+                const bool is_qdm = (opcode == 0xBu);
+                NeonReg out = is_accum ? state_.v[rd] : NeonReg{};
+                const uint32_t cnt = is_sca_elem ? 1u : (8u >> size);
+                const uint32_t off = (is_vec_elem && q) ? cnt : 0u;
+                for (uint32_t i = 0; i < cnt; ++i) {
+                    if (is_unsigned && !is_qdm) {
+                        uint64_t av = NeonGetLane(a, size, off + i);
+                        uint64_t bv = NeonGetLane(b, size, idx);
+                        uint64_t prod = av * bv;
+                        uint64_t acc = is_accum ? NeonGetLane(out, size + 1u, i) : 0ULL;
+                        NeonSetLane(out, size + 1u, i, is_accum ? (is_sub ? (acc - prod) : (acc + prod)) : prod);
+                    } else {
+                        int64_t av = NeonGetLaneSigned(a, size, off + i);
+                        int64_t bv = NeonGetLaneSigned(b, size, idx);
+                        __int128 prod = static_cast<__int128>(av) * static_cast<__int128>(bv);
+                        if (is_qdm) {
+                            NeonSetLane(out, size + 1u, i, static_cast<uint64_t>(SatSigned128(prod * 2, esize_bits * 2u)));
+                        } else {
+                            int64_t p = static_cast<int64_t>(prod);
+                            int64_t acc = is_accum ? NeonGetLaneSigned(out, size + 1u, i) : 0LL;
+                            NeonSetLane(out, size + 1u, i, static_cast<uint64_t>(is_accum ? (is_sub ? (acc - p) : (acc + p)) : p));
+                        }
+                    }
+                }
+                if (is_sca_elem && size == 1u) { out.u32[1] = 0u; out.u64[1] = 0ULL; }
+                state_.v[rd] = out;
+                return true;
+            }
+            // Same-width indexed: MUL(u=0,0x8), MLA(u=1,0x0), MLS(u=1,0x4), SQDMULH(u=0,0xC), SQRDMULH(u=0,0xD)
+            if ((is_vec_elem && ((u == 0u && opcode == 0x8u) || (u == 1u && (opcode == 0x0u || opcode == 0x4u)))) ||
+                (u == 0u && (opcode == 0xCu || opcode == 0xDu))) {
+                const bool is_mla = (opcode == 0x0u);
+                const bool is_mls = (opcode == 0x4u);
+                const bool is_sqdm = (opcode == 0xCu || opcode == 0xDu);
+                const bool rounding = (opcode == 0xDu);
+                NeonReg out = (is_mla || is_mls) ? state_.v[rd] : NeonReg{};
+                if (!q && (is_mla || is_mls)) out.u64[1] = 0ULL;
+                const uint32_t cnt = is_sca_elem ? 1u : (lanes_bytes >> size);
+                for (uint32_t i = 0; i < cnt; ++i) {
+                    if (is_sqdm) {
+                        int64_t av = NeonGetLaneSigned(a, size, i);
+                        int64_t bv = NeonGetLaneSigned(b, size, idx);
+                        __int128 prod = static_cast<__int128>(av) * static_cast<__int128>(bv) * 2;
+                        if (rounding) prod += (static_cast<__int128>(1) << (esize_bits - 1u));
+                        NeonSetLane(out, size, i, static_cast<uint64_t>(SatSigned128(prod >> esize_bits, esize_bits)));
+                    } else {
+                        uint64_t prod = NeonGetLane(a, size, i) * NeonGetLane(b, size, idx);
+                        uint64_t cur = NeonGetLane(out, size, i);
+                        NeonSetLane(out, size, i, is_mla ? (cur + prod) : (is_mls ? (cur - prod) : prod));
+                    }
+                }
+                if (is_sca_elem) {
+                    for (uint32_t b_i = (1u << size); b_i < 16u; ++b_i) out.u8[b_i] = 0u;
+                }
+                state_.v[rd] = out;
+                return true;
+            }
         }
     }
 
@@ -707,22 +917,28 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
         }
     }
 
-    // 3. AdvSIMD Three Same: 0 Q U 01110 size 1 Rm opcode 1 Rn Rd
-    if ((insn & 0x9F200400u) == 0x0E200400u) {
+    // 3/3a. AdvSIMD Vector & Scalar Three Same:
+    //   Vector: 0 Q U 01110 size 1 Rm opcode 1 Rn Rd
+    //   Scalar: 0 1 U 11110 size 1 Rm opcode 1 Rn Rd
+    const bool is_vec_three_same = ((insn & 0x9F200400u) == 0x0E200400u);
+    const bool is_sca_three_same = ((insn & 0xDF200400u) == 0x5E200400u);
+    if (is_vec_three_same || is_sca_three_same) {
         const uint32_t u = (insn >> 29) & 1u;
         const uint32_t opcode = (insn >> 11) & 0x1Fu;
         NeonReg out{};
-        const NeonReg& a = state_.v[rn];
-        const NeonReg& b = state_.v[rm];
+        const NeonReg a = state_.v[rn];
+        const NeonReg b = state_.v[rm];
+        const uint32_t count = is_sca_three_same ? 1u : (lanes_bytes >> size);
+        const uint32_t elem_bits = 8u << size;
 
-        // Bitwise logical ops (opcode == 0x03: AND/BIC/ORR/ORN/EOR/BSL/BIT/BIF encoded via size & u)
-        if (opcode == 0x03u) {
+        // Bitwise logical ops (vector only, opcode == 0x03)
+        if (is_vec_three_same && opcode == 0x03u) {
             for (uint32_t i = 0; i < (q ? 2u : 1u); ++i) {
                 uint64_t va = a.u64[i], vb = b.u64[i], vc = state_.v[rd].u64[i];
                 if (u == 0u) {
                     if (size == 0u) out.u64[i] = va & vb;          // AND
                     else if (size == 1u) out.u64[i] = va & ~vb;    // BIC
-                    else if (size == 2u) out.u64[i] = va | vb;     // ORR (MOV Vd, Vn when rn==rm)
+                    else if (size == 2u) out.u64[i] = va | vb;     // ORR
                     else out.u64[i] = va | ~vb;                    // ORN
                 } else {
                     if (size == 0u) out.u64[i] = va ^ vb;          // EOR
@@ -735,190 +951,283 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
             return true;
         }
 
-        // Integer ADD (u=0, opcode=0x10) / SUB (u=1, opcode=0x10) / ADDP (u=0, opcode=0x17)
-        if (opcode == 0x10u || (u == 0u && opcode == 0x17u)) {
+        // Integer ADD (u=0, 0x10) / SUB (u=1, 0x10) / ADDP (u=0, 0x17)
+        if (opcode == 0x10u || (is_vec_three_same && u == 0u && opcode == 0x17u)) {
             const bool is_sub = (u == 1u && opcode == 0x10u);
-            const bool is_addp = (opcode == 0x17u);
-            if (is_addp) {
-                if (size == 0u) {
-                    const uint32_t half = lanes_bytes / 2u;
-                    for (uint32_t i = 0; i < half; ++i) {
-                        out.u8[i] = static_cast<uint8_t>(a.u8[2u * i] + a.u8[2u * i + 1u]);
-                        out.u8[half + i] = static_cast<uint8_t>(b.u8[2u * i] + b.u8[2u * i + 1u]);
-                    }
-                } else if (size == 1u) {
-                    const uint32_t half = lanes_bytes / 4u;
-                    for (uint32_t i = 0; i < half; ++i) {
-                        out.u16[i] = static_cast<uint16_t>(a.u16[2u * i] + a.u16[2u * i + 1u]);
-                        out.u16[half + i] = static_cast<uint16_t>(b.u16[2u * i] + b.u16[2u * i + 1u]);
-                    }
-                } else if (size == 2u) {
-                    const uint32_t half = lanes_bytes / 8u;
-                    for (uint32_t i = 0; i < half; ++i) {
-                        out.u32[i] = a.u32[2u * i] + a.u32[2u * i + 1u];
-                        out.u32[half + i] = b.u32[2u * i] + b.u32[2u * i + 1u];
-                    }
-                } else if (q) {
-                    out.u64[0] = a.u64[0] + a.u64[1];
-                    out.u64[1] = b.u64[0] + b.u64[1];
+            if (opcode == 0x17u) {
+                const uint32_t half = count / 2u;
+                for (uint32_t i = 0; i < half; ++i) {
+                    NeonSetLane(out, size, i, NeonGetLane(a, size, 2u * i) + NeonGetLane(a, size, 2u * i + 1u));
+                    NeonSetLane(out, size, half + i, NeonGetLane(b, size, 2u * i) + NeonGetLane(b, size, 2u * i + 1u));
                 }
-            } else if (size == 0u) {
-                for (uint32_t i = 0; i < lanes_bytes; ++i) out.u8[i] = is_sub ? (a.u8[i] - b.u8[i]) : (a.u8[i] + b.u8[i]);
-            } else if (size == 1u) {
-                for (uint32_t i = 0; i < lanes_bytes / 2u; ++i) out.u16[i] = is_sub ? (a.u16[i] - b.u16[i]) : (a.u16[i] + b.u16[i]);
-            } else if (size == 2u) {
-                for (uint32_t i = 0; i < lanes_bytes / 4u; ++i) out.u32[i] = is_sub ? (a.u32[i] - b.u32[i]) : (a.u32[i] + b.u32[i]);
             } else {
-                for (uint32_t i = 0; i < lanes_bytes / 8u; ++i) out.u64[i] = is_sub ? (a.u64[i] - b.u64[i]) : (a.u64[i] + b.u64[i]);
+                for (uint32_t i = 0; i < count; ++i) {
+                    uint64_t va = NeonGetLane(a, size, i), vb = NeonGetLane(b, size, i);
+                    NeonSetLane(out, size, i, is_sub ? (va - vb) : (va + vb));
+                }
             }
             state_.v[rd] = out;
             return true;
         }
 
-        // Vector Comparisons: CMGT/CMHI (0x06), CMGE/CMHS (0x07), CMTST/CMEQ (0x11)
+        // Saturating & Halving ADD/SUB: SHADD(0x00), SQADD(0x01), SRHADD(0x02), SHSUB(0x04), SQSUB(0x05)
+        if (opcode == 0x00u || opcode == 0x01u || opcode == 0x02u || opcode == 0x04u || opcode == 0x05u) {
+            const bool is_sat = (opcode == 0x01u || opcode == 0x05u);
+            const bool is_sub = (opcode == 0x04u || opcode == 0x05u);
+            const bool is_round = (opcode == 0x02u);
+            const bool is_unsigned = (u == 1u);
+            for (uint32_t i = 0; i < count; ++i) {
+                __int128 va = is_unsigned ? static_cast<__int128>(NeonGetLane(a, size, i))
+                                          : static_cast<__int128>(NeonGetLaneSigned(a, size, i));
+                __int128 vb = is_unsigned ? static_cast<__int128>(NeonGetLane(b, size, i))
+                                          : static_cast<__int128>(NeonGetLaneSigned(b, size, i));
+                __int128 sum = is_sub ? (va - vb) : (va + vb);
+                if (is_sat) {
+                    NeonSetLane(out, size, i, is_unsigned
+                        ? SatUnsigned128(sum, elem_bits)
+                        : static_cast<uint64_t>(SatSigned128(sum, elem_bits)));
+                } else {
+                    if (is_round) sum += 1;
+                    NeonSetLane(out, size, i, static_cast<uint64_t>(sum >> 1));
+                }
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+
+        // Integer Variable Shifts: SSHL/USHL(0x08), SQSHL/UQSHL(0x09), SRSHL/URSHL(0x0A), SQRSHL/UQRSHL(0x0B)
+        if (opcode == 0x08u || opcode == 0x09u || opcode == 0x0Au || opcode == 0x0Bu) {
+            const bool is_sat = (opcode == 0x09u || opcode == 0x0Bu);
+            const bool is_round = (opcode == 0x0Au || opcode == 0x0Bu);
+            const bool is_unsigned = (u == 1u);
+            for (uint32_t i = 0; i < count; ++i) {
+                int32_t sh = static_cast<int8_t>(NeonGetLane(b, size, i) & 0xFFu);
+                if (is_unsigned) {
+                    uint64_t va = NeonGetLane(a, size, i);
+                    uint64_t res = 0;
+                    if (sh >= 0) {
+                        uint32_t ls = static_cast<uint32_t>(sh);
+                        if (is_sat) {
+                            res = (ls >= elem_bits) ? (va ? ((elem_bits == 64u) ? ~0ULL : ((1ULL << elem_bits) - 1ULL)) : 0ULL)
+                                                    : SatUnsigned128(static_cast<__int128>(static_cast<unsigned __int128>(va) << ls), elem_bits);
+                        } else {
+                            res = (ls >= elem_bits) ? 0ULL : (va << ls);
+                        }
+                    } else {
+                        uint32_t rs = static_cast<uint32_t>(-sh);
+                        res = is_round ? LshrRound64(va, rs) : Lshr64(va, rs);
+                    }
+                    NeonSetLane(out, size, i, res);
+                } else {
+                    int64_t va = NeonGetLaneSigned(a, size, i);
+                    int64_t res = 0;
+                    if (sh >= 0) {
+                        uint32_t ls = static_cast<uint32_t>(sh);
+                        if (is_sat) {
+                            res = (ls >= elem_bits)
+                                ? ((va > 0) ? SatSigned128((static_cast<__int128>(1) << 120), elem_bits)
+                                            : ((va < 0) ? SatSigned128(-(static_cast<__int128>(1) << 120), elem_bits) : 0LL))
+                                : SatSigned128(static_cast<__int128>(va) << ls, elem_bits);
+                        } else {
+                            res = (ls >= elem_bits) ? 0LL : static_cast<int64_t>(static_cast<uint64_t>(va) << ls);
+                        }
+                    } else {
+                        uint32_t rs = static_cast<uint32_t>(-sh);
+                        res = is_round ? AshrRound64(va, rs) : Ashr64(va, rs);
+                    }
+                    NeonSetLane(out, size, i, static_cast<uint64_t>(res));
+                }
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+
+        // Vector/Scalar Integer Comparisons: CMGT/CMHI (0x06), CMGE/CMHS (0x07), CMTST/CMEQ (0x11)
         if (opcode == 0x06u || opcode == 0x07u || opcode == 0x11u) {
-            auto cmp_u = [&](uint64_t va, uint64_t vb) -> bool {
-                if (opcode == 0x11u) return (u == 1u) ? (va == vb) : ((va & vb) != 0ULL);
-                if (opcode == 0x06u) return va > vb; // CMHI
-                return va >= vb;                      // CMHS
-            };
-            auto cmp_s = [&](int64_t va, int64_t vb) -> bool {
-                return (opcode == 0x06u) ? (va > vb) : (va >= vb); // CMGT / CMGE
-            };
             const bool is_signed = (u == 0u && (opcode == 0x06u || opcode == 0x07u));
-            if (size == 0u) {
-                for (uint32_t i = 0; i < lanes_bytes; ++i) {
-                    bool res = is_signed ? cmp_s(a.i8[i], b.i8[i]) : cmp_u(a.u8[i], b.u8[i]);
-                    out.u8[i] = res ? 0xFFu : 0u;
+            for (uint32_t i = 0; i < count; ++i) {
+                bool res = false;
+                if (is_signed) {
+                    int64_t va = NeonGetLaneSigned(a, size, i), vb = NeonGetLaneSigned(b, size, i);
+                    res = (opcode == 0x06u) ? (va > vb) : (va >= vb);
+                } else {
+                    uint64_t va = NeonGetLane(a, size, i), vb = NeonGetLane(b, size, i);
+                    if (opcode == 0x11u) res = (u == 1u) ? (va == vb) : ((va & vb) != 0ULL);
+                    else if (opcode == 0x06u) res = (va > vb);
+                    else res = (va >= vb);
                 }
-            } else if (size == 1u) {
-                for (uint32_t i = 0; i < lanes_bytes / 2u; ++i) {
-                    bool res = is_signed ? cmp_s(a.i16[i], b.i16[i]) : cmp_u(a.u16[i], b.u16[i]);
-                    out.u16[i] = res ? 0xFFFFu : 0u;
-                }
-            } else if (size == 2u) {
-                for (uint32_t i = 0; i < lanes_bytes / 4u; ++i) {
-                    bool res = is_signed ? cmp_s(a.i32[i], b.i32[i]) : cmp_u(a.u32[i], b.u32[i]);
-                    out.u32[i] = res ? 0xFFFFFFFFu : 0u;
-                }
-            } else {
-                for (uint32_t i = 0; i < lanes_bytes / 8u; ++i) {
-                    bool res = is_signed ? cmp_s(a.i64[i], b.i64[i]) : cmp_u(a.u64[i], b.u64[i]);
-                    out.u64[i] = res ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
-                }
+                NeonSetLane(out, size, i, res ? ~0ULL : 0ULL);
             }
             state_.v[rd] = out;
             return true;
         }
 
         // Vector SMAX/UMAX (0x0C), SMIN/UMIN (0x0D), SMAXP/UMAXP (0x14), SMINP/UMINP (0x15)
-        if (opcode == 0x0Cu || opcode == 0x0Du || opcode == 0x14u || opcode == 0x15u) {
+        if (is_vec_three_same && (opcode == 0x0Cu || opcode == 0x0Du || opcode == 0x14u || opcode == 0x15u) && size <= 2u) {
             const bool is_pairwise = (opcode == 0x14u || opcode == 0x15u);
             const bool is_min = (opcode == 0x0Du || opcode == 0x15u);
             const bool is_unsigned = (u == 1u);
-            auto pick_i = [&](int64_t x, int64_t y) -> int64_t {
-                return is_min ? std::min(x, y) : std::max(x, y);
-            };
-            auto pick_u = [&](uint64_t x, uint64_t y) -> uint64_t {
-                return is_min ? std::min(x, y) : std::max(x, y);
+            auto pick = [&](uint32_t ia, uint32_t ib, const NeonReg& ra, const NeonReg& rb) -> uint64_t {
+                if (is_unsigned) {
+                    uint64_t x = NeonGetLane(ra, size, ia), y = NeonGetLane(rb, size, ib);
+                    return is_min ? std::min(x, y) : std::max(x, y);
+                }
+                int64_t x = NeonGetLaneSigned(ra, size, ia), y = NeonGetLaneSigned(rb, size, ib);
+                return static_cast<uint64_t>(is_min ? std::min(x, y) : std::max(x, y));
             };
             if (!is_pairwise) {
-                if (size == 0u) {
-                    for (uint32_t i = 0; i < lanes_bytes; ++i) {
-                        if (is_unsigned) out.u8[i] = static_cast<uint8_t>(pick_u(a.u8[i], b.u8[i]));
-                        else out.i8[i] = static_cast<int8_t>(pick_i(a.i8[i], b.i8[i]));
-                    }
-                } else if (size == 1u) {
-                    for (uint32_t i = 0; i < lanes_bytes / 2u; ++i) {
-                        if (is_unsigned) out.u16[i] = static_cast<uint16_t>(pick_u(a.u16[i], b.u16[i]));
-                        else out.i16[i] = static_cast<int16_t>(pick_i(a.i16[i], b.i16[i]));
-                    }
-                } else if (size == 2u) {
-                    for (uint32_t i = 0; i < lanes_bytes / 4u; ++i) {
-                        if (is_unsigned) out.u32[i] = static_cast<uint32_t>(pick_u(a.u32[i], b.u32[i]));
-                        else out.i32[i] = static_cast<int32_t>(pick_i(a.i32[i], b.i32[i]));
+                for (uint32_t i = 0; i < count; ++i) NeonSetLane(out, size, i, pick(i, i, a, b));
+            } else {
+                const uint32_t half = count / 2u;
+                for (uint32_t i = 0; i < half; ++i) {
+                    NeonSetLane(out, size, i, pick(2u * i, 2u * i + 1u, a, a));
+                    NeonSetLane(out, size, half + i, pick(2u * i, 2u * i + 1u, b, b));
+                }
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+
+        // SABD/UABD (0x0E) and SABA/UABA (0x0F)
+        if (is_vec_three_same && (opcode == 0x0Eu || opcode == 0x0Fu) && size <= 2u) {
+            const bool is_accum = (opcode == 0x0Fu);
+            const bool is_unsigned = (u == 1u);
+            out = is_accum ? state_.v[rd] : NeonReg{};
+            if (!q && is_accum) out.u64[1] = 0ULL;
+            for (uint32_t i = 0; i < count; ++i) {
+                uint64_t diff = 0;
+                if (is_unsigned) {
+                    uint64_t va = NeonGetLane(a, size, i), vb = NeonGetLane(b, size, i);
+                    diff = (va >= vb) ? (va - vb) : (vb - va);
+                } else {
+                    int64_t va = NeonGetLaneSigned(a, size, i), vb = NeonGetLaneSigned(b, size, i);
+                    diff = static_cast<uint64_t>((va >= vb) ? (va - vb) : (vb - va));
+                }
+                NeonSetLane(out, size, i, is_accum ? (NeonGetLane(out, size, i) + diff) : diff);
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+
+        // Integer MUL (u=0, opcode=0x13), PMUL (u=1, size=0, opcode=0x13), MLA/MLS (opcode=0x12),
+        // SQDMULH/SQRDMULH (opcode=0x16)
+        if (opcode == 0x13u || (is_vec_three_same && opcode == 0x12u) || opcode == 0x16u) {
+            if (opcode == 0x16u && (size == 1u || size == 2u)) {
+                const bool rounding = (u == 1u);
+                for (uint32_t i = 0; i < count; ++i) {
+                    int64_t va = NeonGetLaneSigned(a, size, i), vb = NeonGetLaneSigned(b, size, i);
+                    __int128 prod = static_cast<__int128>(va) * static_cast<__int128>(vb) * 2;
+                    if (rounding) prod += (static_cast<__int128>(1) << (elem_bits - 1u));
+                    NeonSetLane(out, size, i, static_cast<uint64_t>(SatSigned128(prod >> elem_bits, elem_bits)));
+                }
+                state_.v[rd] = out;
+                return true;
+            }
+            if (is_vec_three_same && u == 1u && opcode == 0x13u && size == 0u) {
+                for (uint32_t i = 0; i < lanes_bytes; ++i) {
+                    out.u8[i] = static_cast<uint8_t>(PolyMul8(a.u8[i], b.u8[i]));
+                }
+                state_.v[rd] = out;
+                return true;
+            }
+            if (is_vec_three_same && ((u == 0u && opcode == 0x13u) || opcode == 0x12u) && size <= 2u) {
+                const bool is_mul = (opcode == 0x13u);
+                const bool is_sub = (opcode == 0x12u && u == 1u);
+                const NeonReg acc = state_.v[rd];
+                for (uint32_t i = 0; i < count; ++i) {
+                    uint64_t prod = NeonGetLane(a, size, i) * NeonGetLane(b, size, i);
+                    uint64_t cur = NeonGetLane(acc, size, i);
+                    NeonSetLane(out, size, i, is_mul ? prod : (is_sub ? (cur - prod) : (cur + prod)));
+                }
+                state_.v[rd] = out;
+                return true;
+            }
+        }
+
+        // Floating-point Vector & Scalar Three Same (opcode 0x18..0x1F):
+        //   sz = size & 1u (0=f32, 1=f64), op_hi = (size & 2u) != 0
+        if (opcode >= 0x18u) {
+            const bool is_f64 = (size & 1u) != 0u;
+            const bool op_hi = (size & 2u) != 0u;
+            if (is_vec_three_same && is_f64 && !q) {
+                RaiseException(ec::kUnknown, 0, 0, false, state_.pc);
+                return false;
+            }
+            const uint32_t fcnt = is_sca_three_same ? 1u : (is_f64 ? 2u : (q ? 4u : 2u));
+            const bool is_accum = (u == 0u && opcode == 0x19u);
+            if (is_accum) out = state_.v[rd];
+            const bool is_pairwise = is_vec_three_same && (u == 1u) &&
+                                     (opcode == 0x1Au || opcode == 0x1Eu || opcode == 0x18u);
+
+            auto eval_fp = [&](double av, double bv, double cur, bool& is_cmp, bool& cmp_out) -> double {
+                is_cmp = false;
+                if (opcode == 0x18u) { // FMAXNM / FMINNM
+                    return op_hi ? std::fmin(av, bv) : std::fmax(av, bv);
+                }
+                if (opcode == 0x19u && u == 0u) { // FMLA / FMLS
+                    return op_hi ? (cur - av * bv) : (cur + av * bv);
+                }
+                if (opcode == 0x1Au) { // FADD / FSUB / FADDP
+                    return (u == 0u && op_hi) ? (av - bv) : (av + bv);
+                }
+                if (opcode == 0x1Bu && !op_hi) { // FMUL (u=1) / FMULX (u=0)
+                    if (u == 0u && ((av == 0.0 && std::isinf(bv)) || (std::isinf(av) && bv == 0.0))) return 2.0;
+                    return av * bv;
+                }
+                if (opcode == 0x1Cu) { // FCMEQ / FCMGE / FCMGT
+                    is_cmp = true;
+                    if (u == 0u && !op_hi) cmp_out = (av == bv);
+                    else if (u == 1u && !op_hi) cmp_out = (av >= bv);
+                    else cmp_out = (av > bv);
+                    return 0.0;
+                }
+                if (opcode == 0x1Du && u == 1u) { // FACGE / FACGT
+                    is_cmp = true;
+                    double aa = std::fabs(av), bb = std::fabs(bv);
+                    cmp_out = op_hi ? (aa > bb) : (aa >= bb);
+                    return 0.0;
+                }
+                if (opcode == 0x1Eu) { // FMAX / FMIN / FMAXP / FMINP
+                    if (std::isnan(av) || std::isnan(bv)) return av + bv;
+                    return op_hi ? std::fmin(av, bv) : std::fmax(av, bv);
+                }
+                if (opcode == 0x1Fu) { // FDIV (u=1, !op_hi), FRECPS (u=0, !op_hi), FRSQRTS (u=0, op_hi)
+                    if (u == 1u && !op_hi) return av / bv;
+                    if (u == 0u && !op_hi) return 2.0 - (av * bv);
+                    if (u == 0u && op_hi) return (3.0 - (av * bv)) * 0.5;
+                }
+                return 0.0;
+            };
+
+            if (is_pairwise) {
+                const uint32_t half = fcnt / 2u;
+                for (uint32_t i = 0; i < half; ++i) {
+                    bool dummy1 = false, dummy2 = false;
+                    if (is_f64) {
+                        out.f64[0] = eval_fp(a.f64[0], a.f64[1], 0.0, dummy1, dummy2);
+                        out.f64[1] = eval_fp(b.f64[0], b.f64[1], 0.0, dummy1, dummy2);
+                    } else {
+                        out.f32[i] = static_cast<float>(eval_fp(a.f32[2u * i], a.f32[2u * i + 1u], 0.0, dummy1, dummy2));
+                        out.f32[half + i] = static_cast<float>(eval_fp(b.f32[2u * i], b.f32[2u * i + 1u], 0.0, dummy1, dummy2));
                     }
                 }
             } else {
-                if (size == 0u) {
-                    const uint32_t half = lanes_bytes / 2u;
-                    for (uint32_t i = 0; i < half; ++i) {
-                        if (is_unsigned) {
-                            out.u8[i] = static_cast<uint8_t>(pick_u(a.u8[2u * i], a.u8[2u * i + 1u]));
-                            out.u8[half + i] = static_cast<uint8_t>(pick_u(b.u8[2u * i], b.u8[2u * i + 1u]));
-                        } else {
-                            out.i8[i] = static_cast<int8_t>(pick_i(a.i8[2u * i], a.i8[2u * i + 1u]));
-                            out.i8[half + i] = static_cast<int8_t>(pick_i(b.i8[2u * i], b.i8[2u * i + 1u]));
-                        }
-                    }
-                } else if (size == 1u) {
-                    const uint32_t half = lanes_bytes / 4u;
-                    for (uint32_t i = 0; i < half; ++i) {
-                        if (is_unsigned) {
-                            out.u16[i] = static_cast<uint16_t>(pick_u(a.u16[2u * i], a.u16[2u * i + 1u]));
-                            out.u16[half + i] = static_cast<uint16_t>(pick_u(b.u16[2u * i], b.u16[2u * i + 1u]));
-                        } else {
-                            out.i16[i] = static_cast<int16_t>(pick_i(a.i16[2u * i], a.i16[2u * i + 1u]));
-                            out.i16[half + i] = static_cast<int16_t>(pick_i(b.i16[2u * i], b.i16[2u * i + 1u]));
-                        }
-                    }
-                } else if (size == 2u) {
-                    const uint32_t half = lanes_bytes / 8u;
-                    for (uint32_t i = 0; i < half; ++i) {
-                        if (is_unsigned) {
-                            out.u32[i] = static_cast<uint32_t>(pick_u(a.u32[2u * i], a.u32[2u * i + 1u]));
-                            out.u32[half + i] = static_cast<uint32_t>(pick_u(b.u32[2u * i], b.u32[2u * i + 1u]));
-                        } else {
-                            out.i32[i] = static_cast<int32_t>(pick_i(a.i32[2u * i], a.i32[2u * i + 1u]));
-                            out.i32[half + i] = static_cast<int32_t>(pick_i(b.i32[2u * i], b.i32[2u * i + 1u]));
-                        }
+                for (uint32_t i = 0; i < fcnt; ++i) {
+                    bool is_cmp = false, cmp_out = false;
+                    if (is_f64) {
+                        double r = eval_fp(a.f64[i], b.f64[i], out.f64[i], is_cmp, cmp_out);
+                        if (is_cmp) out.u64[i] = cmp_out ? ~0ULL : 0ULL;
+                        else out.f64[i] = r;
+                    } else {
+                        double r = eval_fp(a.f32[i], b.f32[i], out.f32[i], is_cmp, cmp_out);
+                        if (is_cmp) out.u32[i] = cmp_out ? 0xFFFFFFFFu : 0u;
+                        else out.f32[i] = static_cast<float>(r);
                     }
                 }
             }
-            state_.v[rd] = out;
-            return true;
-        }
-
-        // Integer MUL (u=0, opcode=0x13) and MLA (u=0, opcode=0x12) / MLS (u=1, opcode=0x12)
-        if ((u == 0u && opcode == 0x13u) || opcode == 0x12u) {
-            const bool is_mul = (opcode == 0x13u);
-            const bool is_sub = (opcode == 0x12u && u == 1u);
-            const NeonReg acc = state_.v[rd];
-            if (size == 0u) {
-                for (uint32_t i = 0; i < lanes_bytes; ++i) {
-                    uint8_t prod = static_cast<uint8_t>(a.u8[i] * b.u8[i]);
-                    out.u8[i] = is_mul ? prod : (is_sub ? static_cast<uint8_t>(acc.u8[i] - prod) : static_cast<uint8_t>(acc.u8[i] + prod));
-                }
-            } else if (size == 1u) {
-                for (uint32_t i = 0; i < lanes_bytes / 2u; ++i) {
-                    uint16_t prod = static_cast<uint16_t>(a.u16[i] * b.u16[i]);
-                    out.u16[i] = is_mul ? prod : (is_sub ? static_cast<uint16_t>(acc.u16[i] - prod) : static_cast<uint16_t>(acc.u16[i] + prod));
-                }
-            } else if (size == 2u) {
-                for (uint32_t i = 0; i < lanes_bytes / 4u; ++i) {
-                    uint32_t prod = a.u32[i] * b.u32[i];
-                    out.u32[i] = is_mul ? prod : (is_sub ? (acc.u32[i] - prod) : (acc.u32[i] + prod));
-                }
-            }
-            state_.v[rd] = out;
-            return true;
-        }
-
-        // Floating-point vector FADD (u=0, size&1==0, opcode=0x1A) / FSUB (size&1==1, opcode=0x1A) / FMUL (u=1, size&1==0, opcode=0x1B)
-        if (opcode == 0x1Au || opcode == 0x1Bu) {
-            const bool is_f64 = (size & 2u) != 0;
-            const bool is_sub = (opcode == 0x1Au) && ((size & 1u) != 0);
-            const bool is_mul = (opcode == 0x1Bu) && (u == 1u);
-            if (!is_f64) {
-                for (uint32_t i = 0; i < lanes_bytes / 4u; ++i) {
-                    out.f32[i] = is_mul ? (a.f32[i] * b.f32[i])
-                                        : (is_sub ? (a.f32[i] - b.f32[i]) : (a.f32[i] + b.f32[i]));
-                }
-            } else if (q) {
-                for (uint32_t i = 0; i < 2u; ++i) {
-                    out.f64[i] = is_mul ? (a.f64[i] * b.f64[i])
-                                        : (is_sub ? (a.f64[i] - b.f64[i]) : (a.f64[i] + b.f64[i]));
-                }
+            if (is_sca_three_same) {
+                if (!is_f64) out.u32[1] = 0u;
+                out.u64[1] = 0ULL;
             }
             state_.v[rd] = out;
             return true;
@@ -992,79 +1301,108 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
         return true;
     }
 
-    // 3d. AdvSIMD Three Different: SADDL/UADDL, SADDW/UADDW, SSUBL/USUBL, SSUBW/USUBW, SABDL/UABDL, SMULL/UMULL
+    // 3d. AdvSIMD Three Different:
+    //   SADDL/UADDL(0x0), SADDW/UADDW(0x1), SSUBL/USUBL(0x2), SSUBW/USUBW(0x3),
+    //   ADDHN/RADDHN(0x4), SABAL/UABAL(0x5), SUBHN/RSUBHN(0x6), SABDL/UABDL(0x7),
+    //   SMLAL/UMLAL(0x8), SMLSL/UMLSL(0xA), SMULL/UMULL(0xC), SQDMULL(0xD), PMULL(0xE)
     // Encoding: 0 Q U 01110 size 1 Rm opcode(4) 00 Rn Rd
-    if ((insn & 0x9F200C00u) == 0x0E200000u && size <= 2u) {
+    if ((insn & 0x9F200C00u) == 0x0E200000u) {
         const uint32_t u = (insn >> 29) & 1u;
         const uint32_t opcode = (insn >> 12) & 0xFu;
         const bool is_unsigned = (u == 1u);
         const NeonReg a = state_.v[rn];
         const NeonReg b = state_.v[rm];
-        NeonReg out{};
-        if (opcode == 0x0u || opcode == 0x1u || opcode == 0x2u || opcode == 0x3u ||
-            opcode == 0x7u || opcode == 0xCu) {
-            const bool is_wide_a = (opcode == 0x1u || opcode == 0x3u);
-            const bool is_sub = (opcode == 0x2u || opcode == 0x3u);
-            const bool is_abd = (opcode == 0x7u);
-            const bool is_mul = (opcode == 0xCu);
+
+        // PMULL / PMULL2 (u == 0, opcode == 0xE, size == 0 or size == 3)
+        if (u == 0u && opcode == 0xEu && (size == 0u || size == 3u)) {
+            NeonReg out{};
             if (size == 0u) {
                 const uint32_t off = q ? 8u : 0u;
-                for (uint32_t i = 0; i < 8u; ++i) {
-                    if (is_unsigned) {
-                        uint16_t va = is_wide_a ? a.u16[i] : static_cast<uint16_t>(a.u8[off + i]);
-                        uint16_t vb = b.u8[off + i];
-                        if (is_mul) out.u16[i] = static_cast<uint16_t>(va * vb);
-                        else if (is_abd) out.u16[i] = static_cast<uint16_t>(va >= vb ? (va - vb) : (vb - va));
-                        else out.u16[i] = is_sub ? static_cast<uint16_t>(va - vb) : static_cast<uint16_t>(va + vb);
-                    } else {
-                        int16_t va = is_wide_a ? a.i16[i] : static_cast<int16_t>(a.i8[off + i]);
-                        int16_t sb = b.i8[off + i];
-                        if (is_mul) out.i16[i] = static_cast<int16_t>(va * sb);
-                        else if (is_abd) out.i16[i] = static_cast<int16_t>(va >= sb ? (va - sb) : (sb - va));
-                        else out.i16[i] = is_sub ? static_cast<int16_t>(va - sb) : static_cast<int16_t>(va + sb);
-                    }
-                }
-            } else if (size == 1u) {
-                const uint32_t off = q ? 4u : 0u;
-                for (uint32_t i = 0; i < 4u; ++i) {
-                    if (is_unsigned) {
-                        uint32_t va = is_wide_a ? a.u32[i] : static_cast<uint32_t>(a.u16[off + i]);
-                        uint32_t vb = b.u16[off + i];
-                        if (is_mul) out.u32[i] = va * vb;
-                        else if (is_abd) out.u32[i] = (va >= vb) ? (va - vb) : (vb - va);
-                        else out.u32[i] = is_sub ? (va - vb) : (va + vb);
-                    } else {
-                        int32_t va = is_wide_a ? a.i32[i] : static_cast<int32_t>(a.i16[off + i]);
-                        int32_t sb = b.i16[off + i];
-                        if (is_mul) out.i32[i] = va * sb;
-                        else if (is_abd) out.i32[i] = (va >= sb) ? (va - sb) : (sb - va);
-                        else out.i32[i] = is_sub ? (va - sb) : (va + sb);
-                    }
-                }
+                for (uint32_t i = 0; i < 8u; ++i) out.u16[i] = PolyMul8(a.u8[off + i], b.u8[off + i]);
             } else {
-                const uint32_t off = q ? 2u : 0u;
-                for (uint32_t i = 0; i < 2u; ++i) {
-                    if (is_unsigned) {
-                        uint64_t va = is_wide_a ? a.u64[i] : static_cast<uint64_t>(a.u32[off + i]);
-                        uint64_t vb = b.u32[off + i];
-                        if (is_mul) out.u64[i] = va * vb;
-                        else if (is_abd) out.u64[i] = (va >= vb) ? (va - vb) : (vb - va);
-                        else out.u64[i] = is_sub ? (va - vb) : (va + vb);
-                    } else {
-                        int64_t va = is_wide_a ? a.i64[i] : static_cast<int64_t>(a.i32[off + i]);
-                        int64_t sb = b.i32[off + i];
-                        if (is_mul) out.i64[i] = va * sb;
-                        else if (is_abd) out.i64[i] = (va >= sb) ? (va - sb) : (sb - va);
-                        else out.i64[i] = is_sub ? (va - sb) : (va + sb);
-                    }
-                }
+                const uint32_t idx = q ? 1u : 0u;
+                PolyMul64(a.u64[idx], b.u64[idx], out.u64[0], out.u64[1]);
             }
             state_.v[rd] = out;
             return true;
         }
+
+        if (size <= 2u) {
+            // ADDHN / RADDHN (0x4) & SUBHN / RSUBHN (0x6)
+            if (opcode == 0x4u || opcode == 0x6u) {
+                const bool is_sub = (opcode == 0x6u);
+                const bool is_round = (u == 1u);
+                const uint32_t dst_bits = 8u << size;
+                const uint64_t round_c = is_round ? (1ULL << (dst_bits - 1u)) : 0ULL;
+                NeonReg out = q ? state_.v[rd] : NeonReg{};
+                const uint32_t dst_off = q ? (8u >> size) : 0u;
+                const uint32_t n = 8u >> size;
+                for (uint32_t i = 0; i < n; ++i) {
+                    uint64_t va = NeonGetLane(a, size + 1u, i);
+                    uint64_t vb = NeonGetLane(b, size + 1u, i);
+                    __int128 sum = is_sub ? (static_cast<__int128>(va) - static_cast<__int128>(vb))
+                                          : (static_cast<__int128>(va) + static_cast<__int128>(vb));
+                    sum += static_cast<__int128>(round_c);
+                    uint64_t res = static_cast<uint64_t>(static_cast<unsigned __int128>(sum) >> dst_bits);
+                    NeonSetLane(out, size, dst_off + i, res);
+                }
+                if (!q) out.u64[1] = 0ULL;
+                state_.v[rd] = out;
+                return true;
+            }
+
+            // Widening ops: SADDL..SMULL (0x0..0x3, 0x7, 0xC) + SABAL(0x5), SMLAL(0x8), SMLSL(0xA), SQDMULL(0xD)
+            if (opcode == 0x0u || opcode == 0x1u || opcode == 0x2u || opcode == 0x3u ||
+                opcode == 0x5u || opcode == 0x7u || opcode == 0x8u || opcode == 0xAu ||
+                opcode == 0xCu || (u == 0u && opcode == 0xDu && size != 0u)) {
+                const bool is_wide_a = (opcode == 0x1u || opcode == 0x3u);
+                const bool is_sub = (opcode == 0x2u || opcode == 0x3u || opcode == 0xAu);
+                const bool is_abd = (opcode == 0x5u || opcode == 0x7u);
+                const bool is_mul = (opcode == 0x8u || opcode == 0xAu || opcode == 0xCu || opcode == 0xDu);
+                const bool is_accum = (opcode == 0x5u || opcode == 0x8u || opcode == 0xAu);
+                const bool is_qdm = (opcode == 0xDu);
+                NeonReg out = is_accum ? state_.v[rd] : NeonReg{};
+                const uint32_t n = 8u >> size;
+                const uint32_t off = q ? n : 0u;
+                for (uint32_t i = 0; i < n; ++i) {
+                    if (is_unsigned && !is_qdm) {
+                        uint64_t va = is_wide_a ? NeonGetLane(a, size + 1u, i) : NeonGetLane(a, size, off + i);
+                        uint64_t vb = NeonGetLane(b, size, off + i);
+                        uint64_t val = 0;
+                        if (is_mul) val = va * vb;
+                        else if (is_abd) val = (va >= vb) ? (va - vb) : (vb - va);
+                        else val = is_sub ? (va - vb) : (va + vb);
+                        if (is_accum) {
+                            uint64_t cur = NeonGetLane(out, size + 1u, i);
+                            val = is_sub ? (cur - val) : (cur + val);
+                        }
+                        NeonSetLane(out, size + 1u, i, val);
+                    } else {
+                        int64_t va = is_wide_a ? NeonGetLaneSigned(a, size + 1u, i) : NeonGetLaneSigned(a, size, off + i);
+                        int64_t vb = NeonGetLaneSigned(b, size, off + i);
+                        if (is_qdm) {
+                            __int128 prod = static_cast<__int128>(va) * static_cast<__int128>(vb) * 2;
+                            NeonSetLane(out, size + 1u, i, static_cast<uint64_t>(SatSigned128(prod, 16u << size)));
+                        } else {
+                            int64_t val = 0;
+                            if (is_mul) val = va * vb;
+                            else if (is_abd) val = (va >= vb) ? (va - vb) : (vb - va);
+                            else val = is_sub ? (va - vb) : (va + vb);
+                            if (is_accum) {
+                                int64_t cur = NeonGetLaneSigned(out, size + 1u, i);
+                                val = is_sub ? (cur - val) : (cur + val);
+                            }
+                            NeonSetLane(out, size + 1u, i, static_cast<uint64_t>(val));
+                        }
+                    }
+                }
+                state_.v[rd] = out;
+                return true;
+            }
+        }
     }
 
-    // 4a. AdvSIMD Scalar Pairwise: ADDP Dd, Vn.2D / FADDP Sd, Vn.2S / FADDP Dd, Vn.2D
+    // 4a. AdvSIMD Scalar Pairwise: ADDP Dd, Vn.2D / FADDP / FMAXP / FMINP / FMAXNMP / FMINNMP
     if ((insn & 0xDF3E0C00u) == 0x5E300800u) {
         const uint32_t u = (insn >> 29) & 1u;
         const uint32_t opcode = (insn >> 12) & 0x1Fu;
@@ -1074,9 +1412,32 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
             state_.v[rd].u64[0] = a.u64[0] + a.u64[1];
             return true;
         }
-        if (u == 1u && opcode == 0x0Du) {
-            if ((size & 1u) == 0u) state_.v[rd].f32[0] = a.f32[0] + a.f32[1];
-            else state_.v[rd].f64[0] = a.f64[0] + a.f64[1];
+        if (u == 1u && (opcode == 0x0Cu || opcode == 0x0Du || opcode == 0x0Fu)) {
+            const bool is_f64 = (size & 1u) != 0u;
+            const bool op_hi = (size & 2u) != 0u;
+            if (!is_f64) {
+                float x = a.f32[0], y = a.f32[1];
+                if (opcode == 0x0Du && !op_hi) state_.v[rd].f32[0] = x + y;
+                else if (opcode == 0x0Cu) state_.v[rd].f32[0] = op_hi ? std::fmin(x, y) : std::fmax(x, y);
+                else if (opcode == 0x0Fu) {
+                    state_.v[rd].f32[0] = (std::isnan(x) || std::isnan(y)) ? (x + y)
+                                        : (op_hi ? std::fmin(x, y) : std::fmax(x, y));
+                } else {
+                    RaiseException(ec::kUnknown, 0, 0, false, state_.pc);
+                    return false;
+                }
+            } else {
+                double x = a.f64[0], y = a.f64[1];
+                if (opcode == 0x0Du && !op_hi) state_.v[rd].f64[0] = x + y;
+                else if (opcode == 0x0Cu) state_.v[rd].f64[0] = op_hi ? std::fmin(x, y) : std::fmax(x, y);
+                else if (opcode == 0x0Fu) {
+                    state_.v[rd].f64[0] = (std::isnan(x) || std::isnan(y)) ? (x + y)
+                                        : (op_hi ? std::fmin(x, y) : std::fmax(x, y));
+                } else {
+                    RaiseException(ec::kUnknown, 0, 0, false, state_.pc);
+                    return false;
+                }
+            }
             return true;
         }
     }
@@ -1176,53 +1537,49 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
         return true;
     }
 
-    // 6. AdvSIMD Two-reg misc: REV64/REV32/REV16, CLS/CLZ, CNT/NOT/RBIT, XTN/SQXTUN/SQXTN/UQXTN,
-    // SHLL, CMEQ0/CMGT0/CMGE0/CMLT0/CMLE0, ABS/NEG, FABS/FNEG, FCMEQ0/FCMGT0/FCMGE0/FCMLT0/FCMLE0, SCVTF/UCVTF, FCVTZS/FCVTZU
-    if ((insn & 0x9F3E0C00u) == 0x0E200800u) {
+    // 6/6a. AdvSIMD Vector & Scalar Two-reg misc:
+    //   Vector: 0 Q U 01110 size 10000 opcode(5) 10 Rn Rd
+    //   Scalar: 0 1 U 11110 size 10000 opcode(5) 10 Rn Rd
+    const bool is_vec_misc = ((insn & 0x9F3E0C00u) == 0x0E200800u);
+    const bool is_sca_misc = ((insn & 0xDF3E0C00u) == 0x5E200800u);
+    if (is_vec_misc || is_sca_misc) {
         const uint32_t u = (insn >> 29) & 1u;
         const uint32_t opcode = (insn >> 12) & 0x1Fu;
         const NeonReg a = state_.v[rn];
         NeonReg out{};
-        if (u == 0u && opcode == 0x00u) {
+        const uint32_t count = is_sca_misc ? 1u : (lanes_bytes >> size);
+
+        if (is_vec_misc && u == 0u && opcode == 0x00u) {
             // REV64 Vd.T, Vn.T
             const uint32_t halves = q ? 2u : 1u;
             for (uint32_t h = 0; h < halves; ++h) {
-                if (size == 0u) {
-                    for (uint32_t i = 0; i < 8u; ++i) out.u8[h * 8u + i] = a.u8[h * 8u + (7u - i)];
-                } else if (size == 1u) {
-                    for (uint32_t i = 0; i < 4u; ++i) out.u16[h * 4u + i] = a.u16[h * 4u + (3u - i)];
-                } else if (size == 2u) {
-                    for (uint32_t i = 0; i < 2u; ++i) out.u32[h * 2u + i] = a.u32[h * 2u + (1u - i)];
-                }
+                if (size == 0u) for (uint32_t i = 0; i < 8u; ++i) out.u8[h * 8u + i] = a.u8[h * 8u + (7u - i)];
+                else if (size == 1u) for (uint32_t i = 0; i < 4u; ++i) out.u16[h * 4u + i] = a.u16[h * 4u + (3u - i)];
+                else if (size == 2u) for (uint32_t i = 0; i < 2u; ++i) out.u32[h * 2u + i] = a.u32[h * 2u + (1u - i)];
             }
             state_.v[rd] = out;
             return true;
         }
-        if (u == 1u && opcode == 0x00u && (size == 0u || size == 1u)) {
+        if (is_vec_misc && u == 1u && opcode == 0x00u && (size == 0u || size == 1u)) {
             // REV32 Vd.T, Vn.T
             const uint32_t words = q ? 4u : 2u;
             for (uint32_t w = 0; w < words; ++w) {
-                if (size == 0u) {
-                    for (uint32_t i = 0; i < 4u; ++i) out.u8[w * 4u + i] = a.u8[w * 4u + (3u - i)];
-                } else {
-                    out.u16[w * 2u] = a.u16[w * 2u + 1u];
-                    out.u16[w * 2u + 1u] = a.u16[w * 2u];
-                }
+                if (size == 0u) for (uint32_t i = 0; i < 4u; ++i) out.u8[w * 4u + i] = a.u8[w * 4u + (3u - i)];
+                else { out.u16[w * 2u] = a.u16[w * 2u + 1u]; out.u16[w * 2u + 1u] = a.u16[w * 2u]; }
             }
             state_.v[rd] = out;
             return true;
         }
-        if (u == 0u && opcode == 0x01u && size == 0u) {
+        if (is_vec_misc && u == 0u && opcode == 0x01u && size == 0u) {
             // REV16 Vd.T, Vn.T
             const uint32_t halfwords = q ? 8u : 4u;
             for (uint32_t h = 0; h < halfwords; ++h) {
-                out.u8[h * 2u] = a.u8[h * 2u + 1u];
-                out.u8[h * 2u + 1u] = a.u8[h * 2u];
+                out.u8[h * 2u] = a.u8[h * 2u + 1u]; out.u8[h * 2u + 1u] = a.u8[h * 2u];
             }
             state_.v[rd] = out;
             return true;
         }
-        if (opcode == 0x04u && size < 3u) {
+        if (is_vec_misc && opcode == 0x04u && size < 3u) {
             // CLS (u=0) / CLZ (u=1)
             auto clz_n = [](uint32_t val, uint32_t bits) -> uint32_t {
                 uint32_t c = 0;
@@ -1241,186 +1598,177 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
                 }
                 return c;
             };
-            if (size == 0u) {
-                for (uint32_t i = 0; i < lanes_bytes; ++i)
-                    out.u8[i] = static_cast<uint8_t>((u == 1u) ? clz_n(a.u8[i], 8u) : cls_n(a.u8[i], 8u));
-            } else if (size == 1u) {
-                for (uint32_t i = 0; i < lanes_bytes / 2u; ++i)
-                    out.u16[i] = static_cast<uint16_t>((u == 1u) ? clz_n(a.u16[i], 16u) : cls_n(a.u16[i], 16u));
-            } else {
-                for (uint32_t i = 0; i < lanes_bytes / 4u; ++i)
-                    out.u32[i] = (u == 1u) ? clz_n(a.u32[i], 32u) : cls_n(a.u32[i], 32u);
+            for (uint32_t i = 0; i < count; ++i) {
+                uint32_t v = static_cast<uint32_t>(NeonGetLane(a, size, i));
+                NeonSetLane(out, size, i, (u == 1u) ? clz_n(v, 8u << size) : cls_n(v, 8u << size));
             }
             state_.v[rd] = out;
             return true;
         }
-        if (u == 0u && opcode == 0x05u && size == 0u) {
-            // CNT Vd.T, Vn.T
-            for (uint32_t i = 0; i < lanes_bytes; ++i) {
-                out.u8[i] = static_cast<uint8_t>(__builtin_popcount(a.u8[i]));
-            }
+        if (is_vec_misc && u == 0u && opcode == 0x05u && size == 0u) {
+            for (uint32_t i = 0; i < lanes_bytes; ++i) out.u8[i] = static_cast<uint8_t>(__builtin_popcount(a.u8[i]));
             state_.v[rd] = out;
             return true;
         }
-        if (u == 1u && opcode == 0x05u && size == 0u) {
-            // NOT (MVN) Vd.T, Vn.T
+        if (is_vec_misc && u == 1u && opcode == 0x05u && size == 0u) {
             for (uint32_t i = 0; i < (q ? 2u : 1u); ++i) out.u64[i] = ~a.u64[i];
             state_.v[rd] = out;
             return true;
         }
-        if (u == 1u && opcode == 0x05u && size == 1u) {
-            // RBIT Vd.T, Vn.T
+        if (is_vec_misc && u == 1u && opcode == 0x05u && size == 1u) {
             for (uint32_t i = 0; i < lanes_bytes; ++i) {
-                uint8_t b = a.u8[i];
-                uint8_t r = 0;
-                for (int bit = 0; bit < 8; ++bit) {
-                    r = static_cast<uint8_t>((r << 1) | ((b >> bit) & 1u));
-                }
+                uint8_t b = a.u8[i], r = 0;
+                for (int bit = 0; bit < 8; ++bit) r = static_cast<uint8_t>((r << 1) | ((b >> bit) & 1u));
                 out.u8[i] = r;
             }
             state_.v[rd] = out;
             return true;
         }
+        // XTN(0x12,u=0), SQXTUN(0x12,u=1), SQXTN(0x14,u=0), UQXTN(0x14,u=1) — Vector & Scalar
         if ((opcode == 0x12u || opcode == 0x14u) && size < 3u) {
-            // XTN (u=0,op=0x12), SQXTUN (u=1,op=0x12), SQXTN (u=0,op=0x14), UQXTN (u=1,op=0x14)
-            out = q ? state_.v[rd] : NeonReg{};
-            const uint32_t byte_off = q ? 8u : 0u;
-            if (size == 0u) {
-                for (uint32_t i = 0; i < 8u; ++i) {
-                    uint8_t r = 0;
-                    if (opcode == 0x12u && u == 0u) r = static_cast<uint8_t>(a.u16[i]);
-                    else if (opcode == 0x12u && u == 1u) r = static_cast<uint8_t>(std::clamp<int32_t>(a.i16[i], 0, 255));
-                    else if (opcode == 0x14u && u == 0u) r = static_cast<uint8_t>(static_cast<int8_t>(std::clamp<int32_t>(a.i16[i], -128, 127)));
-                    else r = static_cast<uint8_t>(std::min<uint32_t>(a.u16[i], 255u));
-                    out.u8[byte_off + i] = r;
-                }
-            } else if (size == 1u) {
-                for (uint32_t i = 0; i < 4u; ++i) {
-                    uint16_t r = 0;
-                    if (opcode == 0x12u && u == 0u) r = static_cast<uint16_t>(a.u32[i]);
-                    else if (opcode == 0x12u && u == 1u) r = static_cast<uint16_t>(std::clamp<int32_t>(a.i32[i], 0, 65535));
-                    else if (opcode == 0x14u && u == 0u) r = static_cast<uint16_t>(static_cast<int16_t>(std::clamp<int32_t>(a.i32[i], -32768, 32767)));
-                    else r = static_cast<uint16_t>(std::min<uint32_t>(a.u32[i], 65535u));
-                    out.u16[(byte_off / 2u) + i] = r;
-                }
-            } else {
-                for (uint32_t i = 0; i < 2u; ++i) {
-                    uint32_t r = 0;
-                    if (opcode == 0x12u && u == 0u) r = static_cast<uint32_t>(a.u64[i]);
-                    else if (opcode == 0x12u && u == 1u) r = static_cast<uint32_t>(std::clamp<int64_t>(a.i64[i], 0, UINT32_MAX));
-                    else if (opcode == 0x14u && u == 0u) r = static_cast<uint32_t>(static_cast<int32_t>(std::clamp<int64_t>(a.i64[i], INT32_MIN, INT32_MAX)));
-                    else r = static_cast<uint32_t>(std::min<uint64_t>(a.u64[i], UINT32_MAX));
-                    out.u32[(byte_off / 4u) + i] = r;
-                }
+            if (is_vec_misc && u == 0u && opcode == 0x12u) { /* XTN */ }
+            const bool is_vec_hi = is_vec_misc && q;
+            out = is_vec_hi ? state_.v[rd] : NeonReg{};
+            const uint32_t dst_off = is_vec_hi ? (8u >> size) : 0u;
+            const uint32_t n = is_sca_misc ? 1u : (8u >> size);
+            const uint32_t dst_bits = 8u << size;
+            for (uint32_t i = 0; i < n; ++i) {
+                uint64_t r = 0;
+                if (opcode == 0x12u && u == 0u) r = NeonGetLane(a, size + 1u, i);
+                else if (opcode == 0x12u && u == 1u) r = SatUnsigned128(NeonGetLaneSigned(a, size + 1u, i), dst_bits);
+                else if (opcode == 0x14u && u == 0u) r = static_cast<uint64_t>(SatSigned128(NeonGetLaneSigned(a, size + 1u, i), dst_bits));
+                else r = SatUnsigned128(static_cast<__int128>(NeonGetLane(a, size + 1u, i)), dst_bits);
+                NeonSetLane(out, size, dst_off + i, r);
             }
-            if (!q) out.u64[1] = 0ULL;
+            if (!is_vec_hi) out.u64[1] = 0ULL;
             state_.v[rd] = out;
             return true;
         }
-        if (u == 1u && opcode == 0x13u && size < 3u) {
-            // SHLL / SHLL2 Vd.Ta, Vn.Tb, #esize (shift left by 8 << size)
-            if (size == 0u) {
-                const uint32_t off = q ? 8u : 0u;
-                for (uint32_t i = 0; i < 8u; ++i) out.u16[i] = static_cast<uint16_t>(a.u8[off + i]) << 8;
-            } else if (size == 1u) {
-                const uint32_t off = q ? 4u : 0u;
-                for (uint32_t i = 0; i < 4u; ++i) out.u32[i] = static_cast<uint32_t>(a.u16[off + i]) << 16;
+        // Vector FCVTN / FCVTN2 (u=0, op=0x16, size=1) & FCVTL / FCVTL2 (u=0, op=0x17, size=1)
+        if (is_vec_misc && u == 0u && (opcode == 0x16u || opcode == 0x17u) && (size & 1u) == 1u && (size & 2u) == 0u) {
+            if (opcode == 0x16u) {
+                out = q ? state_.v[rd] : NeonReg{};
+                const uint32_t off = q ? 2u : 0u;
+                for (uint32_t i = 0; i < 2u; ++i) out.f32[off + i] = static_cast<float>(a.f64[i]);
+                if (!q) out.u64[1] = 0ULL;
             } else {
                 const uint32_t off = q ? 2u : 0u;
-                for (uint32_t i = 0; i < 2u; ++i) out.u64[i] = static_cast<uint64_t>(a.u32[off + i]) << 32;
+                for (uint32_t i = 0; i < 2u; ++i) out.f64[i] = static_cast<double>(a.f32[off + i]);
             }
             state_.v[rd] = out;
             return true;
         }
+        if (is_vec_misc && u == 1u && opcode == 0x13u && size < 3u) {
+            // SHLL / SHLL2
+            const uint32_t n = 8u >> size;
+            const uint32_t off = q ? n : 0u;
+            const uint32_t sh = 8u << size;
+            for (uint32_t i = 0; i < n; ++i) NeonSetLane(out, size + 1u, i, NeonGetLane(a, size, off + i) << sh);
+            state_.v[rd] = out;
+            return true;
+        }
+        // Integer Zero comparisons (0x08/0x09/0x0A) — Vector & Scalar
         if (opcode == 0x08u || opcode == 0x09u || opcode == 0x0Au) {
-            // Zero comparisons: CMGT(u=0,op=8), CMGE(u=1,op=8), CMEQ(u=0,op=9), CMLE(u=1,op=9), CMLT(u=0,op=10)
-            auto cmp0 = [&](int64_t v) -> bool {
-                if (opcode == 0x08u) return (u == 0u) ? (v > 0) : (v >= 0);
-                if (opcode == 0x09u) return (u == 0u) ? (v == 0) : (v <= 0);
-                return (u == 0u) ? (v < 0) : false;
-            };
-            if (size == 0u) {
-                for (uint32_t i = 0; i < lanes_bytes; ++i) out.u8[i] = cmp0(a.i8[i]) ? 0xFFu : 0u;
-            } else if (size == 1u) {
-                for (uint32_t i = 0; i < lanes_bytes / 2u; ++i) out.u16[i] = cmp0(a.i16[i]) ? 0xFFFFu : 0u;
-            } else if (size == 2u) {
-                for (uint32_t i = 0; i < lanes_bytes / 4u; ++i) out.u32[i] = cmp0(a.i32[i]) ? 0xFFFFFFFFu : 0u;
-            } else {
-                for (uint32_t i = 0; i < lanes_bytes / 8u; ++i) out.u64[i] = cmp0(a.i64[i]) ? ~0ULL : 0ULL;
+            for (uint32_t i = 0; i < count; ++i) {
+                int64_t v = NeonGetLaneSigned(a, size, i);
+                bool cmp = false;
+                if (opcode == 0x08u) cmp = (u == 0u) ? (v > 0) : (v >= 0);
+                else if (opcode == 0x09u) cmp = (u == 0u) ? (v == 0) : (v <= 0);
+                else cmp = (u == 0u) ? (v < 0) : false;
+                NeonSetLane(out, size, i, cmp ? ~0ULL : 0ULL);
             }
             state_.v[rd] = out;
             return true;
         }
+        // Integer ABS (u=0, 0x0B) / NEG (u=1, 0x0B) — Vector & Scalar
         if (opcode == 0x0Bu) {
-            // ABS (u=0) / NEG (u=1)
             const bool is_neg = (u == 1u);
-            if (size == 0u) {
-                for (uint32_t i = 0; i < lanes_bytes; ++i)
-                    out.i8[i] = is_neg ? static_cast<int8_t>(-a.i8[i]) : static_cast<int8_t>(a.i8[i] < 0 ? -a.i8[i] : a.i8[i]);
-            } else if (size == 1u) {
-                for (uint32_t i = 0; i < lanes_bytes / 2u; ++i)
-                    out.i16[i] = is_neg ? static_cast<int16_t>(-a.i16[i]) : static_cast<int16_t>(a.i16[i] < 0 ? -a.i16[i] : a.i16[i]);
-            } else if (size == 2u) {
-                for (uint32_t i = 0; i < lanes_bytes / 4u; ++i)
-                    out.i32[i] = is_neg ? -a.i32[i] : (a.i32[i] < 0 ? -a.i32[i] : a.i32[i]);
-            } else {
-                for (uint32_t i = 0; i < lanes_bytes / 8u; ++i)
-                    out.i64[i] = is_neg ? -a.i64[i] : (a.i64[i] < 0 ? -a.i64[i] : a.i64[i]);
+            for (uint32_t i = 0; i < count; ++i) {
+                int64_t v = NeonGetLaneSigned(a, size, i);
+                int64_t r = is_neg ? static_cast<int64_t>(-static_cast<uint64_t>(v))
+                                   : ((v < 0) ? static_cast<int64_t>(-static_cast<uint64_t>(v)) : v);
+                NeonSetLane(out, size, i, static_cast<uint64_t>(r));
             }
             state_.v[rd] = out;
             return true;
         }
-        if ((opcode == 0x0Cu || opcode == 0x0Du || opcode == 0x0Eu) && (size & 2u) != 0u) {
-            // Floating-point compare to 0.0: FCMGT(u=0,0x0C), FCMGE(u=1,0x0C), FCMEQ(u=0,0x0D), FCMLE(u=1,0x0D), FCMLT(u=0,0x0E)
+        // FP ops in Two-Reg Misc (size & 2 != 0 -> f32 if !(size&1), f64 if (size&1))
+        const bool fp_hi_size = (size & 2u) != 0u;
+        const bool fp_is_f64 = (size & 1u) != 0u;
+        const uint32_t fcnt = is_sca_misc ? 1u : (fp_is_f64 ? 2u : (q ? 4u : 2u));
+
+        if ((opcode == 0x0Cu || opcode == 0x0Du || opcode == 0x0Eu) && fp_hi_size) {
+            // FCMGT0/FCMGE0/FCMEQ0/FCMLE0/FCMLT0 — Vector & Scalar
             auto fcmp0 = [&](double v) -> bool {
                 if (std::isnan(v)) return false;
                 if (opcode == 0x0Cu) return (u == 0u) ? (v > 0.0) : (v >= 0.0);
                 if (opcode == 0x0Du) return (u == 0u) ? (v == 0.0) : (v <= 0.0);
                 return (u == 0u) ? (v < 0.0) : false;
             };
-            if ((size & 1u) == 0u) {
-                for (uint32_t i = 0; i < lanes_bytes / 4u; ++i) out.u32[i] = fcmp0(a.f32[i]) ? 0xFFFFFFFFu : 0u;
-            } else if (q) {
-                for (uint32_t i = 0; i < 2u; ++i) out.u64[i] = fcmp0(a.f64[i]) ? ~0ULL : 0ULL;
+            if (!fp_is_f64) {
+                for (uint32_t i = 0; i < fcnt; ++i) out.u32[i] = fcmp0(a.f32[i]) ? 0xFFFFFFFFu : 0u;
+            } else if (is_sca_misc || q) {
+                for (uint32_t i = 0; i < fcnt; ++i) out.u64[i] = fcmp0(a.f64[i]) ? ~0ULL : 0ULL;
             }
             state_.v[rd] = out;
             return true;
         }
-        if (opcode == 0x0Fu && (size & 2u) != 0u) {
-            // Vector FABS (u=0) / FNEG (u=1)
-            if ((size & 1u) == 0u) {
-                for (uint32_t i = 0; i < lanes_bytes / 4u; ++i)
-                    out.f32[i] = (u == 1u) ? -a.f32[i] : std::fabs(a.f32[i]);
+        if (is_vec_misc && opcode == 0x0Fu && fp_hi_size) {
+            if (!fp_is_f64) {
+                for (uint32_t i = 0; i < fcnt; ++i) out.f32[i] = (u == 1u) ? -a.f32[i] : std::fabs(a.f32[i]);
             } else if (q) {
-                for (uint32_t i = 0; i < 2u; ++i)
-                    out.f64[i] = (u == 1u) ? -a.f64[i] : std::fabs(a.f64[i]);
+                for (uint32_t i = 0; i < 2u; ++i) out.f64[i] = (u == 1u) ? -a.f64[i] : std::fabs(a.f64[i]);
             }
             state_.v[rd] = out;
             return true;
         }
-        if (opcode == 0x1Du && (size & 2u) == 0u) {
-            // Vector SCVTF (u=0) / UCVTF (u=1)
-            if ((size & 1u) == 0u) {
-                for (uint32_t i = 0; i < lanes_bytes / 4u; ++i) {
+        // FSQRT (u=1, op=0x1F)
+        if (is_vec_misc && u == 1u && opcode == 0x1Fu && fp_hi_size) {
+            if (!fp_is_f64) {
+                for (uint32_t i = 0; i < fcnt; ++i) out.f32[i] = std::sqrt(a.f32[i]);
+            } else if (q) {
+                for (uint32_t i = 0; i < 2u; ++i) out.f64[i] = std::sqrt(a.f64[i]);
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+        // FRECPE (u=0, op=0x1D) & FRSQRTE (u=1, op=0x1D) — Vector & Scalar
+        if (opcode == 0x1Du && fp_hi_size) {
+            if (!fp_is_f64) {
+                for (uint32_t i = 0; i < fcnt; ++i) {
+                    out.f32[i] = (u == 1u) ? (1.0f / std::sqrt(a.f32[i])) : (1.0f / a.f32[i]);
+                }
+            } else if (is_sca_misc || q) {
+                for (uint32_t i = 0; i < fcnt; ++i) {
+                    out.f64[i] = (u == 1u) ? (1.0 / std::sqrt(a.f64[i])) : (1.0 / a.f64[i]);
+                }
+            }
+            state_.v[rd] = out;
+            return true;
+        }
+        // SCVTF (u=0, op=0x1D, !fp_hi_size) / UCVTF (u=1, op=0x1D, !fp_hi_size) — Vector & Scalar
+        if (opcode == 0x1Du && !fp_hi_size) {
+            if (!fp_is_f64) {
+                for (uint32_t i = 0; i < fcnt; ++i) {
                     out.f32[i] = (u == 1u) ? static_cast<float>(a.u32[i]) : static_cast<float>(a.i32[i]);
                 }
-            } else if (q) {
-                for (uint32_t i = 0; i < 2u; ++i) {
+            } else if (is_sca_misc || q) {
+                for (uint32_t i = 0; i < fcnt; ++i) {
                     out.f64[i] = (u == 1u) ? static_cast<double>(a.u64[i]) : static_cast<double>(a.i64[i]);
                 }
             }
             state_.v[rd] = out;
             return true;
         }
-        if (opcode == 0x1Bu && (size & 2u) != 0u) {
-            // Vector FCVTZS (u=0) / FCVTZU (u=1)
-            if ((size & 1u) == 0u) {
-                for (uint32_t i = 0; i < lanes_bytes / 4u; ++i) {
+        // FCVTZS (u=0, op=0x1B, fp_hi_size) / FCVTZU (u=1, op=0x1B, fp_hi_size) — Vector & Scalar
+        if (opcode == 0x1Bu && fp_hi_size) {
+            if (!fp_is_f64) {
+                for (uint32_t i = 0; i < fcnt; ++i) {
                     double t = std::trunc(static_cast<double>(a.f32[i]));
                     out.u32[i] = (u == 1u) ? ClampToUint32(t) : static_cast<uint32_t>(ClampToInt32(t));
                 }
-            } else if (q) {
-                for (uint32_t i = 0; i < 2u; ++i) {
+            } else if (is_sca_misc || q) {
+                for (uint32_t i = 0; i < fcnt; ++i) {
                     double t = std::trunc(a.f64[i]);
                     out.u64[i] = (u == 1u) ? ClampToUint64(t) : ClampToInt64(t);
                 }

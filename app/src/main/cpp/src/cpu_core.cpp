@@ -714,7 +714,28 @@ bool AArch64CpuCore::ExecuteInstruction(const DecodedInsn& d, uint64_t& next_pc)
         }
 
         case InsnKind::ShiftVar: {
-            const uint32_t op2 = (insn >> 10) & 3u; // 0=LSL, 1=LSR, 2=ASR, 3=ROR
+            const uint32_t opcode = (insn >> 10) & 0x3Fu;
+            if ((opcode & 0x38u) == 0x10u) {
+                const bool is_crc32c = (opcode & 4u) != 0u;
+                const uint32_t sz = opcode & 3u;
+                if (sz == 3u && !d.sf64) {
+                    RaiseException(ec::kUnknown, 0, 0, false, state_.pc);
+                    return false;
+                }
+                const uint32_t poly = is_crc32c ? 0x82F63B78u : 0xEDB88320u;
+                uint32_t crc = static_cast<uint32_t>(state_.ReadRegOrZero(d.rn));
+                const uint64_t val = state_.ReadRegOrZero(d.rm);
+                const uint32_t nbits = 8u << sz;
+                for (uint32_t b = 0; b < nbits; ++b) {
+                    const uint32_t bit = static_cast<uint32_t>((val >> b) & 1ULL);
+                    const uint32_t lsb = (crc ^ bit) & 1u;
+                    crc >>= 1;
+                    if (lsb) crc ^= poly;
+                }
+                state_.WriteRegOrDiscard(d.rd, static_cast<uint64_t>(crc));
+                return true;
+            }
+            const uint32_t op2 = opcode & 3u; // 0=LSL, 1=LSR, 2=ASR, 3=ROR
             const uint32_t amt = static_cast<uint32_t>(state_.ReadRegOrZero(d.rm));
             uint64_t res = ApplyShift(state_.ReadRegOrZero(d.rn), op2, amt, d.sf64);
             state_.WriteRegOrDiscard(d.rd, res);

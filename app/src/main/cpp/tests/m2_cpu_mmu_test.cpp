@@ -645,6 +645,152 @@ void TestExtendedAdvSimdShiftAndMisc() {
     std::cout << "[PASS] TestExtendedAdvSimdShiftAndMisc\n";
 }
 
+void TestComprehensiveNeonFpAndCrc32() {
+    GuestRam ram;
+    MmioBus bus;
+    HASEEB_CHECK(ram.Allocate(kGuestRamBase, 16ULL * 1024ULL * 1024ULL) == VmError::Ok);
+
+    AArch64CpuCore cpu(ram, bus, 0);
+    const uint64_t code_addr = kGuestRamBase;
+    cpu.Reset(code_addr, kGuestRamBase + 0x80000ULL, 1);
+
+    auto& st = cpu.State();
+    // Seed V1 & V3 for integer tests:
+    st.v[1].u32[0] = 100u; st.v[1].u32[1] = 200u; st.v[1].u32[2] = 0x10000u; st.v[1].u32[3] = 0x00020003u;
+    st.v[3].u32[0] = 3u;   st.v[3].u32[1] = 4u;   st.v[3].u32[2] = 5u;       st.v[3].u32[3] = 6u;
+    // Accumulator pre-values:
+    st.v[2].u32[0] = 10u; st.v[2].u32[1] = 20u; st.v[2].u32[2] = 30u; st.v[2].u32[3] = 40u;
+    st.v[5].u32[0] = 500u;
+    st.v[6].u32[0] = 1000u;
+    st.v[11].u32[0] = 50u;
+    // CRC32 inputs: CRC32C of "123456789" via CRC32CB/W/CX
+    st.x[4] = 0xFFFFFFFFULL;
+    st.x[5] = 0x34333231ULL; // "1234"
+    st.x[6] = 0xFFFFFFFFULL;
+    st.x[7] = static_cast<uint64_t>('1');
+    st.x[8] = 0xFFFFFFFFULL;
+    st.x[9] = 0x3837363534333231ULL; // "12345678"
+
+    std::vector<uint32_t> code = {
+        0x2E638022u, // umlal v2.4s, v1.4h, v3.4h  (exact insns=753504 trap!)
+        0x6E638024u, // umlal2 v4.4s, v1.8h, v3.8h
+        0x0E63A025u, // smlsl v5.4s, v1.4h, v3.4h
+        0x2E635026u, // uabal v6.4s, v1.4h, v3.4h
+        0x0E634027u, // addhn v7.4h, v1.4s, v3.4s
+        0x6E634027u, // raddhn2 v7.8h, v1.4s, v3.4s
+        0x0E23E028u, // pmull v8.8h, v1.8b, v3.8b
+        0x0EE3E029u, // pmull v9.1q, v1.1d, v3.1d
+        0x4F83882Au, // mul v10.4s, v1.4s, v3.s[2]
+        0x6F83082Au, // mla v10.4s, v1.4s, v3.s[2]
+        0x2F53282Bu, // umlal v11.4s, v1.4h, v3.h[5] -> V3.H[5] = V3.U32[2]>>16 = 0
+        0x4EA34436u, // sshl v22.4s, v1.4s, v3.4s
+        0x0E630C37u, // sqadd v23.4h, v1.4h, v3.4h
+        0x4EA37438u, // sabd v24.4s, v1.4s, v3.4s
+        0x4F257439u, // sqshl v25.4s, v1.4s, #5
+        0x2F1B943Au, // uqshrn v26.4h, v1.4s, #5
+        0x4F3CE43Bu, // scvtf v27.4s, v1.4s, #4
+        0x5EE3843Cu, // add d28, d1, d3
+        0x5F45543Du, // shl d29, d1, #5
+        0x1AC54884u, // crc32w w4, w4, w5
+        0x1AC750C6u, // crc32cb w6, w6, w7
+        0x9AC95D08u, // crc32cx w8, w8, x9
+        0x1AC75108u, // crc32cb w8, w8, w7 ('1'..'8' then use '9' below -> overwrite w7 before if needed, here we feed '1' twice then fix below)
+        Hlt(0),
+    };
+    // Fix exact "123456789" test: put '9' in x10 and use crc32cb w8, w8, w10
+    code[code.size() - 2] = 0x1ACA5108u; // crc32cb w8, w8, w10
+    st.x[10] = static_cast<uint64_t>('9');
+
+    ram.WriteBytes(code_addr, code.data(), code.size() * 4u);
+    HASEEB_CHECK(cpu.Run(1000) == VmError::Ok);
+    HASEEB_CHECK(st.halted);
+
+    // UMLAL v2.4s, v1.4h, v3.4h: V1.H=[100, 0, 200, 0], V3.H=[3, 0, 4, 0]
+    HASEEB_CHECK(st.v[2].u32[0] == 10u + 100u * 3u);
+    HASEEB_CHECK(st.v[2].u32[1] == 20u);
+    HASEEB_CHECK(st.v[2].u32[2] == 30u + 200u * 4u);
+    HASEEB_CHECK(st.v[2].u32[3] == 40u);
+    // UMLAL2 v4.4s, v1.8h, v3.8h: V1.H[4..7]=[0, 1, 3, 2], V3.H[4..7]=[5, 0, 6, 0]
+    HASEEB_CHECK(st.v[4].u32[0] == 0u);
+    HASEEB_CHECK(st.v[4].u32[1] == 0u);
+    HASEEB_CHECK(st.v[4].u32[2] == 3u * 6u);
+    // SMLSL v5.4s: 500 - 100*3 = 200
+    HASEEB_CHECK(st.v[5].i32[0] == 200);
+    // UABAL v6.4s: 1000 + |100 - 3| = 1097
+    HASEEB_CHECK(st.v[6].u32[0] == 1097u);
+    // MUL + MLA by element: (100 * 5) * 2 = 1000
+    HASEEB_CHECK(st.v[10].u32[0] == 1000u);
+    HASEEB_CHECK(st.v[10].u32[1] == 2000u);
+    // SSHL: 100 << 3 = 800
+    HASEEB_CHECK(st.v[22].u32[0] == 800u);
+    // SABD: |100 - 3| = 97
+    HASEEB_CHECK(st.v[24].u32[0] == 97u);
+    // SQSHL: 100 << 5 = 3200
+    HASEEB_CHECK(st.v[25].u32[0] == 3200u);
+    // UQSHRN: 0x10000 >> 5 = 2048
+    HASEEB_CHECK(st.v[26].u16[2] == 2048u);
+    // SCVTF #4: 100 / 16.0f = 6.25f
+    HASEEB_CHECK(std::fabs(st.v[27].f32[0] - 6.25f) < 1e-6f);
+    // ADD D28, D1, D3
+    HASEEB_CHECK(st.v[28].u64[0] == st.v[1].u64[0] + st.v[3].u64[0]);
+    // SHL D29, D1, #5
+    HASEEB_CHECK(st.v[29].u64[0] == (st.v[1].u64[0] << 5));
+    // CRC32C of "123456789": ~w8 == 0xE3069283
+    HASEEB_CHECK((~static_cast<uint32_t>(st.x[8])) == 0xE3069283u);
+
+    // Phase 2: Vector FP 4S & 2D + FMADD + FMAXNM
+    cpu.Reset(code_addr, kGuestRamBase + 0x80000ULL, 1);
+    st.v[1].f32[0] = 4.0f; st.v[1].f32[1] = 9.0f; st.v[1].f32[2] = 16.0f; st.v[1].f32[3] = 25.0f;
+    st.v[2].f32[0] = 2.0f; st.v[2].f32[1] = 3.0f; st.v[2].f32[2] = 4.0f;  st.v[2].f32[3] = 5.0f;
+    st.v[3].f32[0] = 1.5f; st.v[3].f32[1] = 2.5f; st.v[3].f32[2] = 3.0f;  st.v[3].f32[3] = 4.0f;
+    st.v[20].f32[0] = 10.0f;
+    st.v[14].f32[0] = 1.0f;
+    std::vector<uint32_t> fp_code = {
+        0x4E23D42Fu, // fadd v15.4s, v1.4s, v3.4s
+        0x4EA3D431u, // fsub v17.4s, v1.4s, v3.4s
+        0x6E23FC33u, // fdiv v19.4s, v1.4s, v3.4s
+        0x4E23CC34u, // fmla v20.4s, v1.4s, v3.4s
+        0x6EA1F835u, // fsqrt v21.4s, v1.4s
+        0x4F83982Cu, // fmul v12.4s, v1.4s, v3.s[2]
+        0x5F83182Eu, // fmla s14, s1, v3.s[2]
+        0x1F020C3Eu, // fmadd s30, s1, s2, s3  -> 4*2 + 1.5 = 9.5
+        Hlt(0),
+    };
+    ram.WriteBytes(code_addr, fp_code.data(), fp_code.size() * 4u);
+    HASEEB_CHECK(cpu.Run(1000) == VmError::Ok);
+    HASEEB_CHECK(std::fabs(st.v[15].f32[0] - 5.5f) < 1e-6f);
+    HASEEB_CHECK(std::fabs(st.v[17].f32[0] - 2.5f) < 1e-6f);
+    HASEEB_CHECK(std::fabs(st.v[19].f32[0] - (4.0f / 1.5f)) < 1e-5f);
+    HASEEB_CHECK(std::fabs(st.v[20].f32[0] - 16.0f) < 1e-6f);
+    HASEEB_CHECK(std::fabs(st.v[21].f32[0] - 2.0f) < 1e-6f);
+    HASEEB_CHECK(std::fabs(st.v[21].f32[3] - 5.0f) < 1e-6f);
+    HASEEB_CHECK(std::fabs(st.v[12].f32[1] - 27.0f) < 1e-6f);
+    HASEEB_CHECK(std::fabs(st.v[14].f32[0] - 13.0f) < 1e-6f);
+    HASEEB_CHECK(std::fabs(st.v[30].f32[0] - 9.5f) < 1e-6f);
+
+    // Phase 3: Vector FP 2D (verifying fixed sz = size & 1 bug!)
+    cpu.Reset(code_addr, kGuestRamBase + 0x80000ULL, 1);
+    st.v[1].f64[0] = 10.5; st.v[1].f64[1] = 20.5;
+    st.v[3].f64[0] = 2.5;  st.v[3].f64[1] = 4.0;
+    std::vector<uint32_t> fp64_code = {
+        0x4E63D430u, // fadd v16.2d, v1.2d, v3.2d
+        0x4EE3D432u, // fsub v18.2d, v1.2d, v3.2d
+        0x4FC3982Du, // fmul v13.2d, v1.2d, v3.d[1]
+        0x1E63683Fu, // fmaxnm d31, d1, d3
+        Hlt(0),
+    };
+    ram.WriteBytes(code_addr, fp64_code.data(), fp64_code.size() * 4u);
+    HASEEB_CHECK(cpu.Run(1000) == VmError::Ok);
+    HASEEB_CHECK(std::fabs(st.v[16].f64[0] - 13.0) < 1e-9);
+    HASEEB_CHECK(std::fabs(st.v[16].f64[1] - 24.5) < 1e-9);
+    HASEEB_CHECK(std::fabs(st.v[18].f64[0] - 8.0) < 1e-9);
+    HASEEB_CHECK(std::fabs(st.v[18].f64[1] - 16.5) < 1e-9);
+    HASEEB_CHECK(std::fabs(st.v[13].f64[0] - 42.0) < 1e-9);
+    HASEEB_CHECK(std::fabs(st.v[31].f64[0] - 10.5) < 1e-9);
+
+    std::cout << "[PASS] TestComprehensiveNeonFpAndCrc32\n";
+}
+
 } // namespace
 
 int main() {
@@ -655,6 +801,7 @@ int main() {
     TestLinkerNeonAndTrace();
     TestLoadStoreSimdStructAndBionicNeon();
     TestExtendedAdvSimdShiftAndMisc();
+    TestComprehensiveNeonFpAndCrc32();
     std::cout << "All M2 AArch64 CPU, DBT, MMU & Exception tests PASSED.\n";
     return 0;
 }

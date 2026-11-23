@@ -305,7 +305,7 @@ DecodedInsn TranslationCache::DecodeOne(uint32_t insn) {
 
     // 5. Data Processing — SIMD & Floating Point (bits[27:25] == 111)
     if ((insn & 0x0E000000u) == 0x0E000000u) {
-        if ((insn & 0x5F000000u) == 0x1E000000u) {
+        if ((insn & 0x5E000000u) == 0x1E000000u) {
             d.kind = InsnKind::FpScalar;
         } else {
             d.kind = InsnKind::NeonSimd;
