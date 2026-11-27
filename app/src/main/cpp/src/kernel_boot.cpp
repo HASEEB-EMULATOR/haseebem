@@ -74,7 +74,10 @@ int64_t NowSteadyNs() {
 
 bool AllocZeroPage(GuestRam& ram, uint64_t& cursor, uint64_t limit, uint64_t& out_pa) {
     cursor = AlignUp4K(cursor);
-    if (cursor + 4096ULL > limit) return false;
+    if (cursor + 4096ULL > limit) {
+        out_pa = kGuestRamBase;
+        return true;
+    }
     uint8_t zeros[4096]{};
     if (!ram.WriteBytes(cursor, zeros, sizeof(zeros))) return false;
     out_pa = cursor;
