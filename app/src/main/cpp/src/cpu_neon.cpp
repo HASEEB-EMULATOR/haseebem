@@ -1815,6 +1815,29 @@ bool AArch64CpuCore::ExecuteNeonSimd(uint32_t insn) {
             state_.v[rd] = out;
             return true;
         }
+        if (is_vec_misc && (opcode == 0x02u || opcode == 0x06u) && size < 3u) {
+            // SADDLP/UADDLP (opcode=0x02) and SADALP/UADALP (opcode=0x06)
+            const bool is_accum = (opcode == 0x06u);
+            const bool is_unsigned = (u == 1u);
+            if (is_accum) {
+                out = state_.v[rd];
+                if (!q) out.u64[1] = 0ULL;
+            }
+            const uint32_t dst_count = count / 2u;
+            for (uint32_t i = 0; i < dst_count; ++i) {
+                if (is_unsigned) {
+                    uint64_t sum = NeonGetLane(a, size, 2u * i) + NeonGetLane(a, size, 2u * i + 1u);
+                    if (is_accum) sum += NeonGetLane(out, size + 1u, i);
+                    NeonSetLane(out, size + 1u, i, sum);
+                } else {
+                    int64_t sum = NeonGetLaneSigned(a, size, 2u * i) + NeonGetLaneSigned(a, size, 2u * i + 1u);
+                    if (is_accum) sum += NeonGetLaneSigned(out, size + 1u, i);
+                    NeonSetLane(out, size + 1u, i, static_cast<uint64_t>(sum));
+                }
+            }
+            state_.v[rd] = out;
+            return true;
+        }
         if (is_vec_misc && opcode == 0x04u && size < 3u) {
             // CLS (u=0) / CLZ (u=1)
             auto clz_n = [](uint32_t val, uint32_t bits) -> uint32_t {

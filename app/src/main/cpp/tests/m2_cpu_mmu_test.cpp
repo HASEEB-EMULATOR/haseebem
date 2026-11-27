@@ -456,6 +456,9 @@ void TestLinkerNeonAndTrace() {
     code.push_back(0x0E043DADu); // UMOV W13, V13.S[0]
     code.push_back(0x0F10844Eu); // SHRN V14.4H, V2.4S, #16 (0xAABBCCDD >> 16 -> 0xAABB)
     code.push_back(0x0E023DCEu); // UMOV W14, V14.H[0]
+    code.push_back(0x6E202842u); // UADDLP V2.8H, V2.16B (exact trapped insn, rd == rn == 2)
+    code.push_back(0x6E60684Cu); // UADALP V12.4S, V2.8H (V12 was all 0)
+    code.push_back(0x0E043D8Fu); // UMOV W15, V12.S[0] -> (0xDD+0xCC)+(0xBB+0xAA) = 0x30E
     code.push_back(Hlt(0));
 
     ram.WriteBytes(code_addr, code.data(), code.size() * 4u);
@@ -471,6 +474,7 @@ void TestLinkerNeonAndTrace() {
     HASEEB_CHECK(cpu.State().x[11] == 0x11U);         // UMINV min byte
     HASEEB_CHECK(cpu.State().x[13] == 0xFFFFFFFFULL); // CMEQ #0
     HASEEB_CHECK(cpu.State().x[14] == 0xAABBULL);     // SHRN #16
+    HASEEB_CHECK(cpu.State().x[15] == 0x030EULL);     // UADDLP + UADALP
 
     const std::string trace = cpu.DumpRecentTrace(8);
     HASEEB_CHECK(!trace.empty());

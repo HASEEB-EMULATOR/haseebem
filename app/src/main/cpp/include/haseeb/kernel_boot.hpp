@@ -179,6 +179,7 @@ public:
         uint64_t current_brk = 0;
         uint64_t mmap_cursor = 0x0000001000000000ULL;
         std::vector<uint64_t> fb_mapped_pas;
+        std::vector<std::pair<uint64_t, uint64_t>> lazy_prot_none_ranges;
     };
 
     struct FdTable {
@@ -351,6 +352,7 @@ private:
                           std::string* out_note,
                           GuestStatMeta& out) const;
     bool LookupL3Pte(uint64_t va, uint64_t& out_l3_entry_pa, uint64_t& out_leaf) const;
+    bool RangeHasAnyMapping(uint64_t addr, uint64_t len) const;
     void UnmapRange4K(AArch64CpuCore& cpu, uint64_t addr, uint64_t len);
     bool ProtectRange4K(AArch64CpuCore& cpu, uint64_t addr, uint64_t len, bool r, bool w, bool x);
     int64_t OpenGuestPath(std::unordered_map<int, OpenFile>& fds,

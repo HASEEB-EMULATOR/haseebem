@@ -74,15 +74,43 @@ int64_t NowSteadyNs() {
 
 bool AllocZeroPage(GuestRam& ram, uint64_t& cursor, uint64_t limit, uint64_t& out_pa) {
     cursor = AlignUp4K(cursor);
-    if (cursor + 4096ULL > limit) {
-        out_pa = kGuestRamBase;
-        return true;
-    }
+    if (cursor + 4096ULL > limit) return false;
     uint8_t zeros[4096]{};
     if (!ram.WriteBytes(cursor, zeros, sizeof(zeros))) return false;
     out_pa = cursor;
     cursor += 4096ULL;
     return true;
+}
+
+void EraseVmRange(std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t start, uint64_t end) {
+    if (start >= end || ranges.empty()) return;
+    std::vector<std::pair<uint64_t, uint64_t>> next;
+    next.reserve(ranges.size());
+    for (const auto& r : ranges) {
+        if (r.second <= start || r.first >= end) {
+            next.push_back(r);
+        } else {
+            if (r.first < start) next.emplace_back(r.first, start);
+            if (r.second > end) next.emplace_back(end, r.second);
+        }
+    }
+    ranges.swap(next);
+}
+
+bool IsVaInVmRanges(const std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t va) {
+    for (const auto& r : ranges) {
+        if (va >= r.first && va < r.second) return true;
+    }
+    return false;
+}
+
+bool RangeOverlapsVmRanges(const std::vector<std::pair<uint64_t, uint64_t>>& ranges,
+                           uint64_t start,
+                           uint64_t end) {
+    for (const auto& r : ranges) {
+        if (start < r.second && end > r.first) return true;
+    }
+    return false;
 }
 
 std::string NormalizeGuestPath(const std::string& raw) {
@@ -1509,6 +1537,7 @@ bool LinuxGuestSupervisor::MapFreshAddressSpace(AArch64CpuCore& cpu,
         cur->vm->current_brk = current_brk_;
         cur->vm->mmap_cursor = mmap_cursor_;
         cur->vm->fb_mapped_pas.clear();
+        cur->vm->lazy_prot_none_ranges.clear();
     }
 
     const int32_t active_asid = CurrentTask() ? CurrentTask()->tgid : 1;
@@ -1780,17 +1809,85 @@ bool LinuxGuestSupervisor::LookupL3Pte(uint64_t va,
     return (out_leaf & 3ULL) == 3ULL;
 }
 
+bool LinuxGuestSupervisor::RangeHasAnyMapping(uint64_t addr, uint64_t len) const {
+    const uint64_t start = AlignDown4K(addr);
+    const uint64_t end = start + AlignUp4K(len);
+    if (end <= start) return true;
+    const GuestTask* cur = CurrentTask();
+    if (cur && cur->vm && RangeOverlapsVmRanges(cur->vm->lazy_prot_none_ranges, start, end)) {
+        return true;
+    }
+    if (ttbr0_pa_ == 0ULL) return false;
+
+    uint64_t va = start;
+    while (va < end) {
+        const uint64_t l1_idx = (va >> 30) & 0x1FFULL;
+        uint64_t d1 = 0;
+        if (!ram_.ReadU64(ttbr0_pa_ + l1_idx * 8ULL, d1) || (d1 & 3ULL) != 3ULL) {
+            const uint64_t next_1g = ((va >> 30) + 1ULL) << 30;
+            if (next_1g <= va || next_1g >= end) break;
+            va = next_1g;
+            continue;
+        }
+        const uint64_t l2_pa = d1 & 0x0000FFFFFFFFF000ULL;
+        const uint64_t l2_idx = (va >> 21) & 0x1FFULL;
+        uint64_t d2 = 0;
+        if (!ram_.ReadU64(l2_pa + l2_idx * 8ULL, d2) || (d2 & 3ULL) != 3ULL) {
+            const uint64_t next_2m = ((va >> 21) + 1ULL) << 21;
+            if (next_2m <= va || next_2m >= end) break;
+            va = next_2m;
+            continue;
+        }
+        const uint64_t l3_pa = d2 & 0x0000FFFFFFFFF000ULL;
+        const uint64_t l3_idx = (va >> 12) & 0x1FFULL;
+        uint64_t leaf = 0;
+        if (ram_.ReadU64(l3_pa + l3_idx * 8ULL, leaf) && (leaf & 3ULL) == 3ULL) {
+            return true;
+        }
+        va += 4096ULL;
+    }
+    return false;
+}
+
 void LinuxGuestSupervisor::UnmapRange4K(AArch64CpuCore& cpu, uint64_t addr, uint64_t len) {
     const uint64_t start = AlignDown4K(addr);
     const uint64_t end = start + AlignUp4K(len);
-    for (uint64_t va = start; va < end; va += 4096ULL) {
-        uint64_t entry_pa = 0, leaf = 0;
-        if (LookupL3Pte(va, entry_pa, leaf)) {
+    if (end <= start) return;
+    if (GuestTask* cur = CurrentTask(); cur && cur->vm) {
+        EraseVmRange(cur->vm->lazy_prot_none_ranges, start, end);
+    }
+    if (ttbr0_pa_ == 0ULL) return;
+
+    uint64_t va = start;
+    while (va < end) {
+        const uint64_t l1_idx = (va >> 30) & 0x1FFULL;
+        uint64_t d1 = 0;
+        if (!ram_.ReadU64(ttbr0_pa_ + l1_idx * 8ULL, d1) || (d1 & 3ULL) != 3ULL) {
+            const uint64_t next_1g = ((va >> 30) + 1ULL) << 30;
+            if (next_1g <= va || next_1g >= end) break;
+            va = next_1g;
+            continue;
+        }
+        const uint64_t l2_pa = d1 & 0x0000FFFFFFFFF000ULL;
+        const uint64_t l2_idx = (va >> 21) & 0x1FFULL;
+        uint64_t d2 = 0;
+        if (!ram_.ReadU64(l2_pa + l2_idx * 8ULL, d2) || (d2 & 3ULL) != 3ULL) {
+            const uint64_t next_2m = ((va >> 21) + 1ULL) << 21;
+            if (next_2m <= va || next_2m >= end) break;
+            va = next_2m;
+            continue;
+        }
+        const uint64_t l3_pa = d2 & 0x0000FFFFFFFFF000ULL;
+        const uint64_t l3_idx = (va >> 12) & 0x1FFULL;
+        const uint64_t entry_pa = l3_pa + l3_idx * 8ULL;
+        uint64_t leaf = 0;
+        if (ram_.ReadU64(entry_pa, leaf) && (leaf & 3ULL) == 3ULL) {
             const uint64_t old_pa = leaf & 0x0000FFFFFFFFF000ULL;
             ram_.WriteU64(entry_pa, 0ULL);
             cpu.Mmu().InvalidateVa(va, true, 0);
             cpu.Cache().InvalidatePhysPage(old_pa);
         }
+        va += 4096ULL;
     }
 }
 
@@ -1802,8 +1899,12 @@ bool LinuxGuestSupervisor::ProtectRange4K(AArch64CpuCore& cpu,
                                           bool x) {
     const uint64_t start = AlignDown4K(addr);
     const uint64_t end = start + AlignUp4K(len);
+    if (end <= start) return true;
     const bool el0_allow = (r || w || x);
-    for (uint64_t va = start; va < end; va += 4096ULL) {
+    GuestTask* cur = CurrentTask();
+
+    uint64_t va = start;
+    while (va < end) {
         uint64_t entry_pa = 0, leaf = 0;
         if (LookupL3Pte(va, entry_pa, leaf)) {
             const uint64_t pa = leaf & 0x0000FFFFFFFFF000ULL;
@@ -1814,7 +1915,45 @@ bool LinuxGuestSupervisor::ProtectRange4K(AArch64CpuCore& cpu,
             ram_.WriteU64(entry_pa, new_leaf);
             cpu.Mmu().InvalidateVa(va, true, 0);
             if (x) cpu.Cache().InvalidatePhysPage(pa);
+            va += 4096ULL;
+            continue;
         }
+
+        if (el0_allow && cur && cur->vm && IsVaInVmRanges(cur->vm->lazy_prot_none_ranges, va)) {
+            uint64_t new_pa = 0;
+            if (!AllocZeroPage(ram_, phys_cursor_, arena_limit_, new_pa)) return false;
+            if (!Elf64GuestLoader::MapPage4K(ram_, ttbr0_pa_, phys_cursor_, arena_limit_,
+                                             va, new_pa, el0_allow, w, x)) {
+                return false;
+            }
+            cpu.Mmu().InvalidateVa(va, true, 0);
+            if (x) cpu.Cache().InvalidatePhysPage(new_pa);
+            va += 4096ULL;
+            continue;
+        }
+
+        if (ttbr0_pa_ == 0ULL) break;
+        const uint64_t l1_idx = (va >> 30) & 0x1FFULL;
+        uint64_t d1 = 0;
+        if (!ram_.ReadU64(ttbr0_pa_ + l1_idx * 8ULL, d1) || (d1 & 3ULL) != 3ULL) {
+            const uint64_t next_1g = ((va >> 30) + 1ULL) << 30;
+            if (next_1g <= va || next_1g >= end) break;
+            va = next_1g;
+            continue;
+        }
+        const uint64_t l2_pa = d1 & 0x0000FFFFFFFFF000ULL;
+        const uint64_t l2_idx = (va >> 21) & 0x1FFULL;
+        uint64_t d2 = 0;
+        if (!ram_.ReadU64(l2_pa + l2_idx * 8ULL, d2) || (d2 & 3ULL) != 3ULL) {
+            const uint64_t next_2m = ((va >> 21) + 1ULL) << 21;
+            if (next_2m <= va || next_2m >= end) break;
+            va = next_2m;
+            continue;
+        }
+        va += 4096ULL;
+    }
+    if (el0_allow && cur && cur->vm) {
+        EraseVmRange(cur->vm->lazy_prot_none_ranges, start, end);
     }
     return true;
 }
@@ -4937,7 +5076,10 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 child->vm->ttbr0_pa = child_ttbr0;
                 child->vm->current_brk = current_brk_;
                 child->vm->mmap_cursor = mmap_cursor_;
-                if (cur->vm) child->vm->fb_mapped_pas = cur->vm->fb_mapped_pas;
+                if (cur->vm) {
+                    child->vm->fb_mapped_pas = cur->vm->fb_mapped_pas;
+                    child->vm->lazy_prot_none_ranges = cur->vm->lazy_prot_none_ranges;
+                }
             }
 
             if (share_files && cur->files) {
@@ -5094,19 +5236,9 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 mmap_cursor_ += len + 4096ULL;
             } else {
                 addr = AlignDown4K(addr);
-                if (!is_fixed) {
-                    bool overlaps = false;
-                    for (uint64_t va = addr; va < addr + len; va += 4096ULL) {
-                        uint64_t ep = 0, lf = 0;
-                        if (LookupL3Pte(va, ep, lf)) {
-                            overlaps = true;
-                            break;
-                        }
-                    }
-                    if (overlaps) {
-                        addr = mmap_cursor_;
-                        mmap_cursor_ += len + 4096ULL;
-                    }
+                if (!is_fixed && RangeHasAnyMapping(addr, len)) {
+                    addr = mmap_cursor_;
+                    mmap_cursor_ += len + 4096ULL;
                 }
                 if (addr >= 0x0000001000000000ULL && addr + len < 0x0000008000000000ULL &&
                     addr + len >= mmap_cursor_) {
@@ -5119,6 +5251,20 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             const bool w_perm = (prot & 2ULL) != 0;
             const bool x_perm = (prot & 4ULL) != 0;
             const bool el0_allow = (r_perm || w_perm || x_perm);
+
+            // Lazy PROT_NONE anonymous virtual reservation (e.g. Scudo/ART 8+ GiB guard arenas)
+            if (is_anon && !el0_allow) {
+                if (is_fixed) {
+                    UnmapRange4K(cpu, addr, len);
+                }
+                if (cur && cur->vm) {
+                    cur->vm->lazy_prot_none_ranges.emplace_back(addr, addr + len);
+                }
+                return static_cast<int64_t>(addr);
+            }
+            if (is_fixed && cur && cur->vm) {
+                EraseVmRange(cur->vm->lazy_prot_none_ranges, addr, addr + len);
+            }
 
             const bool is_fb_map = (fd_it != fds.end() && fd_it->second.is_framebuffer);
             const bool is_binder_map = (!is_anon && fd_it != fds.end() && fd_it->second.is_binder);
@@ -5198,10 +5344,12 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             const uint64_t prot = st.x[2];
             if ((addr & 0xFFFULL) != 0ULL) return -22;
             if (len == 0ULL) return 0;
-            ProtectRange4K(cpu, addr, len,
-                           (prot & 1ULL) != 0ULL,
-                           (prot & 2ULL) != 0ULL,
-                           (prot & 4ULL) != 0ULL);
+            if (!ProtectRange4K(cpu, addr, len,
+                                (prot & 1ULL) != 0ULL,
+                                (prot & 2ULL) != 0ULL,
+                                (prot & 4ULL) != 0ULL)) {
+                return -12; // ENOMEM
+            }
             return 0;
         }
         case 227: // msync
@@ -5374,14 +5522,17 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             return 0;
         case 120: case 140:
             return 0;
-        case 123: { // sched_getaffinity
+        case 123: { // sched_getaffinity(pid, cpusetsize, mask)
+            const uint64_t mask_len = st.x[1];
             const uint64_t mask_uva = st.x[2];
-            if (mask_uva != 0ULL) {
-                uint8_t mask[16];
-                for (int i = 0; i < 16; ++i) mask[i] = 0xFF;
-                if (!WriteUserBytes(cpu, mask_uva, mask, sizeof(mask))) return -14;
+            if (mask_len < 8ULL) return -22; // EINVAL
+            const size_t zero_len = static_cast<size_t>(std::min<uint64_t>(mask_len, 128ULL));
+            std::vector<uint8_t> mask(zero_len, 0u);
+            mask[0] = 0x0Fu; // 4 virtual CPUs (matches /proc/cpuinfo)
+            if (mask_uva != 0ULL && !WriteUserBytes(cpu, mask_uva, mask.data(), mask.size())) {
+                return -14;
             }
-            return 16;
+            return static_cast<int64_t>(std::min<uint64_t>(mask_len, 8ULL));
         }
         case 275: { // sched_getattr
             const uint64_t attr_uva = st.x[1];
