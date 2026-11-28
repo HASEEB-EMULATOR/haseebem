@@ -1622,8 +1622,8 @@ bool LinuxGuestSupervisor::ResolveVfsFile(const std::string& path,
             if (norm == "/fstab." + hw || norm == "/fstab.virt") {
                 const std::string fstab_text =
                     "# Haseeb Virtual ARM64 Board default fstab\n"
-                    "/dev/block/vda /system ext4 ro,noatime wait,first_stage_mount,avb\n"
-                    "/dev/block/vda /vendor ext4 ro,noatime wait,first_stage_mount,avb\n"
+                    "/dev/block/vda /system ext4 ro,noatime wait,first_stage_mount\n"
+                    "/dev/block/vda /vendor ext4 ro,noatime wait,first_stage_mount\n"
                     "/dev/block/vda /data ext4 noatime,nosuid,nodev,noauto_da_alloc,errors=panic wait\n";
                 out_data.assign(fstab_text.begin(), fstab_text.end());
                 return finish_ok();
