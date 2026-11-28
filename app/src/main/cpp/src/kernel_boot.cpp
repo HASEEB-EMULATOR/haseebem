@@ -65,6 +65,9 @@ struct Elf64Phdr {
 
 uint64_t AlignDown4K(uint64_t v) { return v & ~0xFFFULL; }
 uint64_t AlignUp4K(uint64_t v) { return (v + 0xFFFULL) & ~0xFFFULL; }
+uint64_t UntagUserVa(uint64_t va) {
+    return ((va & (1ULL << 55)) == 0ULL) ? (va & 0x00FFFFFFFFFFFFFFULL) : va;
+}
 
 int64_t NowSteadyNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -138,6 +141,19 @@ std::string NormalizeGuestPath(const std::string& raw) {
         clean += p;
     }
     return clean;
+}
+
+bool IsWritableGuestOverlayPath(const std::string& norm) {
+    static constexpr const char* kPrefixes[] = {
+        "/dev", "/data", "/mnt", "/acct", "/cache", "/metadata",
+        "/linkerconfig", "/tmp", "/var", "/apex", "/debug_ramdisk", "/config"
+    };
+    for (const char* p : kPrefixes) {
+        const size_t plen = std::strlen(p);
+        if (norm == p) return true;
+        if (norm.size() > plen && norm.compare(0, plen, p) == 0 && norm[plen] == '/') return true;
+    }
+    return false;
 }
 
 std::string ParentDirOf(const std::string& norm) {
@@ -1194,6 +1210,11 @@ bool LinuxGuestSupervisor::ResolveSymlinkTarget(
     if (ResolveProcSymlinkTarget(fds, norm_path, out_target)) {
         return true;
     }
+    auto link_it = runtime_symlinks_.find(norm_path);
+    if (link_it != runtime_symlinks_.end() && !link_it->second.empty()) {
+        out_target = link_it->second;
+        return true;
+    }
     if (norm_path.size() > 1u) {
         const std::string rel = norm_path.substr(1);
         if (const CpioEntry* ce = CpioArchive::FindEntry(initramfs_, rel)) {
@@ -1344,6 +1365,34 @@ bool LinuxGuestSupervisor::ResolveVfsFile(const std::string& path,
 
         if (GuestVfsBridge::TryResolveSpecialVfs(norm, shared_storage_root_, hardware_, prop_mgr_,
                                                  ram_bytes_, out_data, out_is_dir, out_children)) {
+            return finish_ok();
+        }
+
+        if (auto sl = runtime_symlinks_.find(norm); sl != runtime_symlinks_.end() && !sl->second.empty()) {
+            const std::string& target = sl->second;
+            norm = (target.front() == '/')
+                       ? NormalizeGuestPath(target)
+                       : NormalizeGuestPath(ParentDirOf(norm) + "/" + target);
+            continue;
+        }
+        if (auto rf = runtime_files_.find(norm); rf != runtime_files_.end()) {
+            out_data = rf->second;
+            return finish_ok();
+        }
+        if (runtime_dirs_.find(norm) != runtime_dirs_.end()) {
+            out_is_dir = true;
+            const std::string prefix = (norm == "/") ? "/" : (norm + "/");
+            auto collect_child = [&](const std::string& p) {
+                if (p.size() > prefix.size() && p.compare(0, prefix.size(), prefix) == 0) {
+                    const std::string tail = p.substr(prefix.size());
+                    if (!tail.empty() && tail.find('/') == std::string::npos) {
+                        out_children.push_back(tail);
+                    }
+                }
+            };
+            for (const auto& d : runtime_dirs_) collect_child(d);
+            for (const auto& f : runtime_files_) collect_child(f.first);
+            for (const auto& s : runtime_symlinks_) collect_child(s.first);
             return finish_ok();
         }
 
@@ -1538,6 +1587,7 @@ bool LinuxGuestSupervisor::MapFreshAddressSpace(AArch64CpuCore& cpu,
         cur->vm->mmap_cursor = mmap_cursor_;
         cur->vm->fb_mapped_pas.clear();
         cur->vm->lazy_prot_none_ranges.clear();
+        cur->vm->tagged_addr_ctrl = 0ULL;
     }
 
     const int32_t active_asid = CurrentTask() ? CurrentTask()->tgid : 1;
@@ -1551,7 +1601,7 @@ bool LinuxGuestSupervisor::MapFreshAddressSpace(AArch64CpuCore& cpu,
     st.sys.vbar_el1 = vbar_pa_;
     st.sys.ttbr0_el1 = (ttbr0_pa_ & 0x0000FFFFFFFFF000ULL) |
                        (static_cast<uint64_t>(active_asid & 0xFFFFu) << 48);
-    st.sys.tcr_el1 = 25ULL | (1ULL << 23); // T0SZ=25 (39-bit VA, 4K), EPD1=1
+    st.sys.tcr_el1 = 25ULL | (1ULL << 23) | (1ULL << 37); // T0SZ=25 (39-bit VA, 4K), EPD1=1, TBI0=1
     st.sys.mair_el1 = 0xFFULL;
     st.sys.cpacr_el1 = (3ULL << 20);
     st.sys.sctlr_el1 = 0x30D00801ULL; // MMU enabled (M=1)
@@ -1587,6 +1637,9 @@ VmError LinuxGuestSupervisor::PrepareBoot(AArch64CpuCore& cpu,
     syscall_head_ = 0;
     syscall_total_ = 0;
     logged_enosys_.clear();
+    runtime_dirs_.clear();
+    runtime_symlinks_.clear();
+    runtime_files_.clear();
     CloseAllOpenFds();
     tasks_.clear();
     current_task_idx_ = 0;
@@ -1795,6 +1848,7 @@ bool LinuxGuestSupervisor::LookupL3Pte(uint64_t va,
                                        uint64_t& out_l3_entry_pa,
                                        uint64_t& out_leaf) const {
     if (ttbr0_pa_ == 0ULL) return false;
+    va = UntagUserVa(va);
     const uint64_t l1_idx = (va >> 30) & 0x1FFULL;
     const uint64_t l2_idx = (va >> 21) & 0x1FFULL;
     const uint64_t l3_idx = (va >> 12) & 0x1FFULL;
@@ -1810,7 +1864,7 @@ bool LinuxGuestSupervisor::LookupL3Pte(uint64_t va,
 }
 
 bool LinuxGuestSupervisor::RangeHasAnyMapping(uint64_t addr, uint64_t len) const {
-    const uint64_t start = AlignDown4K(addr);
+    const uint64_t start = AlignDown4K(UntagUserVa(addr));
     const uint64_t end = start + AlignUp4K(len);
     if (end <= start) return true;
     const GuestTask* cur = CurrentTask();
@@ -1850,7 +1904,7 @@ bool LinuxGuestSupervisor::RangeHasAnyMapping(uint64_t addr, uint64_t len) const
 }
 
 void LinuxGuestSupervisor::UnmapRange4K(AArch64CpuCore& cpu, uint64_t addr, uint64_t len) {
-    const uint64_t start = AlignDown4K(addr);
+    const uint64_t start = AlignDown4K(UntagUserVa(addr));
     const uint64_t end = start + AlignUp4K(len);
     if (end <= start) return;
     if (GuestTask* cur = CurrentTask(); cur && cur->vm) {
@@ -1897,7 +1951,7 @@ bool LinuxGuestSupervisor::ProtectRange4K(AArch64CpuCore& cpu,
                                           bool r,
                                           bool w,
                                           bool x) {
-    const uint64_t start = AlignDown4K(addr);
+    const uint64_t start = AlignDown4K(UntagUserVa(addr));
     const uint64_t end = start + AlignUp4K(len);
     if (end <= start) return true;
     const bool el0_allow = (r || w || x);
@@ -2138,16 +2192,49 @@ int64_t LinuxGuestSupervisor::OpenGuestPath(std::unordered_map<int, OpenFile>& f
     bool is_dir = false;
     std::vector<std::string> children;
     std::string resolved_path;
-    if (!ResolveVfsFile(norm, data, is_dir, children, &resolved_path, &fds)) return -2; // ENOENT
+    const bool found_vfs = ResolveVfsFile(norm, data, is_dir, children, &resolved_path, &fds);
+    if (!found_vfs) {
+        if ((flags & 0100ULL /* O_CREAT */) != 0ULL && IsWritableGuestOverlayPath(norm)) {
+            if (check_access_only) return 0;
+            auto& stored = runtime_files_[norm];
+            stored.clear();
+            int fd = next_fd++;
+            OpenFile of;
+            of.path = norm;
+            of.fd_flags = cloexec;
+            of.nonblock = nonblock;
+            of.is_writable_mem = true;
+            of.is_runtime_vfs = true;
+            of.st_dev = 3ULL;
+            of.st_ino = ComputeGuestInode(norm);
+            fds.emplace(fd, std::move(of));
+            return fd;
+        }
+        return -2; // ENOENT
+    }
     if (check_access_only) return 0;
     if ((flags & 0200000ULL /* O_DIRECTORY */) != 0ULL && !is_dir) return -20; // ENOTDIR
+    const std::string eff_path = resolved_path.empty() ? norm : resolved_path;
+    const bool overlay_writable = !is_dir && IsWritableGuestOverlayPath(eff_path);
+    const bool open_for_write = ((flags & 3ULL) != 0ULL) || ((flags & 01000ULL) != 0ULL);
+    if (overlay_writable && ((flags & 01000ULL /* O_TRUNC */) != 0ULL)) {
+        data.clear();
+        runtime_files_[eff_path].clear();
+    } else if (overlay_writable && open_for_write && runtime_files_.find(eff_path) == runtime_files_.end()) {
+        runtime_files_[eff_path] = data;
+    }
     int fd = next_fd++;
     OpenFile of;
-    of.path = resolved_path.empty() ? norm : resolved_path;
+    of.path = eff_path;
     of.data = std::move(data);
     of.fd_flags = cloexec;
     of.is_dir = is_dir;
     of.nonblock = nonblock;
+    of.is_writable_mem = overlay_writable || (runtime_files_.find(eff_path) != runtime_files_.end());
+    of.is_runtime_vfs = of.is_writable_mem;
+    if ((flags & 02000ULL /* O_APPEND */) != 0ULL && of.is_writable_mem) {
+        of.offset = of.data.size();
+    }
     of.dir_children = std::move(children);
     of.st_dev = IsGuestCharDevicePath(of.path) ? 2ULL : 1ULL;
     of.st_ino = ComputeGuestInode(of.path);
@@ -2732,7 +2819,13 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             if (!ReadUserString(cpu, st.x[1], path)) return -14;
             if (!ResolveGuestPathWithDirfd(fds, static_cast<int>(st.x[0]), path, norm)) return -9;
             std::string host_path, rel;
-            if (!ResolveHostStoragePath(norm, host_path, rel)) return -13; // EACCES
+            if (!ResolveHostStoragePath(norm, host_path, rel)) {
+                if (IsWritableGuestOverlayPath(norm)) {
+                    runtime_dirs_.insert(norm);
+                    return 0;
+                }
+                return -13; // EACCES
+            }
             GuestVfsBridge::EnsureDirectoryTree(shared_storage_root_);
             if (::mkdir(host_path.c_str(), static_cast<mode_t>(st.x[2] ? st.x[2] : 0755)) != 0) {
                 if (errno == EEXIST) return 0;
@@ -2745,12 +2838,34 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             if (!ReadUserString(cpu, st.x[1], path)) return -14;
             if (!ResolveGuestPathWithDirfd(fds, static_cast<int>(st.x[0]), path, norm)) return -9;
             std::string host_path, rel;
-            if (!ResolveHostStoragePath(norm, host_path, rel) || rel.empty()) return -13;
+            if (!ResolveHostStoragePath(norm, host_path, rel) || rel.empty()) {
+                if (IsWritableGuestOverlayPath(norm)) {
+                    const bool rm_dir = (st.x[2] & 0x200ULL) != 0ULL;
+                    if (rm_dir) {
+                        if (runtime_dirs_.erase(norm) > 0u) return 0;
+                    } else {
+                        if (runtime_files_.erase(norm) > 0u || runtime_symlinks_.erase(norm) > 0u) return 0;
+                    }
+                    return -2; // ENOENT
+                }
+                return -13;
+            }
             const bool rm_dir = (st.x[2] & 0x200ULL) != 0ULL; // AT_REMOVEDIR
             const int rc = rm_dir ? ::rmdir(host_path.c_str()) : ::unlink(host_path.c_str());
             return (rc == 0) ? 0 : -static_cast<int64_t>(errno);
         }
-        case 38: { // renameat(olddirfd, oldpath, newdirfd, newpath)
+        case 36: { // symlinkat(target, newdirfd, linkpath)
+            std::string target, linkp, norm;
+            if (!ReadUserString(cpu, st.x[0], target) || !ReadUserString(cpu, st.x[2], linkp)) return -14;
+            if (!ResolveGuestPathWithDirfd(fds, static_cast<int>(st.x[1]), linkp, norm)) return -9;
+            if (IsWritableGuestOverlayPath(norm)) {
+                runtime_symlinks_[norm] = target;
+                return 0;
+            }
+            return 0;
+        }
+        case 38:   // renameat(olddirfd, oldpath, newdirfd, newpath)
+        case 276: { // renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
             std::string old_p, new_p, old_norm, new_norm;
             if (!ReadUserString(cpu, st.x[1], old_p) ||
                 !ReadUserString(cpu, st.x[3], new_p)) return -14;
@@ -2761,6 +2876,20 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             std::string h_old, r_old, h_new, r_new;
             if (!ResolveHostStoragePath(old_norm, h_old, r_old) ||
                 !ResolveHostStoragePath(new_norm, h_new, r_new)) {
+                if (auto rf = runtime_files_.find(old_norm); rf != runtime_files_.end()) {
+                    runtime_files_[new_norm] = std::move(rf->second);
+                    runtime_files_.erase(rf);
+                    return 0;
+                }
+                if (auto sl = runtime_symlinks_.find(old_norm); sl != runtime_symlinks_.end()) {
+                    runtime_symlinks_[new_norm] = std::move(sl->second);
+                    runtime_symlinks_.erase(sl);
+                    return 0;
+                }
+                if (runtime_dirs_.erase(old_norm) > 0u) {
+                    runtime_dirs_.insert(new_norm);
+                    return 0;
+                }
                 return -18; // EXDEV
             }
             return (::rename(h_old.c_str(), h_new.c_str()) == 0) ? 0 : -static_cast<int64_t>(errno);
@@ -2813,10 +2942,11 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             int fd = static_cast<int>(st.x[0]);
             auto it = fds.find(fd);
             if (it == fds.end()) return -9;
-            if (it->second.is_memfd || it->second.is_ashmem) {
+            if (it->second.is_memfd || it->second.is_ashmem || it->second.is_writable_mem) {
                 const size_t new_len = static_cast<size_t>(std::min<uint64_t>(st.x[1], 64ULL * 1024ULL * 1024ULL));
                 it->second.data.resize(new_len, 0u);
                 if (it->second.is_ashmem) it->second.ashmem_size = new_len;
+                if (it->second.is_runtime_vfs) runtime_files_[it->second.path] = it->second.data;
                 return 0;
             }
             if (it->second.host_fd < 0) return -9;
@@ -3425,11 +3555,12 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 if (w > 0) WakePollWaiters();
                 return (w >= 0) ? static_cast<int64_t>(w) : -static_cast<int64_t>(errno);
             }
-            if (it->second.is_memfd || it->second.is_ashmem) {
+            if (it->second.is_memfd || it->second.is_ashmem || it->second.is_writable_mem) {
                 const size_t end = it->second.offset + count;
                 if (end > it->second.data.size()) it->second.data.resize(end, 0u);
                 if (count > 0u) std::memcpy(it->second.data.data() + it->second.offset, tmp.data(), count);
                 it->second.offset = end;
+                if (it->second.is_runtime_vfs) runtime_files_[it->second.path] = it->second.data;
                 return static_cast<int64_t>(count);
             }
             if (it->second.is_snd_play && snd_ != nullptr) {
@@ -3598,11 +3729,12 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                         if (w < 0) return total > 0 ? total : -static_cast<int64_t>(errno);
                         if (w > 0) WakePollWaiters();
                         total += static_cast<int64_t>(w);
-                    } else if (it->second.is_memfd || it->second.is_ashmem) {
+                    } else if (it->second.is_memfd || it->second.is_ashmem || it->second.is_writable_mem) {
                         const size_t end = it->second.offset + tmp.size();
                         if (end > it->second.data.size()) it->second.data.resize(end, 0u);
                         std::memcpy(it->second.data.data() + it->second.offset, tmp.data(), tmp.size());
                         it->second.offset = end;
+                        if (it->second.is_runtime_vfs) runtime_files_[it->second.path] = it->second.data;
                         total += static_cast<int64_t>(tmp.size());
                     } else {
                         return -9;
@@ -3646,10 +3778,11 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 ssize_t w = ::pwrite(it->second.host_fd, tmp.data(), count, static_cast<off_t>(off));
                 return (w >= 0) ? static_cast<int64_t>(w) : -static_cast<int64_t>(errno);
             }
-            if (it->second.is_memfd) {
+            if (it->second.is_memfd || it->second.is_writable_mem) {
                 const size_t end = static_cast<size_t>(off) + count;
                 if (end > it->second.data.size()) it->second.data.resize(end, 0u);
                 if (count > 0) std::memcpy(it->second.data.data() + static_cast<size_t>(off), tmp.data(), count);
+                if (it->second.is_runtime_vfs) runtime_files_[it->second.path] = it->second.data;
                 return static_cast<int64_t>(count);
             }
             return -9;
@@ -4212,6 +4345,13 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             if (opt == 40ULL /* PR_GET_TID_ADDRESS */ && st.x[1] != 0ULL) {
                 uint64_t tidptr = cur ? cur->clear_child_tid : 0ULL;
                 return WriteUserBytes(cpu, st.x[1], &tidptr, sizeof(tidptr)) ? 0 : -14;
+            }
+            if (opt == 55ULL /* PR_SET_TAGGED_ADDR_CTRL */) {
+                if (cur && cur->vm) cur->vm->tagged_addr_ctrl = (st.x[1] & 0x7ULL);
+                return 0;
+            }
+            if (opt == 56ULL /* PR_GET_TAGGED_ADDR_CTRL */) {
+                return (cur && cur->vm) ? static_cast<int64_t>(cur->vm->tagged_addr_ctrl) : 0;
             }
             return 0;
         }
@@ -4972,7 +5112,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             return -88;
         }
         case 214: { // brk(addr)
-            uint64_t req = st.x[0];
+            uint64_t req = UntagUserVa(st.x[0]);
             if (req == 0ULL || req <= current_brk_) return static_cast<int64_t>(current_brk_);
             uint64_t end_pg = AlignUp4K(req);
             for (uint64_t va = current_brk_; va < end_pg; va += 4096ULL) {
@@ -4988,14 +5128,14 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             return static_cast<int64_t>(req);
         }
         case 215: { // munmap(addr, len)
-            const uint64_t addr = st.x[0];
+            const uint64_t addr = UntagUserVa(st.x[0]);
             const uint64_t len = AlignUp4K(st.x[1]);
             if ((addr & 0xFFFULL) != 0ULL || len == 0ULL) return -22;
             UnmapRange4K(cpu, addr, len);
             return 0;
         }
         case 216: { // mremap(old_address, old_size, new_size, flags, ...)
-            const uint64_t old_addr = st.x[0];
+            const uint64_t old_addr = UntagUserVa(st.x[0]);
             const uint64_t old_sz = AlignUp4K(st.x[1]);
             const uint64_t new_sz = AlignUp4K(st.x[2]);
             const uint64_t mflags = st.x[3];
@@ -5079,6 +5219,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 if (cur->vm) {
                     child->vm->fb_mapped_pas = cur->vm->fb_mapped_pas;
                     child->vm->lazy_prot_none_ranges = cur->vm->lazy_prot_none_ranges;
+                    child->vm->tagged_addr_ctrl = cur->vm->tagged_addr_ctrl;
                 }
             }
 
@@ -5107,7 +5248,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 } else if (child->vm && child->vm->ttbr0_pa != 0ULL) {
                     const auto* bytes = reinterpret_cast<const uint8_t*>(&cpid);
                     for (size_t b = 0; b < sizeof(cpid); ++b) {
-                        const uint64_t va = st.x[4] + b;
+                        const uint64_t va = UntagUserVa(st.x[4]) + b;
                         uint64_t d1 = 0, d2 = 0, leaf = 0;
                         const uint64_t l1_idx = (va >> 30) & 0x1FFULL;
                         const uint64_t l2_idx = (va >> 21) & 0x1FFULL;
@@ -5216,7 +5357,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             return 0;
         }
         case 222: { // mmap(addr, length, prot, flags, fd, offset)
-            uint64_t addr = st.x[0];
+            uint64_t addr = UntagUserVa(st.x[0]);
             const uint64_t len = AlignUp4K(st.x[1]);
             const uint64_t prot = st.x[2];
             const uint64_t mflags = st.x[3];
@@ -5339,7 +5480,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             return static_cast<int64_t>(addr);
         }
         case 226: { // mprotect(addr, len, prot)
-            const uint64_t addr = st.x[0];
+            const uint64_t addr = UntagUserVa(st.x[0]);
             const uint64_t len = st.x[1];
             const uint64_t prot = st.x[2];
             if ((addr & 0xFFFULL) != 0ULL) return -22;
@@ -5516,9 +5657,10 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             }
             return 0;
         }
-        case 39: case 40: case 51:
-        case 119: case 122: case 141: case 154: case 158: case 159:
-        case 161: case 162: case 233: case 274:
+        case 32: case 33: case 37: case 39: case 40: case 51:
+        case 52: case 53: case 54: case 55: case 81: case 88:
+        case 119: case 122: case 141: case 151: case 152: case 154:
+        case 158: case 159: case 161: case 162: case 233: case 274:
             return 0;
         case 120: case 140:
             return 0;

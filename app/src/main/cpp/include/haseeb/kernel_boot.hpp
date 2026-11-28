@@ -155,6 +155,7 @@ public:
         bool ashmem_pinned = true;
         std::shared_ptr<std::vector<uint64_t>> shared_pages;
         bool is_writable_mem = false;
+        bool is_runtime_vfs = false;
         bool is_dev_null = false;
         bool is_dev_zero = false;
         bool is_dev_urandom = false;
@@ -180,6 +181,7 @@ public:
         uint64_t mmap_cursor = 0x0000001000000000ULL;
         std::vector<uint64_t> fb_mapped_pas;
         std::vector<std::pair<uint64_t, uint64_t>> lazy_prot_none_ranges;
+        uint64_t tagged_addr_ctrl = 0;
     };
 
     struct FdTable {
@@ -434,6 +436,9 @@ private:
     size_t syscall_head_ = 0;
     uint64_t syscall_total_ = 0;
     std::unordered_set<uint64_t> logged_enosys_;
+    std::unordered_set<std::string> runtime_dirs_;
+    std::unordered_map<std::string, std::string> runtime_symlinks_;
+    std::unordered_map<std::string, std::vector<uint8_t>> runtime_files_;
 };
 
 } // namespace haseeb::vm

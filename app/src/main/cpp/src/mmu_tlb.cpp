@@ -41,6 +41,20 @@ MmuFaultStatus PermissionFaultForLevel(int level) {
     }
 }
 
+inline uint64_t CanonicalizeVa(const CpuState& cpu, uint64_t va) {
+    const uint64_t tcr = cpu.sys.tcr_el1;
+    if ((va & (1ULL << 55)) == 0ULL) {
+        if ((tcr & kTcrTbi0) != 0ULL) {
+            return va & 0x00FFFFFFFFFFFFFFULL;
+        }
+    } else {
+        if ((tcr & kTcrTbi1) != 0ULL) {
+            return va | 0xFF00000000000000ULL;
+        }
+    }
+    return va;
+}
+
 } // namespace
 
 Arm64Mmu::Arm64Mmu(GuestRam& ram) : ram_(ram) {}
@@ -71,6 +85,9 @@ void Arm64Mmu::InvalidateAsid(uint16_t asid) {
 }
 
 void Arm64Mmu::InvalidateVa(uint64_t va, bool all_asids, uint16_t asid) {
+    if ((va & (1ULL << 55)) == 0ULL) {
+        va &= 0x00FFFFFFFFFFFFFFULL;
+    }
     // Check both 4K and 16K granularity tags safely by invalidating matching sets
     for (auto& e : tlb_) {
         if (!e.valid) continue;
@@ -96,11 +113,12 @@ MmuTranslationResult Arm64Mmu::Translate(CpuState& cpu,
         return res;
     }
 
-    const uint16_t asid = CurrentAsid(cpu, va);
+    const uint64_t cva = CanonicalizeVa(cpu, va);
+    const uint16_t asid = CurrentAsid(cpu, cva);
     // Probe software TLB (index with 12-bit page shift so both 4K and 16K pages distribute cleanly)
-    const size_t idx = static_cast<size_t>((va >> 12) & (kTlbSets - 1u));
+    const size_t idx = static_cast<size_t>((cva >> 12) & (kTlbSets - 1u));
     const SoftTlbEntry& e = tlb_[idx];
-    if (e.valid && e.epoch == epoch_ && (va & e.va_page_mask) == e.va_tag &&
+    if (e.valid && e.epoch == epoch_ && (cva & e.va_page_mask) == e.va_tag &&
         (e.global || e.asid == asid)) {
         bool perm_ok = false;
         if (access == MemAccessType::Read) {
@@ -113,7 +131,7 @@ MmuTranslationResult Arm64Mmu::Translate(CpuState& cpu,
 
         if (perm_ok) {
             ++tlb_hits_;
-            const uint64_t page_off = va & ~e.va_page_mask;
+            const uint64_t page_off = cva & ~e.va_page_mask;
             MmuTranslationResult res;
             res.ok = true;
             res.phys_addr = e.pa_page | page_off;
@@ -126,7 +144,7 @@ MmuTranslationResult Arm64Mmu::Translate(CpuState& cpu,
     }
 
     ++tlb_misses_;
-    return WalkStage1(cpu, va, access, is_el1_access);
+    return WalkStage1(cpu, cva, access, is_el1_access);
 }
 
 MmuTranslationResult Arm64Mmu::WalkStage1(CpuState& cpu,
@@ -134,6 +152,7 @@ MmuTranslationResult Arm64Mmu::WalkStage1(CpuState& cpu,
                                           MemAccessType access,
                                           bool is_el1_access) {
     MmuTranslationResult fail;
+    va = CanonicalizeVa(cpu, va);
     const uint64_t tcr = cpu.sys.tcr_el1;
     const bool is_upper = (va & (1ULL << 63)) != 0;
 

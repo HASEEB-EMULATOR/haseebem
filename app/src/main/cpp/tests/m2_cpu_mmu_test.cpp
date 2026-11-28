@@ -306,6 +306,19 @@ void TestStage1Mmu4KAnd16KPlusDirtyAccessed() {
     uint64_t par = cpu.Mmu().AddressTranslateForPar(cpu.State(), 0x4000ULL, false, false);
     HASEEB_CHECK((par & 1ULL) == 0 && (par & 0x0000FFFFFFFFF000ULL) == pa_16k);
 
+    // ---- Test 3: Top Byte Ignore (TBI0, bit 37) for tagged EL0/EL1 pointers ----
+    const uint64_t tagged_va = 0xB400000000004123ULL;
+    auto r_no_tbi = cpu.Mmu().Translate(cpu.State(), tagged_va, MemAccessType::Read, true);
+    HASEEB_CHECK(!r_no_tbi.ok && r_no_tbi.fault_status == MmuFaultStatus::TranslationL0);
+
+    cpu.State().sys.tcr_el1 |= (1ULL << 37); // Enable TBI0
+    auto r_tbi = cpu.Mmu().Translate(cpu.State(), tagged_va, MemAccessType::Read, true);
+    HASEEB_CHECK(r_tbi.ok && r_tbi.phys_addr == pa_16k + 0x123ULL);
+    const uint64_t tbi_hits_before = cpu.Mmu().TlbHits();
+    auto r_tbi_diff_tag = cpu.Mmu().Translate(cpu.State(), 0x4200000000004200ULL, MemAccessType::Read, true);
+    HASEEB_CHECK(r_tbi_diff_tag.ok && r_tbi_diff_tag.phys_addr == pa_16k + 0x200ULL &&
+                 cpu.Mmu().TlbHits() == tbi_hits_before + 1);
+
     std::cout << "[PASS] TestStage1Mmu4KAnd16KPlusDirtyAccessed\n";
 }
 
