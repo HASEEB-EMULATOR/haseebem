@@ -1597,6 +1597,22 @@ bool LinuxGuestSupervisor::ResolveVfsFile(const std::string& path,
             if (followed_link) continue;
             if (norm == "/system" && try_ext4("/")) return finish_ok();
             if (followed_link) continue;
+            if (norm.rfind("/vendor/", 0) == 0) {
+                if (try_ext4("/system/vendor/" + norm.substr(8))) return finish_ok();
+                if (followed_link) continue;
+            }
+            if (norm.rfind("/product/", 0) == 0) {
+                if (try_ext4("/system/product/" + norm.substr(9))) return finish_ok();
+                if (followed_link) continue;
+            }
+            if (norm.rfind("/system_ext/", 0) == 0) {
+                if (try_ext4("/system/system_ext/" + norm.substr(12))) return finish_ok();
+                if (followed_link) continue;
+            }
+            if (norm.rfind("/odm/", 0) == 0) {
+                if (try_ext4("/system/odm/" + norm.substr(5))) return finish_ok();
+                if (followed_link) continue;
+            }
         }
         // 3. Fallback default fstab for system-as-root init FirstStageMount when absent from image/DT
         if (norm.rfind("/fstab.", 0) == 0) {
@@ -6140,7 +6156,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             }
             return 0;
         }
-        case 32: case 33: case 37: case 39: case 40: case 51:
+        case 32: case 33: case 37: case 39: case 40: case 41: case 51:
         case 52: case 53: case 54: case 55: case 81: case 88:
         case 119: case 122: case 151: case 152: case 154:
         case 158: case 159: case 161: case 162: case 267: case 274:
