@@ -184,11 +184,15 @@ bool FdtBuilder::Build(const FdtBuildParams& params,
     }
     w.EndNode();
 
-    // /firmware/android (identifies Android DT root; fstab intentionally supplied via /fstab.<hw>)
+    // /firmware/android (identifies Android DT root and vbmeta compatibility for FirstStageMount)
     w.BeginNode("firmware");
     w.BeginNode("android");
     w.PropString("compatible", "android,firmware");
     w.PropString("name", "android");
+    w.BeginNode("vbmeta");
+    w.PropString("compatible", "android,vbmeta");
+    w.PropString("parts", "vbmeta,boot,system,vendor");
+    w.EndNode();
     w.EndNode();
     w.EndNode();
 
