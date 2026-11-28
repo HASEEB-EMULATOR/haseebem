@@ -240,7 +240,7 @@ bool GuestVfsBridge::TryResolveSpecialVfs(const std::string& norm_path,
     }
     if (norm_path == "/proc/device-tree/firmware/android") {
         out_is_dir = true;
-        out_children = {"compatible", "name"};
+        out_children = {"compatible", "name", "vbmeta"};
         return true;
     }
     if (norm_path == "/proc/device-tree/firmware/android/compatible") {
@@ -251,6 +251,26 @@ bool GuestVfsBridge::TryResolveSpecialVfs(const std::string& norm_path,
     if (norm_path == "/proc/device-tree/firmware/android/name") {
         static constexpr char kFwName[] = "android\0";
         out_data.assign(kFwName, kFwName + sizeof(kFwName));
+        return true;
+    }
+    if (norm_path == "/proc/device-tree/firmware/android/vbmeta") {
+        out_is_dir = true;
+        out_children = {"compatible", "parts", "name"};
+        return true;
+    }
+    if (norm_path == "/proc/device-tree/firmware/android/vbmeta/compatible") {
+        static constexpr char kVbCompat[] = "android,vbmeta\0";
+        out_data.assign(kVbCompat, kVbCompat + sizeof(kVbCompat));
+        return true;
+    }
+    if (norm_path == "/proc/device-tree/firmware/android/vbmeta/parts") {
+        static constexpr char kVbParts[] = "vbmeta,boot,system,vendor\0";
+        out_data.assign(kVbParts, kVbParts + sizeof(kVbParts));
+        return true;
+    }
+    if (norm_path == "/proc/device-tree/firmware/android/vbmeta/name") {
+        static constexpr char kVbName[] = "vbmeta\0";
+        out_data.assign(kVbName, kVbName + sizeof(kVbName));
         return true;
     }
     if (norm_path == "/proc/sys/kernel/random/boot_id") {
