@@ -1378,6 +1378,166 @@ void TestFirstStageMountSelinuxXattrDup3CapNetlink() {
     std::cout << "[PASS] Test 7: FirstStageMount DT/fstab, SELinux sysfs+xattr, dup3 stdio, capget & AF_NETLINK\n";
 }
 
+// Test 8: Single-NUL DT vbmeta/compatible (15 bytes), distinct /dev/block/by-name/* rdev minors,
+// /dev/pmsg0 -> [PMSG], mount(40) dir registration, and [REGS]/[BT] diagnostics on abort.
+void TestDtSingleNulByNamePmsgMountAndDiag() {
+    auto ldr_w = [](uint8_t wt, uint8_t xn, uint16_t imm_bytes) -> uint32_t {
+        return 0xB9400000u | (static_cast<uint32_t>((imm_bytes / 4u) & 0xFFFu) << 10) |
+               (static_cast<uint32_t>(xn & 31u) << 5) | (wt & 31u);
+    };
+
+    CodeBlobBuilder cb;
+    const size_t p_vb_compat = cb.AddString("/proc/device-tree/firmware/android/vbmeta/compatible");
+    const size_t p_by_sys = cb.AddString("/dev/block/by-name/system");
+    const size_t p_by_vnd = cb.AddString("/dev/block/by-name/vendor");
+    const size_t p_pmsg = cb.AddString("/dev/pmsg0");
+    const size_t p_mnt_src = cb.AddString("/dev/block/by-name/system");
+    const size_t p_mnt_tgt = cb.AddString("/mnt/test_stage2");
+    const size_t p_fs_type = cb.AddString("ext4");
+    const size_t pmsg_text = cb.AddString("PMSG-TEST-OK\n");
+    const size_t ok_msg = cb.AddString("[DT-PMSG-MNT-OK]\n");
+
+    cb.insns.push_back(SubImm64(31, 31, 1024u));
+
+    // 1. read(/proc/device-tree/firmware/android/vbmeta/compatible) == 15 ("android,vbmeta\0")
+    EmitImm64(cb.insns, 0, static_cast<uint64_t>(-100));
+    cb.EmitAdrPlaceholder(1, p_vb_compat);
+    cb.insns.push_back(Movz(2, 0u));
+    cb.insns.push_back(Movz(3, 0u));
+    cb.insns.push_back(Movz(8, 56u)); // openat
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 3u));
+    const size_t f1 = cb.insns.size(); cb.insns.push_back(0);
+    cb.insns.push_back(AddImm64(1, 31, 0u));
+    cb.insns.push_back(Movz(2, 64u));
+    cb.insns.push_back(Movz(8, 63u)); // read
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 15u));
+    const size_t f2 = cb.insns.size(); cb.insns.push_back(0); // NE -> fail
+
+    // 2. statx(/dev/block/by-name/system) vs statx(/dev/block/by-name/vendor) distinct stx_rdev_minor
+    EmitImm64(cb.insns, 0, static_cast<uint64_t>(-100));
+    cb.EmitAdrPlaceholder(1, p_by_sys);
+    cb.insns.push_back(Movz(2, 0u));
+    cb.insns.push_back(Movz(3, 0x7FFu));
+    cb.insns.push_back(AddImm64(4, 31, 128u));
+    cb.insns.push_back(Movz(8, 291u)); // statx
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 0u));
+    const size_t f3 = cb.insns.size(); cb.insns.push_back(0);
+
+    EmitImm64(cb.insns, 0, static_cast<uint64_t>(-100));
+    cb.EmitAdrPlaceholder(1, p_by_vnd);
+    cb.insns.push_back(Movz(2, 0u));
+    cb.insns.push_back(Movz(3, 0x7FFu));
+    cb.insns.push_back(AddImm64(4, 31, 400u));
+    cb.insns.push_back(Movz(8, 291u)); // statx
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 0u));
+    const size_t f4 = cb.insns.size(); cb.insns.push_back(0);
+
+    cb.insns.push_back(ldr_w(10, 31, 128u + 132u)); // system stx_rdev_minor
+    cb.insns.push_back(ldr_w(11, 31, 400u + 132u)); // vendor stx_rdev_minor
+    cb.insns.push_back(0x6B0B015Fu); // CMP W10, W11
+    const size_t f5 = cb.insns.size(); cb.insns.push_back(0); // EQ -> fail
+
+    // 3. openat(/dev/pmsg0) + write("PMSG-TEST-OK\n", 13) -> 13
+    EmitImm64(cb.insns, 0, static_cast<uint64_t>(-100));
+    cb.EmitAdrPlaceholder(1, p_pmsg);
+    cb.insns.push_back(Movz(2, 1u));
+    cb.insns.push_back(Movz(3, 0u));
+    cb.insns.push_back(Movz(8, 56u));
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 3u));
+    const size_t f6 = cb.insns.size(); cb.insns.push_back(0);
+    cb.EmitAdrPlaceholder(1, pmsg_text);
+    cb.insns.push_back(Movz(2, 13u));
+    cb.insns.push_back(Movz(8, 64u));
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 13u));
+    const size_t f7 = cb.insns.size(); cb.insns.push_back(0);
+
+    // 4. mount("/dev/block/by-name/system", "/mnt/test_stage2", "ext4", 0, 0) == 0 & statx("/mnt/test_stage2") == 0
+    cb.EmitAdrPlaceholder(0, p_mnt_src);
+    cb.EmitAdrPlaceholder(1, p_mnt_tgt);
+    cb.EmitAdrPlaceholder(2, p_fs_type);
+    cb.insns.push_back(Movz(3, 0u));
+    cb.insns.push_back(Movz(4, 0u));
+    cb.insns.push_back(Movz(8, 40u)); // mount
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 0u));
+    const size_t f8 = cb.insns.size(); cb.insns.push_back(0);
+
+    EmitImm64(cb.insns, 0, static_cast<uint64_t>(-100));
+    cb.EmitAdrPlaceholder(1, p_mnt_tgt);
+    cb.insns.push_back(Movz(2, 0u));
+    cb.insns.push_back(Movz(3, 0x7FFu));
+    cb.insns.push_back(AddImm64(4, 31, 680u));
+    cb.insns.push_back(Movz(8, 291u)); // statx("/mnt/test_stage2")
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 0u));
+    const size_t f9 = cb.insns.size(); cb.insns.push_back(0);
+
+    // Emit [DT-PMSG-MNT-OK]
+    cb.insns.push_back(Movz(0, 1u));
+    cb.EmitAdrPlaceholder(1, ok_msg);
+    cb.insns.push_back(Movz(2, 17u));
+    cb.insns.push_back(Movz(8, 64u));
+    cb.insns.push_back(Svc(0));
+
+    // Deliberately trigger SIGABRT via tgkill(1, 1, 6) to verify [REGS] & [BT] diagnostics
+    cb.insns.push_back(0xAA1F03FDu); // MOV X29, XZR (clean frame chain end)
+    cb.insns.push_back(Movz(0, 1u));
+    cb.insns.push_back(Movz(1, 1u));
+    cb.insns.push_back(Movz(2, 6u));
+    cb.insns.push_back(Movz(8, 131u)); // tgkill
+    cb.insns.push_back(Svc(0));
+
+    const size_t fail_idx = cb.insns.size();
+    cb.insns.push_back(Movz(0, 88u));
+    cb.insns.push_back(Movz(8, 94u));
+    cb.insns.push_back(Svc(0));
+
+    cb.insns[f1] = BCond(11u /* LT */, static_cast<int32_t>(fail_idx - f1));
+    cb.insns[f2] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f2));
+    cb.insns[f3] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f3));
+    cb.insns[f4] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f4));
+    cb.insns[f5] = BCond(0u /* EQ */, static_cast<int32_t>(fail_idx - f5));
+    cb.insns[f6] = BCond(11u /* LT */, static_cast<int32_t>(fail_idx - f6));
+    cb.insns[f7] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f7));
+    cb.insns[f8] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f8));
+    cb.insns[f9] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f9));
+
+    std::vector<uint8_t> init_elf = BuildMinimalAArch64Elf64(cb.Finalize());
+    std::vector<uint8_t> rd = GzipVec(CpioArchive::Build({
+        MakeCpio("init", 0100755u, init_elf),
+    }));
+
+    std::vector<uint8_t> boot_bytes = BuildBootImgV2({}, rd, "androidboot.hardware=virt");
+    ParsedBootImage parsed;
+    std::string err;
+    assert(BootImageParser::ParseBootBytes(boot_bytes, parsed, err) == VmError::Ok);
+
+    VirtualMachineSkeleton vm;
+    MachineBootConfig cfg;
+    cfg.ram_mb = 64u;
+    assert(vm.InitializeAndStage(cfg, &parsed, err) == VmError::Ok);
+
+    std::string target;
+    assert(vm.BootGuest(false, target, err) == VmError::Ok);
+    assert(vm.StepGuest(50000ULL) == VmError::Ok);
+    assert(vm.CpuState().halted);
+    assert(vm.Supervisor()->Exited());
+    assert(vm.Supervisor()->ExitStatus() == 134); // 128 + SIGABRT
+
+    const std::string uart = vm.Uart().CapturedOutput();
+    assert(uart.find("[DT-PMSG-MNT-OK]") != std::string::npos);
+    assert(uart.find("[PMSG] PMSG-TEST-OK") != std::string::npos);
+    assert(uart.find("[REGS] pc=") != std::string::npos);
+    assert(uart.find("[BT] #0 ") != std::string::npos);
+    std::cout << "[PASS] Test 8: Single-NUL DT vbmeta/compatible, distinct by-name rdev, /dev/pmsg0, mount & [REGS]/[BT]\n";
+}
+
 } // namespace
 
 int main() {
@@ -1388,6 +1548,7 @@ int main() {
     TestElfPhdrTlsMmapCoherencyAndSyscalls();
     TestUniqueInodesProcSelfFdAndSigQueue();
     TestFirstStageMountSelinuxXattrDup3CapNetlink();
+    TestDtSingleNulByNamePmsgMountAndDiag();
     std::cout << "ALL M4 KERNEL & INIT BOOT TESTS PASSED.\n";
     return 0;
 }

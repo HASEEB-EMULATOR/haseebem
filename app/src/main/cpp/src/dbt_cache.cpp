@@ -236,7 +236,8 @@ DecodedInsn TranslationCache::DecodeOne(uint32_t insn) {
             if (!is_unsigned_imm && bit21) {
                 if (bits11_10 == 2u) {
                     d.kind = InsnKind::LoadStoreReg;
-                } else if (!is_simd && bits11_10 == 0u && ((insn >> 15) & 1u) == 0) {
+                } else if (!is_simd && bits11_10 == 0u &&
+                           (((insn >> 15) & 1u) == 0 || (insn & 0x3FFFFC00u) == 0x38BFC000u)) {
                     d.kind = InsnKind::AtomicLse;
                 } else {
                     d.kind = InsnKind::Unmapped;

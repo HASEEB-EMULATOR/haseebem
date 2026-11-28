@@ -505,6 +505,15 @@ bool AArch64CpuCore::ExecuteAtomicLse(const DecodedInsn& d) {
         return true;
     }
 
+    // LDAPR / LDAPRH / LDAPRB (ARMv8.3-RCPC load-acquire RCpc)
+    if ((insn & 0x3FFFFC00u) == 0x38BFC000u) {
+        const uint64_t mask = (datasize == 8u) ? ~0ULL : ((1ULL << (datasize * 8u)) - 1ULL);
+        uint64_t val = 0;
+        if (!ReadMem(addr, datasize, val, true)) return false;
+        state_.WriteRegOrDiscard(rt, val & mask);
+        return true;
+    }
+
     // LDADD / LDCLR / LDEOR / LDSET / SWP
     const uint8_t rs = static_cast<uint8_t>((insn >> 16) & 31u);
     const uint32_t opc = (insn >> 12) & 7u;

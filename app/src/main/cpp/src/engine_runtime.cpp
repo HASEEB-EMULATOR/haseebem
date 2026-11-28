@@ -842,7 +842,7 @@ void EngineRuntime::SetCheckpoint(const std::string& stage, const std::string& d
 void EngineRuntime::WriteTraceFileLocked(const std::string& line) {
     if (boot_trace_path_.empty()) return;
     struct stat st{};
-    if (::stat(boot_trace_path_.c_str(), &st) == 0 && st.st_size > 256 * 1024) {
+    if (::stat(boot_trace_path_.c_str(), &st) == 0 && st.st_size > 512 * 1024) {
         std::ofstream trunc_ofs(boot_trace_path_, std::ios::trunc);
         trunc_ofs << "[TRACE_ROTATED]\n";
     }
@@ -865,7 +865,11 @@ void EngineRuntime::AppendLog(const std::string& level, const std::string& msg) 
     const bool is_diag_uart = (level == "UART") &&
         (msg.rfind("[TRAP]", 0) == 0 || msg.rfind("[FAIL]", 0) == 0 ||
          msg.rfind("[SIGNAL]", 0) == 0 || msg.rfind("[SYS", 0) == 0 ||
-         msg.rfind("[TRACE]", 0) == 0 || msg.find("CANNOT LINK") != std::string::npos);
+         msg.rfind("[TRACE]", 0) == 0 || msg.rfind("[REGS]", 0) == 0 ||
+         msg.rfind("[BT]", 0) == 0 || msg.rfind("[PMSG]", 0) == 0 ||
+         msg.rfind("[LOGD]", 0) == 0 || msg.rfind("[KMSG]", 0) == 0 ||
+         msg.rfind("[BINDER]", 0) == 0 ||
+         msg.find("CANNOT LINK") != std::string::npos);
     if (level == "ERROR" || level == "WARN" || level == "INFO" || is_diag_uart) {
         std::lock_guard<std::mutex> tlock(trace_mutex_);
         WriteTraceFileLocked(line);

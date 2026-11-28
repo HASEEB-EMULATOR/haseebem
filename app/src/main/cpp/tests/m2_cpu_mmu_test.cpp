@@ -808,6 +808,42 @@ void TestComprehensiveNeonFpAndCrc32() {
     std::cout << "[PASS] TestComprehensiveNeonFpAndCrc32\n";
 }
 
+void TestRcpcLdapr() {
+    GuestRam ram;
+    MmioBus bus;
+    HASEEB_CHECK(ram.Allocate(kGuestRamBase, 16ULL * 1024ULL * 1024ULL) == VmError::Ok);
+
+    AArch64CpuCore cpu(ram, bus, 0);
+    const uint64_t code_addr = kGuestRamBase;
+    const uint64_t data_addr = kGuestRamBase + 0x10000ULL;
+    cpu.Reset(code_addr, kGuestRamBase + 0x80000ULL, 1);
+
+    const uint64_t pattern = 0x1122334455667788ULL;
+    ram.WriteBytes(data_addr, &pattern, sizeof(pattern));
+
+    std::vector<uint32_t> code;
+    EmitImm64(code, 1, data_addr);
+    EmitImm64(code, 2, 0xFFFFFFFFFFFFFFFFULL);
+    EmitImm64(code, 3, 0xFFFFFFFFFFFFFFFFULL);
+    EmitImm64(code, 4, 0xFFFFFFFFFFFFFFFFULL);
+    EmitImm64(code, 5, 0xFFFFFFFFFFFFFFFFULL);
+    code.push_back(0xF8BFC022u); // ldapr  x2, [x1]
+    code.push_back(0xB8BFC023u); // ldapr  w3, [x1]
+    code.push_back(0x78BFC024u); // ldaprh w4, [x1]
+    code.push_back(0x38BFC025u); // ldaprb w5, [x1]
+    code.push_back(Hlt(0));
+
+    ram.WriteBytes(code_addr, code.data(), code.size() * 4u);
+    HASEEB_CHECK(cpu.Run(100) == VmError::Ok);
+    HASEEB_CHECK(cpu.State().halted);
+    HASEEB_CHECK(cpu.State().x[2] == 0x1122334455667788ULL);
+    HASEEB_CHECK(cpu.State().x[3] == 0x55667788ULL);
+    HASEEB_CHECK(cpu.State().x[4] == 0x7788ULL);
+    HASEEB_CHECK(cpu.State().x[5] == 0x88ULL);
+
+    std::cout << "[PASS] TestRcpcLdapr\n";
+}
+
 } // namespace
 
 int main() {
@@ -819,6 +855,7 @@ int main() {
     TestLoadStoreSimdStructAndBionicNeon();
     TestExtendedAdvSimdShiftAndMisc();
     TestComprehensiveNeonFpAndCrc32();
+    TestRcpcLdapr();
     std::cout << "All M2 AArch64 CPU, DBT, MMU & Exception tests PASSED.\n";
     return 0;
 }

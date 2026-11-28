@@ -214,6 +214,7 @@ uint64_t ComputeGuestInode(const std::string& key) {
 
 bool IsBlockDevicePath(const std::string& norm) {
     return norm == "/dev/block/vda" ||
+           norm.rfind("/dev/block/vda", 0) == 0 ||
            norm.rfind("/dev/block/by-name/", 0) == 0;
 }
 
@@ -253,7 +254,7 @@ bool IsGuestCharDevicePath(const std::string& norm) {
            norm == "/dev/fb0" ||
            norm == "/dev/binder" || norm == "/dev/hwbinder" || norm == "/dev/vndbinder" ||
            norm == "/dev/ashmem" || norm == "/dev/ion" || norm == "/dev/dma_heap/system" ||
-           norm == "/dev/kmsg" || norm == "/dev/tty" || norm == "/dev/ptmx" ||
+           norm == "/dev/kmsg" || norm == "/dev/pmsg0" || norm == "/dev/tty" || norm == "/dev/ptmx" ||
            norm == "/dev/input/event0" || norm == "/dev/input/event1" ||
            norm == "/dev/haseeb_sensors" || norm == "/dev/video0" ||
            norm == "/dev/haseeb_gles" || norm == "/dev/magisk_su" ||
@@ -263,12 +264,24 @@ bool IsGuestCharDevicePath(const std::string& norm) {
 }
 
 uint64_t ComputeDeviceRdev(const std::string& norm) {
-    if (IsBlockDevicePath(norm)) return (254ULL << 8) | 0ULL;
+    if (norm == "/dev/block/vda") return (254ULL << 8) | 0ULL;
+    if (norm == "/dev/block/by-name/system") return (254ULL << 8) | 1ULL;
+    if (norm == "/dev/block/by-name/vendor") return (254ULL << 8) | 2ULL;
+    if (norm == "/dev/block/by-name/product") return (254ULL << 8) | 3ULL;
+    if (norm == "/dev/block/by-name/system_ext") return (254ULL << 8) | 4ULL;
+    if (norm == "/dev/block/by-name/odm") return (254ULL << 8) | 5ULL;
+    if (norm == "/dev/block/by-name/userdata") return (254ULL << 8) | 6ULL;
+    if (norm == "/dev/block/by-name/cache") return (254ULL << 8) | 7ULL;
+    if (norm == "/dev/block/by-name/metadata") return (254ULL << 8) | 8ULL;
+    if (norm == "/dev/block/by-name/vbmeta") return (254ULL << 8) | 9ULL;
+    if (norm == "/dev/block/by-name/boot") return (254ULL << 8) | 10ULL;
+    if (IsBlockDevicePath(norm)) return (254ULL << 8) | 15ULL;
     if (norm == "/dev/null" || norm == "/sys/fs/selinux/null") return (1ULL << 8) | 3ULL;
     if (norm == "/dev/zero") return (1ULL << 8) | 5ULL;
     if (norm == "/dev/random") return (1ULL << 8) | 8ULL;
     if (norm == "/dev/urandom") return (1ULL << 8) | 9ULL;
     if (norm == "/dev/kmsg") return (1ULL << 8) | 11ULL;
+    if (norm == "/dev/pmsg0") return (10ULL << 8) | 62ULL;
     if (norm == "/dev/tty") return (5ULL << 8) | 0ULL;
     if (norm == "/dev/ptmx") return (5ULL << 8) | 2ULL;
     if (IsGuestCharDevicePath(norm)) return (10ULL << 8) | 1ULL;
@@ -297,10 +310,12 @@ bool MapElfSegments(GuestRam& ram,
                     uint64_t& out_first_pt_load_va,
                     bool& out_has_pt_load,
                     uint64_t& inout_highest_va,
-                    std::string& out_error) {
+                    std::string& out_error,
+                    uint64_t* out_seg_end = nullptr) {
     std::unordered_map<uint64_t, uint64_t> mapped_va_to_pa;
     out_has_pt_load = false;
     out_first_pt_load_va = 0ULL;
+    uint64_t seg_high = load_bias;
 
     for (uint16_t i = 0; i < eh.e_phnum; ++i) {
         Elf64Phdr ph{};
@@ -318,6 +333,9 @@ bool MapElfSegments(GuestRam& ram,
         }
         const uint64_t page_start = AlignDown4K(seg_va);
         const uint64_t page_end = AlignUp4K(seg_va + ph.p_memsz);
+        if (page_end > seg_high) {
+            seg_high = page_end;
+        }
         if (load_bias < kInterpLoadBase && page_end > inout_highest_va) {
             inout_highest_va = page_end;
         }
@@ -359,6 +377,7 @@ bool MapElfSegments(GuestRam& ram,
             copied += chunk;
         }
     }
+    if (out_seg_end) *out_seg_end = seg_high;
     return true;
 }
 
@@ -554,10 +573,14 @@ Elf64LoadResult Elf64GuestLoader::LoadAndMap(GuestRam& ram,
         }
     }
 
+    uint64_t main_seg_end = load_bias;
     if (!MapElfSegments(ram, ttbr0_pa, phys_alloc_cursor, phys_alloc_limit, elf_bytes, eh,
-                        load_bias, first_pt_load_va, has_pt_load, highest_va, res.error)) {
+                        load_bias, first_pt_load_va, has_pt_load, highest_va, res.error,
+                        &main_seg_end)) {
         return res;
     }
+    res.main_base = has_pt_load ? first_pt_load_va : load_bias;
+    res.main_end = main_seg_end;
 
     uint64_t start_pc = load_bias + eh.e_entry;
     if (res.is_dynamic && !res.interp_path.empty()) {
@@ -583,12 +606,14 @@ Elf64LoadResult Elf64GuestLoader::LoadAndMap(GuestRam& ram,
         uint64_t interp_first = 0ULL;
         bool interp_has_load = false;
         uint64_t interp_high = interp_bias;
+        uint64_t interp_seg_end = interp_bias;
         if (!MapElfSegments(ram, ttbr0_pa, phys_alloc_cursor, phys_alloc_limit, interp_bytes,
                             interp_eh, interp_bias, interp_first, interp_has_load,
-                            interp_high, res.error)) {
+                            interp_high, res.error, &interp_seg_end)) {
             return res;
         }
         res.interp_base = interp_bias;
+        res.interp_end = interp_seg_end;
         start_pc = interp_bias + interp_eh.e_entry;
     }
 
@@ -1416,10 +1441,20 @@ bool LinuxGuestSupervisor::ResolveVfsFile(const std::string& path,
         }
         if (norm == "/proc/self/maps" || norm == "/proc/thread-self/maps") {
             std::ostringstream oss;
-            const std::string bin = active_binary_.empty() ? "/init" : active_binary_;
-            oss << "00400000-00800000 r-xp 00000000 00:01 1 " << bin << "\n"
-                << "20000000-20200000 r-xp 00000000 00:01 2 /system/bin/linker64\n"
-                << "7ffe0000-7fff0000 rw-p 00000000 00:00 0 [stack]\n";
+            const GuestTask* cur = CurrentTask();
+            if (cur && cur->vm && !cur->vm->mapped_regions.empty()) {
+                for (const auto& reg : cur->vm->mapped_regions) {
+                    oss << std::hex << reg.start << "-" << reg.end
+                        << " " << reg.perms << " "
+                        << std::setw(8) << std::setfill('0') << reg.file_offset
+                        << " 00:01 1 " << reg.path << "\n";
+                }
+            } else {
+                const std::string bin = active_binary_.empty() ? "/init" : active_binary_;
+                oss << "00400000-00800000 r-xp 00000000 00:01 1 " << bin << "\n"
+                    << "20000000-20200000 r-xp 00000000 00:01 2 /system/bin/linker64\n";
+            }
+            oss << "7ffe0000-7fff0000 rw-p 00000000 00:00 0 [stack]\n";
             const std::string s = oss.str();
             out_data.assign(s.begin(), s.end());
             return finish_ok();
@@ -1474,7 +1509,7 @@ bool LinuxGuestSupervisor::ResolveVfsFile(const std::string& path,
                     return finish_ok();
                 }
                 if (attr_leaf == "current") {
-                    static constexpr char kInitCtx[] = "u:r:init:s0\0";
+                    static constexpr char kInitCtx[] = "u:r:init:s0";
                     out_data.assign(kInitCtx, kInitCtx + sizeof(kInitCtx));
                 }
                 return finish_ok();
@@ -1622,9 +1657,9 @@ bool LinuxGuestSupervisor::ResolveVfsFile(const std::string& path,
             if (norm == "/fstab." + hw || norm == "/fstab.virt") {
                 const std::string fstab_text =
                     "# Haseeb Virtual ARM64 Board default fstab\n"
-                    "/dev/block/vda /system ext4 ro,noatime wait,first_stage_mount\n"
-                    "/dev/block/vda /vendor ext4 ro,noatime wait,first_stage_mount\n"
-                    "/dev/block/vda /data ext4 noatime,nosuid,nodev,noauto_da_alloc,errors=panic wait\n";
+                    "/dev/block/by-name/system /system ext4 ro,noatime wait,first_stage_mount\n"
+                    "/dev/block/by-name/vendor /vendor ext4 ro,noatime wait,first_stage_mount\n"
+                    "/dev/block/by-name/userdata /data ext4 noatime,nosuid,nodev,noauto_da_alloc,errors=panic wait\n";
                 out_data.assign(fstab_text.begin(), fstab_text.end());
                 return finish_ok();
             }
@@ -1638,10 +1673,10 @@ bool LinuxGuestSupervisor::ResolveVfsFile(const std::string& path,
             norm == "/storage/emulated" || norm == "/proc" || norm == "/sys") {
             out_is_dir = true;
             if (norm == "/dev") {
-                out_children = {"null", "zero", "urandom", "random", "kmsg", "tty", "ptmx",
-                                "binder", "hwbinder", "vndbinder", "ashmem", "ion",
-                                "dma_heap", "socket", "block", "input", "__properties__",
-                                "pts", "shm"};
+                out_children = {"null", "zero", "urandom", "random", "kmsg", "pmsg0",
+                                "tty", "ptmx", "binder", "hwbinder", "vndbinder", "ashmem",
+                                "ion", "dma_heap", "socket", "block", "input",
+                                "__properties__", "pts", "shm"};
             } else if (norm == "/proc") {
                 out_children = {"self", "cmdline", "cpuinfo", "meminfo", "mounts", "filesystems",
                                 "stat", "uptime", "loadavg", "version", "device-tree", "sys"};
@@ -1740,6 +1775,25 @@ bool LinuxGuestSupervisor::MapFreshAddressSpace(AArch64CpuCore& cpu,
         cur->vm->mmap_cursor = mmap_cursor_;
         cur->vm->fb_mapped_pas.clear();
         cur->vm->lazy_prot_none_ranges.clear();
+        cur->vm->mapped_regions.clear();
+        if (load.main_end > load.main_base) {
+            cur->vm->mapped_regions.push_back(MappedRegion{
+                load.main_base,
+                load.main_end,
+                0ULL,
+                active_binary_.empty() ? "/init" : active_binary_,
+                "r-xp"
+            });
+        }
+        if (load.is_dynamic && load.interp_end > load.interp_base) {
+            cur->vm->mapped_regions.push_back(MappedRegion{
+                load.interp_base,
+                load.interp_end,
+                0ULL,
+                load.interp_path.empty() ? "/system/bin/linker64" : load.interp_path,
+                "r-xp"
+            });
+        }
         cur->vm->tagged_addr_ctrl = 0ULL;
     }
 
@@ -1984,18 +2038,84 @@ std::string LinuxGuestSupervisor::DumpRecentSyscalls(size_t max_entries) const {
     return oss.str();
 }
 
+std::string LinuxGuestSupervisor::DescribeGuestAddress(const VmSpace* vm, uint64_t va) const {
+    const uint64_t clean = UntagUserVa(va);
+    std::ostringstream oss;
+    oss << "0x" << std::hex << clean;
+    if (vm != nullptr) {
+        for (const auto& reg : vm->mapped_regions) {
+            if (clean >= reg.start && clean < reg.end) {
+                const uint64_t off = (clean - reg.start) + reg.file_offset;
+                oss << " (" << reg.path << "+0x" << std::hex << off << ")";
+                break;
+            }
+        }
+    }
+    return oss.str();
+}
+
 void LinuxGuestSupervisor::EmitFailureDiagnostics(AArch64CpuCore& cpu,
                                                   const std::string& reason) const {
     const GuestTask* cur = CurrentTask();
     const int32_t pid = cur ? cur->pid : 1;
+    const VmSpace* vm = cur ? cur->vm.get() : nullptr;
+    const CpuState& st = cpu.State();
+    const uint64_t fault_pc = (st.sys.elr_el1 != 0ULL) ? st.sys.elr_el1 : st.pc;
+
     std::ostringstream hdr;
     hdr << "[FAIL] " << reason
         << " bin=" << (active_binary_.empty() ? "unknown" : active_binary_)
         << " pid=" << std::dec << pid
-        << " insns=" << cpu.State().instructions_executed << "\r\n";
+        << " insns=" << st.instructions_executed << "\r\n";
     LogToUart(hdr.str());
-    LogToUart(DumpRecentSyscalls(32));
-    LogToUart(cpu.DumpRecentTrace(16));
+
+    // Full AArch64 register dump for exact post-mortem debugging
+    {
+        std::ostringstream regs;
+        regs << "[REGS] PC=" << DescribeGuestAddress(vm, fault_pc)
+             << " LR=" << DescribeGuestAddress(vm, st.x[30])
+             << " SP=0x" << std::hex << st.sp_el[0]
+             << " FP=0x" << st.x[29]
+             << " TPIDR=0x" << st.sys.tpidr_el0
+             << " SPSR=0x" << st.sys.spsr_el1 << "\r\n";
+        for (int i = 0; i < 28; i += 4) {
+            regs << "[REGS] x" << std::dec << std::setw(2) << std::setfill('0') << i
+                 << "=0x" << std::hex << st.x[i]
+                 << " x" << std::dec << std::setw(2) << (i + 1) << "=0x" << std::hex << st.x[i + 1]
+                 << " x" << std::dec << std::setw(2) << (i + 2) << "=0x" << std::hex << st.x[i + 2]
+                 << " x" << std::dec << std::setw(2) << (i + 3) << "=0x" << std::hex << st.x[i + 3]
+                 << "\r\n";
+        }
+        regs << "[REGS] x28=0x" << std::hex << st.x[28]
+             << " x29=0x" << st.x[29]
+             << " x30=0x" << st.x[30] << "\r\n";
+        LogToUart(regs.str());
+    }
+
+    // Frame-pointer stack backtrace (up to 24 frames)
+    {
+        std::ostringstream bt;
+        bt << "[BT] #00 " << DescribeGuestAddress(vm, fault_pc) << "\r\n";
+        if (st.x[30] != 0ULL && st.x[30] != fault_pc) {
+            bt << "[BT] #01 " << DescribeGuestAddress(vm, st.x[30]) << "\r\n";
+        }
+        uint64_t fp = UntagUserVa(st.x[29]);
+        for (int frame = 2; frame < 24 && fp != 0ULL && (fp & 7ULL) == 0ULL; ++frame) {
+            uint64_t pair[2]{};
+            if (!ReadUserBytes(cpu, fp, pair, sizeof(pair))) break;
+            if (pair[1] != 0ULL) {
+                bt << "[BT] #" << std::dec << std::setw(2) << std::setfill('0') << frame
+                   << " " << DescribeGuestAddress(vm, pair[1]) << "\r\n";
+            }
+            const uint64_t next_fp = UntagUserVa(pair[0]);
+            if (next_fp <= fp || (next_fp - fp) > 0x100000ULL) break;
+            fp = next_fp;
+        }
+        LogToUart(bt.str());
+    }
+
+    LogToUart(DumpRecentSyscalls(96));
+    LogToUart(cpu.DumpRecentTrace(64));
 }
 
 bool LinuxGuestSupervisor::LookupL3Pte(uint64_t va,
@@ -2063,6 +2183,10 @@ void LinuxGuestSupervisor::UnmapRange4K(AArch64CpuCore& cpu, uint64_t addr, uint
     if (end <= start) return;
     if (GuestTask* cur = CurrentTask(); cur && cur->vm) {
         EraseVmRange(cur->vm->lazy_prot_none_ranges, start, end);
+        auto& regs = cur->vm->mapped_regions;
+        regs.erase(std::remove_if(regs.begin(), regs.end(), [&](const MappedRegion& r) {
+            return r.start >= start && r.end <= end;
+        }), regs.end());
     }
     if (ttbr0_pa_ == 0ULL) return;
 
@@ -2237,7 +2361,7 @@ int64_t LinuxGuestSupervisor::OpenGuestPath(std::unordered_map<int, OpenFile>& f
         fds.emplace(fd, std::move(of));
         return fd;
     }
-    if (norm == "/dev/kmsg" || norm == "/dev/tty" || norm == "/dev/ptmx") {
+    if (norm == "/dev/kmsg" || norm == "/dev/pmsg0" || norm == "/dev/tty" || norm == "/dev/ptmx") {
         if (check_access_only) return 0;
         int fd = next_fd++;
         OpenFile of;
@@ -2245,6 +2369,7 @@ int64_t LinuxGuestSupervisor::OpenGuestPath(std::unordered_map<int, OpenFile>& f
         of.fd_flags = cloexec;
         of.nonblock = nonblock;
         of.is_kmsg = (norm == "/dev/kmsg");
+        of.is_pmsg = (norm == "/dev/pmsg0");
         of.is_tty = (norm == "/dev/tty" || norm == "/dev/ptmx");
         of.st_dev = 2ULL;
         of.st_ino = ComputeGuestInode(of.path);
@@ -2709,7 +2834,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 }
             }
             if (!found && xname == "security.selinux") {
-                static constexpr char kDefaultCtx[] = "u:object_r:unlabeled:s0\0";
+                static constexpr char kDefaultCtx[] = "u:object_r:unlabeled:s0";
                 val.assign(kDefaultCtx, kDefaultCtx + sizeof(kDefaultCtx));
                 found = true;
             }
@@ -3863,6 +3988,18 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 if (!s.empty()) LogToUart("[KMSG] " + s + (s.back() == '\n' ? "" : "\r\n"));
                 return static_cast<int64_t>(count);
             }
+            if (it->second.is_pmsg) {
+                std::string text;
+                text.reserve(tmp.size());
+                for (uint8_t b : tmp) {
+                    if (b >= 0x20u && b < 0x7Fu) text.push_back(static_cast<char>(b));
+                    else if ((b == '\n' || b == '\r' || b == '\0') && !text.empty() && text.back() != ' ') {
+                        text.push_back(' ');
+                    }
+                }
+                if (!text.empty()) LogToUart("[PMSG] " + text + "\r\n");
+                return static_cast<int64_t>(count);
+            }
             if (it->second.is_dev_null || it->second.is_dev_zero) {
                 return static_cast<int64_t>(count);
             }
@@ -4069,6 +4206,17 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                     } else if (it->second.is_kmsg) {
                         std::string s(reinterpret_cast<const char*>(tmp.data()), tmp.size());
                         if (!s.empty()) LogToUart("[KMSG] " + s + (s.back() == '\n' ? "" : "\r\n"));
+                        total += static_cast<int64_t>(vec[1]);
+                    } else if (it->second.is_pmsg) {
+                        std::string text;
+                        text.reserve(tmp.size());
+                        for (uint8_t b : tmp) {
+                            if (b >= 0x20u && b < 0x7Fu) text.push_back(static_cast<char>(b));
+                            else if ((b == '\n' || b == '\r' || b == '\0') && !text.empty() && text.back() != ' ') {
+                                text.push_back(' ');
+                            }
+                        }
+                        if (!text.empty()) LogToUart("[PMSG] " + text + "\r\n");
                         total += static_cast<int64_t>(vec[1]);
                     } else if (it->second.is_dev_null || it->second.is_dev_zero) {
                         total += static_cast<int64_t>(vec[1]);
@@ -5976,6 +6124,17 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 binder_broker_.RegisterMmap(fd_it->second.binder_client_id, addr, len,
                                             std::move(binder_pa_pages));
             }
+            if (!is_anon && fd_it != fds.end() && cur && cur->vm &&
+                cur->vm->mapped_regions.size() < 512u) {
+                std::string perms;
+                perms.push_back(r_perm ? 'r' : '-');
+                perms.push_back(w_perm ? 'w' : '-');
+                perms.push_back(x_perm ? 'x' : '-');
+                perms.push_back(is_shared ? 's' : 'p');
+                cur->vm->mapped_regions.push_back(MappedRegion{
+                    addr, addr + len, file_offset, fd_it->second.path, std::move(perms)
+                });
+            }
             return static_cast<int64_t>(addr);
         }
         case 226: { // mprotect(addr, len, prot)
@@ -6097,7 +6256,10 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             return 0;
         }
         case 147: { // setresuid(ruid, euid, suid)
-            if (static_cast<int32_t>(st.x[0]) != -1) uid_ = static_cast<uint32_t>(st.x[0]);
+            const int32_t ruid = static_cast<int32_t>(st.x[0]);
+            const int32_t euid = static_cast<int32_t>(st.x[1]);
+            if (euid != -1) uid_ = static_cast<uint32_t>(euid);
+            else if (ruid != -1) uid_ = static_cast<uint32_t>(ruid);
             return 0;
         }
         case 148: { // getresuid(ruid*, euid*, suid*)
@@ -6109,7 +6271,10 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             return 0;
         }
         case 149: { // setresgid(rgid, egid, sgid)
-            if (static_cast<int32_t>(st.x[0]) != -1) gid_ = static_cast<uint32_t>(st.x[0]);
+            const int32_t rgid = static_cast<int32_t>(st.x[0]);
+            const int32_t egid = static_cast<int32_t>(st.x[1]);
+            if (egid != -1) gid_ = static_cast<uint32_t>(egid);
+            else if (rgid != -1) gid_ = static_cast<uint32_t>(rgid);
             return 0;
         }
         case 150: { // getresgid(rgid*, egid*, sgid*)
@@ -6156,7 +6321,47 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             }
             return 0;
         }
-        case 32: case 33: case 37: case 39: case 40: case 41: case 51:
+        case 40: { // mount(source, target, filesystemtype, mountflags, data)
+            std::string target;
+            if (ReadUserString(cpu, st.x[1], target) && !target.empty()) {
+                const std::string target_norm = NormalizeGuestPath(target);
+                if (out_note) *out_note = target_norm;
+                runtime_dirs_.insert(target_norm);
+                if ((st.x[3] & 0x2000ULL /* MS_MOVE */) != 0ULL) {
+                    std::string source;
+                    if (ReadUserString(cpu, st.x[0], source) && !source.empty()) {
+                        const std::string src_norm = NormalizeGuestPath(source);
+                        const std::string src_pfx = (src_norm == "/") ? "/" : (src_norm + "/");
+                        const std::string dst_pfx = (target_norm == "/") ? "/" : (target_norm + "/");
+                        std::vector<std::pair<std::string, std::vector<uint8_t>>> moved_files;
+                        for (auto itf = runtime_files_.begin(); itf != runtime_files_.end(); ) {
+                            if (itf->first.compare(0, src_pfx.size(), src_pfx) == 0) {
+                                moved_files.emplace_back(dst_pfx + itf->first.substr(src_pfx.size()),
+                                                         std::move(itf->second));
+                                itf = runtime_files_.erase(itf);
+                            } else {
+                                ++itf;
+                            }
+                        }
+                        for (auto& kv : moved_files) {
+                            runtime_files_[kv.first] = std::move(kv.second);
+                        }
+                        std::vector<std::string> moved_dirs;
+                        for (auto itd = runtime_dirs_.begin(); itd != runtime_dirs_.end(); ) {
+                            if (itd->compare(0, src_pfx.size(), src_pfx) == 0) {
+                                moved_dirs.push_back(dst_pfx + itd->substr(src_pfx.size()));
+                                itd = runtime_dirs_.erase(itd);
+                            } else {
+                                ++itd;
+                            }
+                        }
+                        for (const auto& d : moved_dirs) runtime_dirs_.insert(d);
+                    }
+                }
+            }
+            return 0;
+        }
+        case 32: case 33: case 37: case 39: case 41: case 51:
         case 52: case 53: case 54: case 55: case 81: case 88:
         case 119: case 122: case 151: case 152: case 154:
         case 158: case 159: case 161: case 162: case 267: case 274:

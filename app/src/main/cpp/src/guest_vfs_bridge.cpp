@@ -165,7 +165,7 @@ bool GuestVfsBridge::TryResolveSpecialVfs(const std::string& norm_path,
     if (norm_path == "/proc/mounts" || norm_path == "/proc/self/mounts" || norm_path == "/proc/self/mountinfo") {
         const std::string mounts = (norm_path == "/proc/self/mountinfo")
             ? "1 1 0:1 / / rw,relatime - rootfs rootfs rw\n"
-              "2 1 0:2 / /system ro,relatime - ext4 /dev/block/vda ro\n"
+              "2 1 0:2 / /system ro,relatime - ext4 /dev/block/by-name/system ro\n"
               "3 1 0:3 / /proc rw,nosuid,nodev,noexec - proc proc rw\n"
               "4 1 0:4 / /sys rw,nosuid,nodev,noexec - sysfs sysfs rw\n"
               "5 1 0:5 / /dev rw,nosuid - tmpfs tmpfs rw\n"
@@ -173,7 +173,7 @@ bool GuestVfsBridge::TryResolveSpecialVfs(const std::string& norm_path,
               "7 1 0:7 / /data rw,nosuid,nodev - tmpfs tmpfs rw\n"
               "8 1 0:8 / /storage/emulated/0 rw,nosuid,nodev - sdcardfs /storage/emulated/0 rw\n"
             : "rootfs / rootfs rw 0 0\n"
-              "/dev/block/vda /system ext4 ro,relatime 0 0\n"
+              "/dev/block/by-name/system /system ext4 ro,relatime 0 0\n"
               "proc /proc proc rw,nosuid,nodev,noexec 0 0\n"
               "sysfs /sys sysfs rw,nosuid,nodev,noexec 0 0\n"
               "tmpfs /dev tmpfs rw,nosuid 0 0\n"
@@ -214,12 +214,12 @@ bool GuestVfsBridge::TryResolveSpecialVfs(const std::string& norm_path,
         return true;
     }
     if (norm_path == "/proc/device-tree/compatible") {
-        static constexpr char kCompat[] = "linux,dummy-virt\0";
+        static constexpr char kCompat[] = "linux,dummy-virt";
         out_data.assign(kCompat, kCompat + sizeof(kCompat));
         return true;
     }
     if (norm_path == "/proc/device-tree/model") {
-        static constexpr char kModel[] = "Haseeb Virtual ARM64 Board\0";
+        static constexpr char kModel[] = "Haseeb Virtual ARM64 Board";
         out_data.assign(kModel, kModel + sizeof(kModel));
         return true;
     }
@@ -229,7 +229,7 @@ bool GuestVfsBridge::TryResolveSpecialVfs(const std::string& norm_path,
         return true;
     }
     if (norm_path == "/proc/device-tree/chosen/name") {
-        static constexpr char kChosen[] = "chosen\0";
+        static constexpr char kChosen[] = "chosen";
         out_data.assign(kChosen, kChosen + sizeof(kChosen));
         return true;
     }
@@ -244,33 +244,38 @@ bool GuestVfsBridge::TryResolveSpecialVfs(const std::string& norm_path,
         return true;
     }
     if (norm_path == "/proc/device-tree/firmware/android/compatible") {
-        static constexpr char kFwCompat[] = "android,firmware\0";
+        static constexpr char kFwCompat[] = "android,firmware";
         out_data.assign(kFwCompat, kFwCompat + sizeof(kFwCompat));
         return true;
     }
     if (norm_path == "/proc/device-tree/firmware/android/name") {
-        static constexpr char kFwName[] = "android\0";
+        static constexpr char kFwName[] = "android";
         out_data.assign(kFwName, kFwName + sizeof(kFwName));
         return true;
     }
     if (norm_path == "/proc/device-tree/firmware/android/vbmeta") {
         out_is_dir = true;
-        out_children = {"compatible", "parts", "name"};
+        out_children = {"compatible", "parts", "name", "status"};
         return true;
     }
     if (norm_path == "/proc/device-tree/firmware/android/vbmeta/compatible") {
-        static constexpr char kVbCompat[] = "android,vbmeta\0";
+        static constexpr char kVbCompat[] = "android,vbmeta";
         out_data.assign(kVbCompat, kVbCompat + sizeof(kVbCompat));
         return true;
     }
     if (norm_path == "/proc/device-tree/firmware/android/vbmeta/parts") {
-        static constexpr char kVbParts[] = "vbmeta,boot,system,vendor\0";
+        static constexpr char kVbParts[] = "vbmeta,boot,system,vendor,product,system_ext,odm";
         out_data.assign(kVbParts, kVbParts + sizeof(kVbParts));
         return true;
     }
     if (norm_path == "/proc/device-tree/firmware/android/vbmeta/name") {
-        static constexpr char kVbName[] = "vbmeta\0";
+        static constexpr char kVbName[] = "vbmeta";
         out_data.assign(kVbName, kVbName + sizeof(kVbName));
+        return true;
+    }
+    if (norm_path == "/proc/device-tree/firmware/android/vbmeta/status") {
+        static constexpr char kVbStatus[] = "okay";
+        out_data.assign(kVbStatus, kVbStatus + sizeof(kVbStatus));
         return true;
     }
     if (norm_path == "/proc/sys/kernel/random/boot_id") {
@@ -313,12 +318,12 @@ bool GuestVfsBridge::TryResolveSpecialVfs(const std::string& norm_path,
         return true;
     }
     if (norm_path == "/sys/fs/selinux/initial_contexts/kernel") {
-        static constexpr char kCtx[] = "u:r:kernel:s0\0";
+        static constexpr char kCtx[] = "u:r:kernel:s0";
         out_data.assign(kCtx, kCtx + sizeof(kCtx));
         return true;
     }
     if (norm_path == "/sys/fs/selinux/initial_contexts/file") {
-        static constexpr char kCtx[] = "u:object_r:unlabeled:s0\0";
+        static constexpr char kCtx[] = "u:object_r:unlabeled:s0";
         out_data.assign(kCtx, kCtx + sizeof(kCtx));
         return true;
     }
@@ -430,21 +435,29 @@ bool GuestVfsBridge::TryResolveSpecialVfs(const std::string& norm_path,
     }
     if (norm_path == "/dev/block/by-name") {
         out_is_dir = true;
-        out_children = {"system", "userdata", "cache", "metadata"};
+        out_children = {"system", "vendor", "product", "system_ext", "odm",
+                        "userdata", "cache", "metadata", "vbmeta", "boot"};
         return true;
     }
     if (norm_path == "/dev/block/vda" ||
         norm_path == "/dev/block/by-name/system" ||
+        norm_path == "/dev/block/by-name/vendor" ||
+        norm_path == "/dev/block/by-name/product" ||
+        norm_path == "/dev/block/by-name/system_ext" ||
+        norm_path == "/dev/block/by-name/odm" ||
         norm_path == "/dev/block/by-name/userdata" ||
         norm_path == "/dev/block/by-name/cache" ||
         norm_path == "/dev/block/by-name/metadata" ||
+        norm_path == "/dev/block/by-name/vbmeta" ||
+        norm_path == "/dev/block/by-name/boot" ||
         norm_path == "/dev/haseeb_sensors" || norm_path == "/dev/video0" ||
         norm_path == "/dev/haseeb_gles" || norm_path == "/dev/magisk_su" ||
         norm_path == "/dev/snd/pcmC0D0p" || norm_path == "/dev/snd/pcmC0D0c" ||
         norm_path == "/dev/binder" || norm_path == "/dev/hwbinder" ||
         norm_path == "/dev/vndbinder" || norm_path == "/dev/ashmem" ||
         norm_path == "/dev/ion" || norm_path == "/dev/dma_heap/system" ||
-        norm_path == "/dev/kmsg" || norm_path == "/dev/tty" || norm_path == "/dev/ptmx") {
+        norm_path == "/dev/kmsg" || norm_path == "/dev/pmsg0" ||
+        norm_path == "/dev/tty" || norm_path == "/dev/ptmx") {
         return true;
     }
 

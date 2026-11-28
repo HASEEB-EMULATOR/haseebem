@@ -36,7 +36,7 @@ using HypercallHandler = std::function<HypercallResult(CpuState& cpu, uint16_t i
 // full exception/interrupt vectoring, system registers, exclusives/LSE atomics, and NEON/FP.
 class AArch64CpuCore {
 public:
-    static constexpr size_t kInsnTraceSize = 64;
+    static constexpr size_t kInsnTraceSize = 256;
 
     AArch64CpuCore(GuestRam& ram, MmioBus& mmio_bus, uint32_t cpu_id = 0);
 

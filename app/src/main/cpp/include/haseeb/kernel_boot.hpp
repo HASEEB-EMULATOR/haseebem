@@ -38,7 +38,10 @@ struct Elf64LoadResult {
     uint64_t brk_start = 0;
     uint64_t stack_top = 0;
     uint64_t initial_sp = 0;
+    uint64_t main_base = 0;
+    uint64_t main_end = 0;
     uint64_t interp_base = 0;
+    uint64_t interp_end = 0;
     std::string interp_path;
     std::string error;
 };
@@ -160,6 +163,7 @@ public:
         bool is_dev_zero = false;
         bool is_dev_urandom = false;
         bool is_kmsg = false;
+        bool is_pmsg = false;
         bool is_tty = false;
         bool is_stdio_out = false;
         bool nonblock = false;
@@ -179,12 +183,21 @@ public:
         uint64_t st_ino = 1ULL;
     };
 
+    struct MappedRegion {
+        uint64_t start = 0;
+        uint64_t end = 0;
+        uint64_t file_offset = 0;
+        std::string path;
+        std::string perms = "r-xp";
+    };
+
     struct VmSpace {
         uint64_t ttbr0_pa = 0;
         uint64_t current_brk = 0;
         uint64_t mmap_cursor = 0x0000001000000000ULL;
         std::vector<uint64_t> fb_mapped_pas;
         std::vector<std::pair<uint64_t, uint64_t>> lazy_prot_none_ranges;
+        std::vector<MappedRegion> mapped_regions;
         uint64_t tagged_addr_ctrl = 0;
     };
 
@@ -380,6 +393,7 @@ private:
                        int64_t ret, uint64_t pc, int32_t pid, const std::string& note = "");
     void LogToUart(const std::string& msg) const;
     std::string DumpRecentSyscalls(size_t max_entries = 16) const;
+    std::string DescribeGuestAddress(const VmSpace* vm, uint64_t va) const;
     void EmitFailureDiagnostics(AArch64CpuCore& cpu, const std::string& reason) const;
     bool ReadUserString(AArch64CpuCore& cpu, uint64_t uva, std::string& out_str) const;
     bool ReadUserBytes(AArch64CpuCore& cpu, uint64_t uva, void* dst, size_t len) const;
@@ -436,7 +450,7 @@ private:
     bool exited_ = false;
     int exit_status_ = 0;
 
-    static constexpr size_t kSyscallTraceSize = 64;
+    static constexpr size_t kSyscallTraceSize = 128;
     std::array<SyscallTraceEntry, kSyscallTraceSize> syscall_ring_{};
     size_t syscall_head_ = 0;
     uint64_t syscall_total_ = 0;
