@@ -1066,6 +1066,318 @@ void TestUniqueInodesProcSelfFdAndSigQueue() {
     std::cout << "[PASS] Test 6: Unique per-file st_ino, /proc/self/fd readlinkat, sysinfo & rt_tgsigqueueinfo\n";
 }
 
+// Test 7: Android FirstStageMount DT/fstab, SELinux sysfs + xattr, dup3 stdio redirection,
+// capget, PR_CAPBSET_READ, and AF_NETLINK socket/bind.
+void TestFirstStageMountSelinuxXattrDup3CapNetlink() {
+    auto ldr_x = [](uint8_t xt, uint8_t xn, uint16_t imm_bytes) -> uint32_t {
+        return 0xF9400000u | (static_cast<uint32_t>((imm_bytes / 8u) & 0xFFFu) << 10) |
+               (static_cast<uint32_t>(xn & 31u) << 5) | (xt & 31u);
+    };
+    auto str_w = [](uint8_t wt, uint8_t xn, uint16_t imm_bytes) -> uint32_t {
+        return 0xB9000000u | (static_cast<uint32_t>((imm_bytes / 4u) & 0xFFFu) << 10) |
+               (static_cast<uint32_t>(xn & 31u) << 5) | (wt & 31u);
+    };
+    auto ldr_w = [](uint8_t wt, uint8_t xn, uint16_t imm_bytes) -> uint32_t {
+        return 0xB9400000u | (static_cast<uint32_t>((imm_bytes / 4u) & 0xFFFu) << 10) |
+               (static_cast<uint32_t>(xn & 31u) << 5) | (wt & 31u);
+    };
+
+    CodeBlobBuilder cb;
+    const size_t p_dt_compat = cb.AddString("/proc/device-tree/firmware/android/compatible");
+    const size_t p_fstab = cb.AddString("/fstab.virt");
+    const size_t p_selinux_dir = cb.AddString("/sys/fs/selinux");
+    const size_t p_selinux_load = cb.AddString("/sys/fs/selinux/load");
+    const size_t p_kmsg = cb.AddString("/dev/kmsg");
+    const size_t p_proc_attr_exec = cb.AddString("/proc/self/attr/exec");
+    const size_t p_vda = cb.AddString("/dev/block/vda");
+    const size_t kmsg_msg = cb.AddString("KMSG-DUP\n");
+    const size_t xattr_name = cb.AddString("security.selinux");
+    const size_t xattr_val = cb.AddString("u:object_r:rootfs:s0");
+    const size_t ok_msg = cb.AddString("[INIT-STAGE1-OK]\n");
+
+    cb.insns.push_back(SubImm64(31, 31, 1024u));
+
+    // 1. openat("/proc/device-tree/firmware/android/compatible") + read -> >= 16 bytes, starts with 'a'
+    EmitImm64(cb.insns, 0, static_cast<uint64_t>(-100));
+    cb.EmitAdrPlaceholder(1, p_dt_compat);
+    cb.insns.push_back(Movz(2, 0u));
+    cb.insns.push_back(Movz(3, 0u));
+    cb.insns.push_back(Movz(8, 56u)); // openat
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 3u));
+    const size_t f1 = cb.insns.size(); cb.insns.push_back(0); // LT -> fail
+    cb.insns.push_back(0xAA0003F4u); // MOV X20, X0
+    cb.insns.push_back(AddImm64(1, 31, 0u));
+    cb.insns.push_back(Movz(2, 32u));
+    cb.insns.push_back(Movz(8, 63u)); // read
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 16u));
+    const size_t f2 = cb.insns.size(); cb.insns.push_back(0); // LT -> fail
+    cb.insns.push_back(Ldrb(10, 31, 0u));
+    cb.insns.push_back(CmpImm64(10, static_cast<uint16_t>('a')));
+    const size_t f3 = cb.insns.size(); cb.insns.push_back(0); // NE -> fail
+
+    // 2. openat("/fstab.virt") + read -> >= 20 bytes
+    EmitImm64(cb.insns, 0, static_cast<uint64_t>(-100));
+    cb.EmitAdrPlaceholder(1, p_fstab);
+    cb.insns.push_back(Movz(2, 0u));
+    cb.insns.push_back(Movz(3, 0u));
+    cb.insns.push_back(Movz(8, 56u));
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 3u));
+    const size_t f4 = cb.insns.size(); cb.insns.push_back(0);
+    cb.insns.push_back(AddImm64(1, 31, 64u));
+    cb.insns.push_back(Movz(2, 128u));
+    cb.insns.push_back(Movz(8, 63u));
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 20u));
+    const size_t f5 = cb.insns.size(); cb.insns.push_back(0);
+
+    // 3. statfs("/sys/fs/selinux", sp+256) -> f_type == 0xF97CFF8C
+    cb.EmitAdrPlaceholder(0, p_selinux_dir);
+    cb.insns.push_back(AddImm64(1, 31, 256u));
+    cb.insns.push_back(Movz(8, 43u)); // statfs
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 0u));
+    const size_t f6 = cb.insns.size(); cb.insns.push_back(0);
+    cb.insns.push_back(ldr_x(10, 31, 256u));
+    EmitImm64(cb.insns, 11, 0xF97CFF8CULL);
+    cb.insns.push_back(0xEB0B015Fu); // CMP X10, X11
+    const size_t f7 = cb.insns.size(); cb.insns.push_back(0);
+
+    // 4. openat("/sys/fs/selinux/load", O_WRONLY=1) + write(fd, "POLICY", 6) -> 6
+    EmitImm64(cb.insns, 0, static_cast<uint64_t>(-100));
+    cb.EmitAdrPlaceholder(1, p_selinux_load);
+    cb.insns.push_back(Movz(2, 1u));
+    cb.insns.push_back(Movz(3, 0u));
+    cb.insns.push_back(Movz(8, 56u));
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 3u));
+    const size_t f8 = cb.insns.size(); cb.insns.push_back(0);
+    cb.EmitAdrPlaceholder(1, ok_msg);
+    cb.insns.push_back(Movz(2, 6u));
+    cb.insns.push_back(Movz(8, 64u)); // write
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 6u));
+    const size_t f9 = cb.insns.size(); cb.insns.push_back(0);
+
+    // 5. lsetxattr("/fstab.virt", "security.selinux", "u:object_r:rootfs:s0\0", 21, 0) + lgetxattr
+    cb.EmitAdrPlaceholder(0, p_fstab);
+    cb.EmitAdrPlaceholder(1, xattr_name);
+    cb.EmitAdrPlaceholder(2, xattr_val);
+    cb.insns.push_back(Movz(3, 21u));
+    cb.insns.push_back(Movz(4, 0u));
+    cb.insns.push_back(Movz(8, 6u)); // lsetxattr
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 0u));
+    const size_t f10 = cb.insns.size(); cb.insns.push_back(0);
+
+    cb.EmitAdrPlaceholder(0, p_fstab);
+    cb.EmitAdrPlaceholder(1, xattr_name);
+    cb.insns.push_back(AddImm64(2, 31, 400u));
+    cb.insns.push_back(Movz(3, 64u));
+    cb.insns.push_back(Movz(8, 9u)); // lgetxattr
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 21u));
+    const size_t f11 = cb.insns.size(); cb.insns.push_back(0);
+
+    // 6. capget({0x20080522, 0}, sp+528) -> 0, eff != 0
+    EmitImm64(cb.insns, 10, 0x20080522ULL);
+    cb.insns.push_back(str_w(10, 31, 512u));
+    cb.insns.push_back(str_w(31, 31, 516u)); // pid = 0
+    cb.insns.push_back(AddImm64(0, 31, 512u));
+    cb.insns.push_back(AddImm64(1, 31, 528u));
+    cb.insns.push_back(Movz(8, 90u)); // capget
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 0u));
+    const size_t f12 = cb.insns.size(); cb.insns.push_back(0);
+    cb.insns.push_back(ldr_w(10, 31, 528u));
+    cb.insns.push_back(CmpImm64(10, 0u));
+    const size_t f13 = cb.insns.size(); cb.insns.push_back(0); // EQ -> fail
+
+    // 7. prctl(PR_CAPBSET_READ=23, 0) == 1 and prctl(23, 60) == -22
+    cb.insns.push_back(Movz(0, 23u));
+    cb.insns.push_back(Movz(1, 0u));
+    cb.insns.push_back(Movz(8, 167u));
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 1u));
+    const size_t f14 = cb.insns.size(); cb.insns.push_back(0);
+
+    cb.insns.push_back(Movz(0, 23u));
+    cb.insns.push_back(Movz(1, 60u));
+    cb.insns.push_back(Movz(8, 167u));
+    cb.insns.push_back(Svc(0));
+    EmitImm64(cb.insns, 11, static_cast<uint64_t>(-22));
+    cb.insns.push_back(0xEB0B001Fu); // CMP X0, X11
+    const size_t f15 = cb.insns.size(); cb.insns.push_back(0);
+
+    // 8. socket(AF_NETLINK=16, SOCK_RAW=3, 15) + bind(fd, {16,0,1,1}, 12)
+    cb.insns.push_back(Movz(0, 16u));
+    cb.insns.push_back(Movz(1, 3u));
+    cb.insns.push_back(Movz(2, 15u));
+    cb.insns.push_back(Movz(8, 198u)); // socket
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 3u));
+    const size_t f16 = cb.insns.size(); cb.insns.push_back(0);
+    cb.insns.push_back(Movz(10, 16u)); // nl_family=AF_NETLINK
+    cb.insns.push_back(str_w(10, 31, 600u));
+    cb.insns.push_back(Movz(10, 1u));
+    cb.insns.push_back(str_w(10, 31, 604u)); // nl_pid=1
+    cb.insns.push_back(str_w(10, 31, 608u)); // nl_groups=1
+    cb.insns.push_back(AddImm64(1, 31, 600u));
+    cb.insns.push_back(Movz(2, 12u));
+    cb.insns.push_back(Movz(8, 200u)); // bind
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 0u));
+    const size_t f17 = cb.insns.size(); cb.insns.push_back(0);
+
+    // 9. Print [INIT-STAGE1-OK], then dup3(kmsg_fd, 1, 0) and write(1, "KMSG-DUP\n", 9) -> [KMSG] KMSG-DUP
+    cb.insns.push_back(Movz(0, 1u));
+    cb.EmitAdrPlaceholder(1, ok_msg);
+    cb.insns.push_back(Movz(2, 17u));
+    cb.insns.push_back(Movz(8, 64u));
+    cb.insns.push_back(Svc(0));
+
+    EmitImm64(cb.insns, 0, static_cast<uint64_t>(-100));
+    cb.EmitAdrPlaceholder(1, p_kmsg);
+    cb.insns.push_back(Movz(2, 1u));
+    cb.insns.push_back(Movz(3, 0u));
+    cb.insns.push_back(Movz(8, 56u)); // openat(/dev/kmsg)
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(Movz(1, 1u));  // newfd = 1 (stdout)
+    cb.insns.push_back(Movz(2, 0u));
+    cb.insns.push_back(Movz(8, 24u)); // dup3(kmsg_fd, 1, 0)
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 1u));
+    const size_t f18 = cb.insns.size(); cb.insns.push_back(0);
+
+    cb.insns.push_back(Movz(0, 1u));
+    cb.EmitAdrPlaceholder(1, kmsg_msg);
+    cb.insns.push_back(Movz(2, 9u));
+    cb.insns.push_back(Movz(8, 64u)); // write(1, "KMSG-DUP\n", 9)
+    cb.insns.push_back(Svc(0));
+
+    // 10. /proc/self/attr/exec write + readback + statx(/dev/block/vda).stx_rdev_major == 254
+    EmitImm64(cb.insns, 0, static_cast<uint64_t>(-100));
+    cb.EmitAdrPlaceholder(1, p_proc_attr_exec);
+    cb.insns.push_back(Movz(2, 2u)); // O_RDWR
+    cb.insns.push_back(Movz(3, 0u));
+    cb.insns.push_back(Movz(8, 56u)); // openat
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 3u));
+    const size_t f19 = cb.insns.size(); cb.insns.push_back(0);
+    cb.EmitAdrPlaceholder(1, xattr_val);
+    cb.insns.push_back(Movz(2, 20u));
+    cb.insns.push_back(Movz(8, 64u)); // write
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 20u));
+    const size_t f20 = cb.insns.size(); cb.insns.push_back(0);
+
+    EmitImm64(cb.insns, 0, static_cast<uint64_t>(-100));
+    cb.EmitAdrPlaceholder(1, p_vda);
+    cb.insns.push_back(Movz(2, 0u));
+    cb.insns.push_back(Movz(3, 0x7FFu));
+    cb.insns.push_back(AddImm64(4, 31, 640u));
+    cb.insns.push_back(Movz(8, 291u)); // statx
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 0u));
+    const size_t f21 = cb.insns.size(); cb.insns.push_back(0);
+    cb.insns.push_back(ldr_w(10, 31, 640u + 128u)); // stx_rdev_major
+    cb.insns.push_back(CmpImm64(10, 254u));
+    const size_t f22 = cb.insns.size(); cb.insns.push_back(0);
+
+    // 11. getpriority(0, 0) == 20, getcpu(sp+900, sp+904, 0) == 0, waitid(P_ALL=0,0,sp+912,4|1) == -10
+    cb.insns.push_back(Movz(0, 0u));
+    cb.insns.push_back(Movz(1, 0u));
+    cb.insns.push_back(Movz(8, 141u)); // getpriority
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 20u));
+    const size_t f23 = cb.insns.size(); cb.insns.push_back(0);
+
+    cb.insns.push_back(AddImm64(0, 31, 900u));
+    cb.insns.push_back(AddImm64(1, 31, 904u));
+    cb.insns.push_back(Movz(2, 0u));
+    cb.insns.push_back(Movz(8, 168u)); // getcpu
+    cb.insns.push_back(Svc(0));
+    cb.insns.push_back(CmpImm64(0, 0u));
+    const size_t f24 = cb.insns.size(); cb.insns.push_back(0);
+
+    cb.insns.push_back(Movz(0, 0u));
+    cb.insns.push_back(Movz(1, 0u));
+    cb.insns.push_back(AddImm64(2, 31, 912u));
+    cb.insns.push_back(Movz(3, 5u)); // WEXITED | WNOHANG
+    cb.insns.push_back(Movz(4, 0u));
+    cb.insns.push_back(Movz(8, 95u)); // waitid
+    cb.insns.push_back(Svc(0));
+    EmitImm64(cb.insns, 11, static_cast<uint64_t>(-10));
+    cb.insns.push_back(0xEB0B001Fu); // CMP X0, X11
+    const size_t f25 = cb.insns.size(); cb.insns.push_back(0);
+
+    cb.insns.push_back(Movz(0, 0u));
+    cb.insns.push_back(Movz(8, 94u)); // exit_group(0)
+    cb.insns.push_back(Svc(0));
+
+    const size_t fail_idx = cb.insns.size();
+    cb.insns.push_back(Movz(0, 97u));
+    cb.insns.push_back(Movz(8, 94u));
+    cb.insns.push_back(Svc(0));
+
+    cb.insns[f1] = BCond(11u /* LT */, static_cast<int32_t>(fail_idx - f1));
+    cb.insns[f2] = BCond(11u /* LT */, static_cast<int32_t>(fail_idx - f2));
+    cb.insns[f3] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f3));
+    cb.insns[f4] = BCond(11u /* LT */, static_cast<int32_t>(fail_idx - f4));
+    cb.insns[f5] = BCond(11u /* LT */, static_cast<int32_t>(fail_idx - f5));
+    cb.insns[f6] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f6));
+    cb.insns[f7] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f7));
+    cb.insns[f8] = BCond(11u /* LT */, static_cast<int32_t>(fail_idx - f8));
+    cb.insns[f9] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f9));
+    cb.insns[f10] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f10));
+    cb.insns[f11] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f11));
+    cb.insns[f12] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f12));
+    cb.insns[f13] = BCond(0u /* EQ */, static_cast<int32_t>(fail_idx - f13));
+    cb.insns[f14] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f14));
+    cb.insns[f15] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f15));
+    cb.insns[f16] = BCond(11u /* LT */, static_cast<int32_t>(fail_idx - f16));
+    cb.insns[f17] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f17));
+    cb.insns[f18] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f18));
+    cb.insns[f19] = BCond(11u /* LT */, static_cast<int32_t>(fail_idx - f19));
+    cb.insns[f20] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f20));
+    cb.insns[f21] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f21));
+    cb.insns[f22] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f22));
+    cb.insns[f23] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f23));
+    cb.insns[f24] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f24));
+    cb.insns[f25] = BCond(1u /* NE */, static_cast<int32_t>(fail_idx - f25));
+
+    std::vector<uint8_t> init_elf = BuildMinimalAArch64Elf64(cb.Finalize());
+    std::vector<uint8_t> rd = GzipVec(CpioArchive::Build({
+        MakeCpio("init", 0100755u, init_elf),
+    }));
+
+    std::vector<uint8_t> boot_bytes = BuildBootImgV2({}, rd, "androidboot.hardware=virt androidboot.selinux=permissive");
+    ParsedBootImage parsed;
+    std::string err;
+    assert(BootImageParser::ParseBootBytes(boot_bytes, parsed, err) == VmError::Ok);
+
+    VirtualMachineSkeleton vm;
+    MachineBootConfig cfg;
+    cfg.ram_mb = 64u;
+    assert(vm.InitializeAndStage(cfg, &parsed, err) == VmError::Ok);
+
+    std::string target;
+    assert(vm.BootGuest(false, target, err) == VmError::Ok);
+    assert(target == "/init");
+
+    assert(vm.StepGuest(50000ULL) == VmError::Ok);
+    assert(vm.CpuState().halted);
+    assert(vm.Supervisor()->Exited());
+    assert(vm.Supervisor()->ExitStatus() == 0);
+
+    const std::string uart = vm.Uart().CapturedOutput();
+    assert(uart.find("[INIT-STAGE1-OK]") != std::string::npos);
+    assert(uart.find("[KMSG] KMSG-DUP") != std::string::npos);
+    std::cout << "[PASS] Test 7: FirstStageMount DT/fstab, SELinux sysfs+xattr, dup3 stdio, capget & AF_NETLINK\n";
+}
+
 } // namespace
 
 int main() {
@@ -1075,6 +1387,7 @@ int main() {
     TestEl0MagiskInitToShellPrompt();
     TestElfPhdrTlsMmapCoherencyAndSyscalls();
     TestUniqueInodesProcSelfFdAndSigQueue();
+    TestFirstStageMountSelinuxXattrDup3CapNetlink();
     std::cout << "ALL M4 KERNEL & INIT BOOT TESTS PASSED.\n";
     return 0;
 }

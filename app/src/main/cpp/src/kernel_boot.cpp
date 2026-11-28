@@ -143,10 +143,46 @@ std::string NormalizeGuestPath(const std::string& raw) {
     return clean;
 }
 
+bool ParseNonNegInt(const std::string& s, int& out_val);
+
+bool ParseProcAttrPath(const std::string& norm, bool& out_is_dir, std::string& out_leaf) {
+    out_is_dir = false;
+    out_leaf.clear();
+    if (norm.rfind("/proc/", 0) != 0) return false;
+    const std::string rest = norm.substr(6);
+    const size_t slash1 = rest.find('/');
+    if (slash1 == std::string::npos) return false;
+    const std::string who = rest.substr(0, slash1);
+    int tmp_pid = 0;
+    if (who != "self" && who != "thread-self" && !ParseNonNegInt(who, tmp_pid)) return false;
+    const std::string tail = rest.substr(slash1 + 1u);
+    if (tail == "attr") {
+        out_is_dir = true;
+        return true;
+    }
+    if (tail.rfind("attr/", 0) == 0) {
+        const std::string leaf = tail.substr(5);
+        if (leaf == "current" || leaf == "exec" || leaf == "fscreate" ||
+            leaf == "sockcreate" || leaf == "keycreate" || leaf == "prev") {
+            out_leaf = leaf;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsProcAttrFilePath(const std::string& norm) {
+    bool is_dir = false;
+    std::string leaf;
+    return ParseProcAttrPath(norm, is_dir, leaf) && !is_dir;
+}
+
 bool IsWritableGuestOverlayPath(const std::string& norm) {
+    if (IsProcAttrFilePath(norm)) return true;
     static constexpr const char* kPrefixes[] = {
         "/dev", "/data", "/mnt", "/acct", "/cache", "/metadata",
-        "/linkerconfig", "/tmp", "/var", "/apex", "/debug_ramdisk", "/config"
+        "/linkerconfig", "/tmp", "/var", "/apex", "/debug_ramdisk", "/config",
+        "/sys/fs/cgroup", "/storage", "/proc/sys/kernel"
     };
     for (const char* p : kPrefixes) {
         const size_t plen = std::strlen(p);
@@ -176,6 +212,41 @@ uint64_t ComputeGuestInode(const std::string& key) {
     return (h == 0ULL) ? 1ULL : h;
 }
 
+bool IsBlockDevicePath(const std::string& norm) {
+    return norm == "/dev/block/vda" ||
+           norm.rfind("/dev/block/by-name/", 0) == 0;
+}
+
+bool IsSelinuxWritableNode(const std::string& norm) {
+    return norm == "/sys/fs/selinux/load" ||
+           norm == "/sys/fs/selinux/enforce" ||
+           norm == "/sys/fs/selinux/disable" ||
+           norm == "/sys/fs/selinux/checkreqprot" ||
+           norm == "/sys/fs/selinux/deny_unknown" ||
+           norm == "/sys/fs/selinux/commit_pending_bools" ||
+           norm == "/sys/fs/selinux/access" ||
+           norm == "/sys/fs/selinux/create" ||
+           norm == "/sys/fs/selinux/context";
+}
+
+std::string ExtractCmdlineParam(const std::string& cmdline, const std::string& key) {
+    const std::string needle = key + "=";
+    size_t pos = cmdline.find(needle);
+    while (pos != std::string::npos) {
+        if (pos == 0 || cmdline[pos - 1] == ' ' || cmdline[pos - 1] == '\t') {
+            const size_t vstart = pos + needle.size();
+            size_t vend = vstart;
+            while (vend < cmdline.size() && cmdline[vend] != ' ' &&
+                   cmdline[vend] != '\t' && cmdline[vend] != '\n') {
+                ++vend;
+            }
+            return cmdline.substr(vstart, vend - vstart);
+        }
+        pos = cmdline.find(needle, pos + 1u);
+    }
+    return {};
+}
+
 bool IsGuestCharDevicePath(const std::string& norm) {
     return norm == "/dev/null" || norm == "/dev/zero" ||
            norm == "/dev/urandom" || norm == "/dev/random" ||
@@ -187,7 +258,21 @@ bool IsGuestCharDevicePath(const std::string& norm) {
            norm == "/dev/haseeb_sensors" || norm == "/dev/video0" ||
            norm == "/dev/haseeb_gles" || norm == "/dev/magisk_su" ||
            norm == "/dev/snd/pcmC0D0p" || norm == "/dev/snd/pcmC0D0c" ||
-           norm == "/dev/stdin" || norm == "/dev/stdout" || norm == "/dev/stderr";
+           norm == "/dev/stdin" || norm == "/dev/stdout" || norm == "/dev/stderr" ||
+           norm == "/sys/fs/selinux/null";
+}
+
+uint64_t ComputeDeviceRdev(const std::string& norm) {
+    if (IsBlockDevicePath(norm)) return (254ULL << 8) | 0ULL;
+    if (norm == "/dev/null" || norm == "/sys/fs/selinux/null") return (1ULL << 8) | 3ULL;
+    if (norm == "/dev/zero") return (1ULL << 8) | 5ULL;
+    if (norm == "/dev/random") return (1ULL << 8) | 8ULL;
+    if (norm == "/dev/urandom") return (1ULL << 8) | 9ULL;
+    if (norm == "/dev/kmsg") return (1ULL << 8) | 11ULL;
+    if (norm == "/dev/tty") return (5ULL << 8) | 0ULL;
+    if (norm == "/dev/ptmx") return (5ULL << 8) | 2ULL;
+    if (IsGuestCharDevicePath(norm)) return (10ULL << 8) | 1ULL;
+    return 0ULL;
 }
 
 bool ParseNonNegInt(const std::string& s, int& out_val) {
@@ -1379,6 +1464,22 @@ bool LinuxGuestSupervisor::ResolveVfsFile(const std::string& path,
             out_data = rf->second;
             return finish_ok();
         }
+        {
+            bool attr_is_dir = false;
+            std::string attr_leaf;
+            if (ParseProcAttrPath(norm, attr_is_dir, attr_leaf)) {
+                if (attr_is_dir) {
+                    out_is_dir = true;
+                    out_children = {"current", "exec", "fscreate", "sockcreate", "keycreate", "prev"};
+                    return finish_ok();
+                }
+                if (attr_leaf == "current") {
+                    static constexpr char kInitCtx[] = "u:r:init:s0\0";
+                    out_data.assign(kInitCtx, kInitCtx + sizeof(kInitCtx));
+                }
+                return finish_ok();
+            }
+        }
         if (runtime_dirs_.find(norm) != runtime_dirs_.end()) {
             out_is_dir = true;
             const std::string prefix = (norm == "/") ? "/" : (norm + "/");
@@ -1496,6 +1597,40 @@ bool LinuxGuestSupervisor::ResolveVfsFile(const std::string& path,
             if (followed_link) continue;
             if (norm == "/system" && try_ext4("/")) return finish_ok();
             if (followed_link) continue;
+        }
+        // 3. Fallback default fstab for system-as-root init FirstStageMount when absent from image/DT
+        if (norm.rfind("/fstab.", 0) == 0) {
+            std::string hw = ExtractCmdlineParam(cmdline_, "androidboot.fstab_suffix");
+            if (hw.empty()) hw = ExtractCmdlineParam(cmdline_, "androidboot.hardware");
+            if (hw.empty()) hw = "virt";
+            if (norm == "/fstab." + hw || norm == "/fstab.virt") {
+                const std::string fstab_text =
+                    "# Haseeb Virtual ARM64 Board default fstab\n"
+                    "/dev/block/vda /data ext4 noatime,nosuid,nodev,noauto_da_alloc,errors=panic wait\n";
+                out_data.assign(fstab_text.begin(), fstab_text.end());
+                return finish_ok();
+            }
+        }
+        // 4. Fallback standard Android mountpoint directories when omitted by SAR image
+        if (norm == "/dev" || norm == "/dev/pts" || norm == "/dev/shm" ||
+            norm == "/data" || norm == "/mnt" || norm == "/acct" || norm == "/cache" ||
+            norm == "/metadata" || norm == "/linkerconfig" || norm == "/tmp" || norm == "/var" ||
+            norm == "/apex" || norm == "/debug_ramdisk" || norm == "/config" ||
+            norm == "/sys/fs/cgroup" || norm == "/storage" || norm == "/storage/self" ||
+            norm == "/storage/emulated" || norm == "/proc" || norm == "/sys") {
+            out_is_dir = true;
+            if (norm == "/dev") {
+                out_children = {"null", "zero", "urandom", "random", "kmsg", "tty", "ptmx",
+                                "binder", "hwbinder", "vndbinder", "ashmem", "ion",
+                                "dma_heap", "socket", "block", "input", "__properties__",
+                                "pts", "shm"};
+            } else if (norm == "/proc") {
+                out_children = {"self", "cmdline", "cpuinfo", "meminfo", "mounts", "filesystems",
+                                "stat", "uptime", "loadavg", "version", "device-tree", "sys"};
+            } else if (norm == "/sys") {
+                out_children = {"fs", "block", "devices", "class"};
+            }
+            return finish_ok();
         }
         return false;
     }
@@ -1640,6 +1775,7 @@ VmError LinuxGuestSupervisor::PrepareBoot(AArch64CpuCore& cpu,
     runtime_dirs_.clear();
     runtime_symlinks_.clear();
     runtime_files_.clear();
+    runtime_xattrs_.clear();
     CloseAllOpenFds();
     tasks_.clear();
     current_task_idx_ = 0;
@@ -2021,14 +2157,15 @@ int64_t LinuxGuestSupervisor::OpenGuestPath(std::unordered_map<int, OpenFile>& f
     const bool nonblock = (flags & 04000ULL) != 0ULL; // O_NONBLOCK
     const int cloexec = ((flags & 02000000ULL) != 0ULL) ? 1 : 0; // O_CLOEXEC
     if (norm == "/dev/null" || norm == "/dev/zero" ||
-        norm == "/dev/urandom" || norm == "/dev/random") {
+        norm == "/dev/urandom" || norm == "/dev/random" ||
+        norm == "/sys/fs/selinux/null") {
         if (check_access_only) return 0;
         int fd = next_fd++;
         OpenFile of;
         of.path = norm;
         of.fd_flags = cloexec;
         of.nonblock = nonblock;
-        of.is_dev_null = (norm == "/dev/null");
+        of.is_dev_null = (norm == "/dev/null" || norm == "/sys/fs/selinux/null");
         of.is_dev_zero = (norm == "/dev/zero");
         of.is_dev_urandom = (norm == "/dev/urandom" || norm == "/dev/random");
         of.st_dev = 2ULL;
@@ -2216,6 +2353,7 @@ int64_t LinuxGuestSupervisor::OpenGuestPath(std::unordered_map<int, OpenFile>& f
     if ((flags & 0200000ULL /* O_DIRECTORY */) != 0ULL && !is_dir) return -20; // ENOTDIR
     const std::string eff_path = resolved_path.empty() ? norm : resolved_path;
     const bool overlay_writable = !is_dir && IsWritableGuestOverlayPath(eff_path);
+    const bool selinux_writable = !is_dir && IsSelinuxWritableNode(eff_path);
     const bool open_for_write = ((flags & 3ULL) != 0ULL) || ((flags & 01000ULL) != 0ULL);
     if (overlay_writable && ((flags & 01000ULL /* O_TRUNC */) != 0ULL)) {
         data.clear();
@@ -2230,13 +2368,14 @@ int64_t LinuxGuestSupervisor::OpenGuestPath(std::unordered_map<int, OpenFile>& f
     of.fd_flags = cloexec;
     of.is_dir = is_dir;
     of.nonblock = nonblock;
-    of.is_writable_mem = overlay_writable || (runtime_files_.find(eff_path) != runtime_files_.end());
-    of.is_runtime_vfs = of.is_writable_mem;
+    of.is_writable_mem = overlay_writable || selinux_writable ||
+                         (runtime_files_.find(eff_path) != runtime_files_.end());
+    of.is_runtime_vfs = overlay_writable || (runtime_files_.find(eff_path) != runtime_files_.end());
     if ((flags & 02000ULL /* O_APPEND */) != 0ULL && of.is_writable_mem) {
         of.offset = of.data.size();
     }
     of.dir_children = std::move(children);
-    of.st_dev = IsGuestCharDevicePath(of.path) ? 2ULL : 1ULL;
+    of.st_dev = (IsGuestCharDevicePath(of.path) || IsBlockDevicePath(of.path)) ? 2ULL : 1ULL;
     of.st_ino = ComputeGuestInode(of.path);
     fds.emplace(fd, std::move(of));
     return fd;
@@ -2246,15 +2385,17 @@ int64_t LinuxGuestSupervisor::StatFd(const std::unordered_map<int, OpenFile>& fd
                                      int fd,
                                      GuestStatMeta& out) const {
     if (fd < 0) return -9; // EBADF
-    if (fd <= 2) {
-        out.st_dev = 2ULL;
-        out.st_ino = static_cast<uint64_t>(100 + fd);
-        out.st_mode = 0020666u;
-        out.st_size = 0ULL;
-        return 0;
-    }
     auto it = fds.find(fd);
-    if (it == fds.end()) return -9;
+    if (it == fds.end()) {
+        if (fd <= 2) {
+            out.st_dev = 2ULL;
+            out.st_ino = static_cast<uint64_t>(100 + fd);
+            out.st_mode = 0020666u;
+            out.st_size = 0ULL;
+            return 0;
+        }
+        return -9;
+    }
     const OpenFile& of = it->second;
     out.st_dev = (of.st_dev != 0ULL) ? of.st_dev : 1ULL;
     out.st_ino = (of.st_ino != 0ULL) ? of.st_ino : ComputeGuestInode(of.path);
@@ -2269,10 +2410,15 @@ int64_t LinuxGuestSupervisor::StatFd(const std::unordered_map<int, OpenFile>& fd
     }
     if (of.is_dir) {
         out.st_mode = 0040755u;
-    } else if (of.unix_sock || of.is_host_inet_sock) {
+    } else if (of.unix_sock || of.is_host_inet_sock || of.is_netlink) {
         out.st_mode = 0140777u;
-    } else if (IsGuestCharDevicePath(of.path)) {
+    } else if (IsBlockDevicePath(of.path)) {
+        out.st_mode = 0060660u;
+        out.st_rdev = ComputeDeviceRdev(of.path);
+    } else if (IsGuestCharDevicePath(of.path) || of.is_kmsg || of.is_tty || of.is_dev_null ||
+               of.is_dev_zero || of.is_dev_urandom) {
         out.st_mode = 0020666u;
+        out.st_rdev = ComputeDeviceRdev(of.path);
     } else {
         out.st_mode = 0100755u;
     }
@@ -2337,9 +2483,14 @@ int64_t LinuxGuestSupervisor::StatGuestPath(const std::unordered_map<int, OpenFi
     if (is_dir) {
         out.st_dev = 1ULL;
         out.st_mode = 0040755u;
+    } else if (IsBlockDevicePath(canon)) {
+        out.st_dev = 2ULL;
+        out.st_mode = 0060660u;
+        out.st_rdev = ComputeDeviceRdev(canon);
     } else if (IsGuestCharDevicePath(canon)) {
         out.st_dev = 2ULL;
         out.st_mode = 0020666u;
+        out.st_rdev = ComputeDeviceRdev(canon);
     } else {
         out.st_dev = 1ULL;
         out.st_mode = 0100755u;
@@ -2472,6 +2623,135 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
     auto& fb_pas = (cur && cur->vm) ? cur->vm->fb_mapped_pas : fb_mapped_pas_;
 
     switch (nr) {
+        case 5:   // setxattr(path, name, value, size, flags)
+        case 6:   // lsetxattr(path, name, value, size, flags)
+        case 7: { // fsetxattr(fd, name, value, size, flags)
+            std::string key_path;
+            if (nr == 7) {
+                const int fd = static_cast<int>(st.x[0]);
+                auto fit = fds.find(fd);
+                if (fit == fds.end()) return -9;
+                key_path = fit->second.path;
+            } else {
+                std::string path, norm;
+                if (!ReadUserString(cpu, st.x[0], path)) return -14;
+                if (!ResolveGuestPathWithDirfd(fds, -100, path, norm)) return -9;
+                key_path = norm;
+            }
+            std::string xname;
+            if (!ReadUserString(cpu, st.x[1], xname)) return -14;
+            const size_t xlen = std::min<size_t>(static_cast<size_t>(st.x[3]), 4096u);
+            std::vector<uint8_t> xval(xlen);
+            if (xlen > 0u && !ReadUserBytes(cpu, st.x[2], xval.data(), xlen)) return -14;
+            runtime_xattrs_[key_path][xname] = std::move(xval);
+            return 0;
+        }
+        case 8:   // getxattr(path, name, value, size)
+        case 9:   // lgetxattr(path, name, value, size)
+        case 10: { // fgetxattr(fd, name, value, size)
+            std::string key_path;
+            bool exists = false;
+            if (nr == 10) {
+                const int fd = static_cast<int>(st.x[0]);
+                auto fit = fds.find(fd);
+                if (fit != fds.end()) {
+                    key_path = fit->second.path;
+                    exists = true;
+                } else if (fd >= 0 && fd <= 2) {
+                    key_path = (fd == 0) ? "/dev/stdin" : (fd == 1 ? "/dev/stdout" : "/dev/stderr");
+                    exists = true;
+                } else {
+                    return -9;
+                }
+            } else {
+                std::string path, norm;
+                if (!ReadUserString(cpu, st.x[0], path)) return -14;
+                if (!ResolveGuestPathWithDirfd(fds, -100, path, norm)) return -9;
+                key_path = norm;
+                std::string hp, rel;
+                if (ResolveHostStoragePath(norm, hp, rel)) {
+                    struct stat hst{};
+                    exists = (::stat(hp.c_str(), &hst) == 0);
+                } else {
+                    std::vector<uint8_t> tmp;
+                    bool is_dir = false;
+                    std::vector<std::string> ch;
+                    exists = ResolveVfsFile(norm, tmp, is_dir, ch, nullptr, &fds);
+                }
+            }
+            if (!exists) return -2; // ENOENT
+            std::string xname;
+            if (!ReadUserString(cpu, st.x[1], xname)) return -14;
+            std::vector<uint8_t> val;
+            bool found = false;
+            if (auto pit = runtime_xattrs_.find(key_path); pit != runtime_xattrs_.end()) {
+                if (auto xit = pit->second.find(xname); xit != pit->second.end()) {
+                    val = xit->second;
+                    found = true;
+                }
+            }
+            if (!found && xname == "security.selinux") {
+                static constexpr char kDefaultCtx[] = "u:object_r:unlabeled:s0\0";
+                val.assign(kDefaultCtx, kDefaultCtx + sizeof(kDefaultCtx));
+                found = true;
+            }
+            if (!found) return -61; // ENODATA
+            const size_t cap = static_cast<size_t>(st.x[3]);
+            if (cap == 0u) return static_cast<int64_t>(val.size());
+            if (cap < val.size()) return -34; // ERANGE
+            if (!val.empty() && !WriteUserBytes(cpu, st.x[2], val.data(), val.size())) return -14;
+            return static_cast<int64_t>(val.size());
+        }
+        case 11:  // listxattr(path, list, size)
+        case 12:  // llistxattr(path, list, size)
+        case 13: { // flistxattr(fd, list, size)
+            std::string key_path;
+            if (nr == 13) {
+                const int fd = static_cast<int>(st.x[0]);
+                auto fit = fds.find(fd);
+                if (fit == fds.end()) return (fd >= 0 && fd <= 2) ? 0 : -9;
+                key_path = fit->second.path;
+            } else {
+                std::string path, norm;
+                if (!ReadUserString(cpu, st.x[0], path)) return -14;
+                if (!ResolveGuestPathWithDirfd(fds, -100, path, norm)) return -9;
+                key_path = norm;
+            }
+            std::vector<uint8_t> out_list;
+            if (auto pit = runtime_xattrs_.find(key_path); pit != runtime_xattrs_.end()) {
+                for (const auto& kv : pit->second) {
+                    out_list.insert(out_list.end(), kv.first.begin(), kv.first.end());
+                    out_list.push_back('\0');
+                }
+            }
+            const size_t cap = static_cast<size_t>(st.x[2]);
+            if (cap == 0u) return static_cast<int64_t>(out_list.size());
+            if (cap < out_list.size()) return -34;
+            if (!out_list.empty() && !WriteUserBytes(cpu, st.x[1], out_list.data(), out_list.size())) return -14;
+            return static_cast<int64_t>(out_list.size());
+        }
+        case 14:  // removexattr(path, name)
+        case 15:  // lremovexattr(path, name)
+        case 16: { // fremovexattr(fd, name)
+            std::string key_path;
+            if (nr == 16) {
+                const int fd = static_cast<int>(st.x[0]);
+                auto fit = fds.find(fd);
+                if (fit == fds.end()) return -9;
+                key_path = fit->second.path;
+            } else {
+                std::string path, norm;
+                if (!ReadUserString(cpu, st.x[0], path)) return -14;
+                if (!ResolveGuestPathWithDirfd(fds, -100, path, norm)) return -9;
+                key_path = norm;
+            }
+            std::string xname;
+            if (!ReadUserString(cpu, st.x[1], xname)) return -14;
+            if (auto pit = runtime_xattrs_.find(key_path); pit != runtime_xattrs_.end()) {
+                pit->second.erase(xname);
+            }
+            return 0;
+        }
         case 17: { // getcwd(buf, size)
             uint64_t buf = st.x[0];
             uint64_t sz = st.x[1];
@@ -2709,6 +2989,18 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
         }
         case 23: { // dup(oldfd)
             int oldfd = static_cast<int>(st.x[0]);
+            auto it = fds.find(oldfd);
+            if (it != fds.end()) {
+                OpenFile copy = it->second;
+                copy.fd_flags = 0;
+                if (copy.host_fd >= 0) {
+                    copy.host_fd = ::dup(copy.host_fd);
+                    if (copy.host_fd < 0) return -static_cast<int64_t>(errno);
+                }
+                int newfd = next_fd++;
+                fds.emplace(newfd, std::move(copy));
+                return newfd;
+            }
             if (oldfd >= 0 && oldfd <= 2) {
                 int newfd = next_fd++;
                 OpenFile of;
@@ -2719,40 +3011,31 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 fds.emplace(newfd, std::move(of));
                 return newfd;
             }
-            auto it = fds.find(oldfd);
-            if (it == fds.end()) return -9;
-            OpenFile copy = it->second;
-            copy.fd_flags = 0;
-            if (copy.host_fd >= 0) {
-                copy.host_fd = ::dup(copy.host_fd);
-                if (copy.host_fd < 0) return -static_cast<int64_t>(errno);
-            }
-            int newfd = next_fd++;
-            fds.emplace(newfd, std::move(copy));
-            return newfd;
+            return -9;
         }
         case 24: { // dup3(oldfd, newfd, flags)
             int oldfd = static_cast<int>(st.x[0]);
             int newfd = static_cast<int>(st.x[1]);
             uint64_t dflags = st.x[2];
+            if (oldfd < 0 || newfd < 0) return -9;
             if (oldfd == newfd) return -22;
             OpenFile copy;
-            if (oldfd >= 0 && oldfd <= 2) {
-                copy.path = (oldfd == 0) ? "/dev/stdin" : (oldfd == 1 ? "/dev/stdout" : "/dev/stderr");
-                copy.is_stdio_out = (oldfd == 1 || oldfd == 2);
-                copy.st_dev = 2ULL;
-                copy.st_ino = static_cast<uint64_t>(100 + oldfd);
-            } else {
-                auto it = fds.find(oldfd);
-                if (it == fds.end()) return -9;
+            auto it = fds.find(oldfd);
+            if (it != fds.end()) {
                 copy = it->second;
                 if (copy.host_fd >= 0) {
                     copy.host_fd = ::dup(copy.host_fd);
                     if (copy.host_fd < 0) return -static_cast<int64_t>(errno);
                 }
+            } else if (oldfd >= 0 && oldfd <= 2) {
+                copy.path = (oldfd == 0) ? "/dev/stdin" : (oldfd == 1 ? "/dev/stdout" : "/dev/stderr");
+                copy.is_stdio_out = (oldfd == 1 || oldfd == 2);
+                copy.st_dev = 2ULL;
+                copy.st_ino = static_cast<uint64_t>(100 + oldfd);
+            } else {
+                return -9;
             }
             copy.fd_flags = ((dflags & 02000000ULL) != 0ULL) ? 1 : 0;
-            if (newfd <= 2) return newfd;
             auto existing = fds.find(newfd);
             if (existing != fds.end()) {
                 CloseSingleOpenFile(existing->second);
@@ -2766,7 +3049,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             int fd = static_cast<int>(st.x[0]);
             int cmd = static_cast<int>(st.x[1]);
             uint64_t arg = st.x[2];
-            auto it = (fd > 2) ? fds.find(fd) : fds.end();
+            auto it = fds.find(fd);
             if (fd < 0 || (fd > 2 && it == fds.end())) return -9; // EBADF
             switch (cmd) {
                 case 0:    // F_DUPFD
@@ -2774,17 +3057,17 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                     int min_fd = std::max<int>(3, static_cast<int>(arg));
                     while (fds.find(min_fd) != fds.end()) ++min_fd;
                     OpenFile copy;
-                    if (fd <= 2) {
-                        copy.path = (fd == 0) ? "/dev/stdin" : (fd == 1 ? "/dev/stdout" : "/dev/stderr");
-                        copy.is_stdio_out = (fd == 1 || fd == 2);
-                        copy.st_dev = 2ULL;
-                        copy.st_ino = static_cast<uint64_t>(100 + fd);
-                    } else {
+                    if (it != fds.end()) {
                         copy = it->second;
                         if (copy.host_fd >= 0) {
                             copy.host_fd = ::dup(copy.host_fd);
                             if (copy.host_fd < 0) return -static_cast<int64_t>(errno);
                         }
+                    } else {
+                        copy.path = (fd == 0) ? "/dev/stdin" : (fd == 1 ? "/dev/stdout" : "/dev/stderr");
+                        copy.is_stdio_out = (fd == 1 || fd == 2);
+                        copy.st_dev = 2ULL;
+                        copy.st_ino = static_cast<uint64_t>(100 + fd);
                     }
                     copy.fd_flags = (cmd == 1030) ? 1 : 0;
                     fds.emplace(min_fd, std::move(copy));
@@ -2792,14 +3075,14 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                     return min_fd;
                 }
                 case 1: // F_GETFD
-                    return (fd <= 2) ? 0 : it->second.fd_flags;
+                    return (it != fds.end()) ? it->second.fd_flags : 0;
                 case 2: // F_SETFD
-                    if (fd > 2) it->second.fd_flags = static_cast<int>(arg & 1ULL);
+                    if (it != fds.end()) it->second.fd_flags = static_cast<int>(arg & 1ULL);
                     return 0;
                 case 3: // F_GETFL
-                    return (fd <= 2) ? 2 : (it->second.nonblock ? 04000 : 0);
+                    return (it != fds.end()) ? (it->second.nonblock ? 04000 : 0) : 2;
                 case 4: // F_SETFL
-                    if (fd > 2) {
+                    if (it != fds.end()) {
                         it->second.nonblock = (arg & 04000ULL) != 0ULL;
                         if (it->second.host_fd >= 0) {
                             int hf = ::fcntl(it->second.host_fd, F_GETFL, 0);
@@ -2814,6 +3097,25 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                     return 0;
             }
         }
+        case 26: { // inotify_init1(flags)
+            const uint64_t iflags = st.x[0];
+            const int ifd = next_fd++;
+            OpenFile of;
+            of.path = "anon_inode:inotify";
+            of.fd_flags = ((iflags & 02000000ULL) != 0ULL) ? 1 : 0;
+            of.nonblock = (iflags & 04000ULL) != 0ULL;
+            of.is_dev_null = true;
+            of.st_dev = 4ULL;
+            of.st_ino = static_cast<uint64_t>(700000 + ifd);
+            fds.emplace(ifd, std::move(of));
+            return ifd;
+        }
+        case 27: // inotify_add_watch(fd, pathname, mask)
+            return 1;
+        case 28: // inotify_rm_watch(fd, wd)
+        case 30: // ioprio_set(which, who, ioprio)
+        case 31: // ioprio_get(which, who)
+            return 0;
         case 34: { // mkdirat(dirfd, pathname, mode)
             std::string path, norm;
             if (!ReadUserString(cpu, st.x[1], path)) return -14;
@@ -2823,6 +3125,12 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 if (IsWritableGuestOverlayPath(norm)) {
                     runtime_dirs_.insert(norm);
                     return 0;
+                }
+                std::vector<uint8_t> tmp;
+                bool is_dir = false;
+                std::vector<std::string> ch;
+                if (ResolveVfsFile(norm, tmp, is_dir, ch, nullptr, &fds)) {
+                    return -17; // EEXIST
                 }
                 return -13; // EACCES
             }
@@ -2896,11 +3204,13 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
         }
         case 43:   // statfs(path, buf)
         case 44: { // fstatfs(fd, buf)
+            std::string fs_path;
             if (nr == 43) {
                 std::string path;
                 if (!ReadUserString(cpu, st.x[0], path)) return -14;
                 std::string norm;
                 if (!ResolveGuestPathWithDirfd(fds, -100, path, norm)) return -2;
+                fs_path = norm;
                 std::string hp, rel;
                 if (!ResolveHostStoragePath(norm, hp, rel)) {
                     std::vector<uint8_t> tmp;
@@ -2910,7 +3220,9 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 }
             } else {
                 int fd = static_cast<int>(st.x[0]);
-                if (fd > 2 && fds.find(fd) == fds.end()) return -9;
+                auto fit = fds.find(fd);
+                if (fd > 2 && fit == fds.end()) return -9;
+                if (fit != fds.end()) fs_path = fit->second.path;
             }
             struct LinuxStatFs64 {
                 int64_t f_type;
@@ -2927,7 +3239,18 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 int64_t f_spare[4];
             } sfs{};
             const uint64_t blocks = std::max<uint64_t>(65536ULL, ram_bytes_ / 4096ULL);
-            sfs.f_type = 0xEF53LL; // EXT4_SUPER_MAGIC
+            int64_t ftype = 0xEF53LL; // EXT4_SUPER_MAGIC
+            if (fs_path == "/sys/fs/selinux" || fs_path.rfind("/sys/fs/selinux/", 0) == 0) {
+                ftype = 0xF97CFF8CLL; // SELINUX_MAGIC
+            } else if (fs_path == "/proc" || fs_path.rfind("/proc/", 0) == 0) {
+                ftype = 0x9FA0LL; // PROC_SUPER_MAGIC
+            } else if (fs_path == "/sys" || fs_path.rfind("/sys/", 0) == 0) {
+                ftype = 0x62656572LL; // SYSFS_MAGIC
+            } else if (IsWritableGuestOverlayPath(fs_path) &&
+                       fs_path != "/data" && fs_path.rfind("/data/", 0) != 0) {
+                ftype = 0x01021994LL; // TMPFS_MAGIC
+            }
+            sfs.f_type = ftype;
             sfs.f_bsize = 4096LL;
             sfs.f_blocks = blocks;
             sfs.f_bfree = blocks / 2ULL;
@@ -3278,9 +3601,10 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
         }
         case 57: { // close(fd)
             int fd = static_cast<int>(st.x[0]);
-            if (fd <= 2) return 0;
             auto it = fds.find(fd);
-            if (it == fds.end()) return -9;
+            if (it == fds.end()) {
+                return (fd >= 0 && fd <= 2) ? 0 : -9;
+            }
             CloseSingleOpenFile(it->second);
             fds.erase(it);
             return 0;
@@ -3314,7 +3638,8 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             int fd = static_cast<int>(st.x[0]);
             uint64_t buf = st.x[1];
             size_t count = static_cast<size_t>(st.x[2]);
-            if (fd == 0) {
+            auto it = fds.find(fd);
+            if (fd == 0 && it == fds.end()) {
                 size_t got = 0;
                 while (got < count) {
                     if ((uart_.Read(0x018ULL, 4) & (1u << 4)) != 0u) break; // RXFE
@@ -3331,7 +3656,6 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 }
                 return static_cast<int64_t>(got);
             }
-            auto it = fds.find(fd);
             if (it == fds.end() || it->second.is_dir) return -9;
             if (it->second.is_dev_null) return 0;
             if (it->second.is_dev_zero) {
@@ -3504,12 +3828,14 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             size_t count = static_cast<size_t>(st.x[2]);
             std::vector<uint8_t> tmp(count);
             if (count > 0 && !ReadUserBytes(cpu, buf, tmp.data(), count)) return -14;
-            if (fd == 1 || fd == 2) {
-                for (uint8_t b : tmp) uart_.Write(0x000ULL, 1, b);
-                return static_cast<int64_t>(count);
-            }
             auto it = fds.find(fd);
-            if (it == fds.end()) return -9;
+            if (it == fds.end()) {
+                if (fd == 1 || fd == 2) {
+                    for (uint8_t b : tmp) uart_.Write(0x000ULL, 1, b);
+                    return static_cast<int64_t>(count);
+                }
+                return -9;
+            }
             if (it->second.is_stdio_out || it->second.is_tty) {
                 for (uint8_t b : tmp) uart_.Write(0x000ULL, 1, b);
                 return static_cast<int64_t>(count);
@@ -3556,10 +3882,14 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 return (w >= 0) ? static_cast<int64_t>(w) : -static_cast<int64_t>(errno);
             }
             if (it->second.is_memfd || it->second.is_ashmem || it->second.is_writable_mem) {
-                const size_t end = it->second.offset + count;
-                if (end > it->second.data.size()) it->second.data.resize(end, 0u);
-                if (count > 0u) std::memcpy(it->second.data.data() + it->second.offset, tmp.data(), count);
-                it->second.offset = end;
+                if (IsProcAttrFilePath(it->second.path) && it->second.offset == 0u) {
+                    it->second.data = tmp;
+                } else {
+                    const size_t end = it->second.offset + count;
+                    if (end > it->second.data.size()) it->second.data.resize(end, 0u);
+                    if (count > 0u) std::memcpy(it->second.data.data() + it->second.offset, tmp.data(), count);
+                }
+                it->second.offset = it->second.offset + count;
                 if (it->second.is_runtime_vfs) runtime_files_[it->second.path] = it->second.data;
                 return static_cast<int64_t>(count);
             }
@@ -3582,9 +3912,9 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             uint64_t iov_va = st.x[1];
             int iovcnt = std::min(static_cast<int>(st.x[2]), 1024);
             if (iovcnt < 0) return -22;
-            auto it = (fd > 2) ? fds.find(fd) : fds.end();
-            if (fd < 0 || (fd > 2 && (it == fds.end() || it->second.is_dir))) return -9;
-            if (fd > 2 && it->second.unix_sock) {
+            auto it = fds.find(fd);
+            if (fd < 0 || (it == fds.end() && fd != 0) || (it != fds.end() && it->second.is_dir)) return -9;
+            if (it != fds.end() && it->second.unix_sock) {
                 auto& sock = *it->second.unix_sock;
                 if (sock.rx_chunks.empty()) {
                     if (sock.peer_closed || sock.shutdown_rd) return 0;
@@ -3623,7 +3953,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 if (!ReadUserBytes(cpu, iov_va + static_cast<uint64_t>(i) * 16ULL, vec, 16)) return -14;
                 const size_t len = static_cast<size_t>(vec[1]);
                 if (len == 0u) continue;
-                if (fd == 0) {
+                if (fd == 0 && it == fds.end()) {
                     size_t got = 0;
                     while (got < len) {
                         if ((uart_.Read(0x018ULL, 4) & (1u << 4)) != 0u) break;
@@ -3673,9 +4003,9 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             uint64_t iov_va = st.x[1];
             int iovcnt = std::min(static_cast<int>(st.x[2]), 1024);
             if (iovcnt < 0) return -22;
-            auto it = (fd > 2) ? fds.find(fd) : fds.end();
-            if (fd != 1 && fd != 2 && (fd < 0 || it == fds.end())) return -9;
-            if (fd > 2 && it->second.unix_sock) {
+            auto it = fds.find(fd);
+            if (fd < 0 || (it == fds.end() && fd != 1 && fd != 2)) return -9;
+            if (it != fds.end() && it->second.unix_sock) {
                 auto& sock = *it->second.unix_sock;
                 if (sock.shutdown_wr) return -32;
                 std::vector<uint8_t> combined;
@@ -3715,7 +4045,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 if (vec[1] > 0) {
                     std::vector<uint8_t> tmp(static_cast<size_t>(vec[1]));
                     if (!ReadUserBytes(cpu, vec[0], tmp.data(), tmp.size())) return -14;
-                    if (fd == 1 || fd == 2 || it->second.is_stdio_out || it->second.is_tty) {
+                    if (it == fds.end() || it->second.is_stdio_out || it->second.is_tty) {
                         for (uint8_t b : tmp) uart_.Write(0x000ULL, 1, b);
                         total += static_cast<int64_t>(vec[1]);
                     } else if (it->second.is_kmsg) {
@@ -3965,6 +4295,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             ks.st_nlink = 1;
             ks.st_uid = uid_;
             ks.st_gid = gid_;
+            ks.st_rdev = meta.st_rdev;
             ks.st_size = static_cast<int64_t>(meta.st_size);
             ks.st_blksize = 4096;
             ks.st_blocks = static_cast<int64_t>((meta.st_size + 511u) / 512u);
@@ -3983,6 +4314,8 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             const uint32_t nlink = 1u;
             const uint16_t mode = static_cast<uint16_t>(meta.st_mode & 0xFFFFu);
             const uint64_t blocks = (meta.st_size + 511u) / 512u;
+            const uint32_t rdev_major = static_cast<uint32_t>((meta.st_rdev >> 8) & 0xFFFu);
+            const uint32_t rdev_minor = static_cast<uint32_t>(meta.st_rdev & 0xFFu);
             const uint32_t dev_major = 0u;
             const uint32_t dev_minor = static_cast<uint32_t>(meta.st_dev & 0xFFu);
             std::memcpy(buf + 0u, &mask, 4u);
@@ -3994,6 +4327,8 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             std::memcpy(buf + 32u, &meta.st_ino, 8u);
             std::memcpy(buf + 40u, &meta.st_size, 8u);
             std::memcpy(buf + 48u, &blocks, 8u);
+            std::memcpy(buf + 128u, &rdev_major, 4u);
+            std::memcpy(buf + 132u, &rdev_minor, 4u);
             std::memcpy(buf + 136u, &dev_major, 4u);
             std::memcpy(buf + 140u, &dev_minor, 4u);
             return WriteUserBytes(cpu, st.x[4], buf, sizeof(buf)) ? 0 : -14;
@@ -4011,9 +4346,22 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             return 0;
         }
         case 90: { // capget(hdrp, datap)
+            if (st.x[0] != 0ULL) {
+                uint32_t hdr[2]{};
+                if (!ReadUserBytes(cpu, st.x[0], hdr, sizeof(hdr))) return -14;
+                if (hdr[0] != 0x20080522u && hdr[0] != 0x20071026u && hdr[0] != 0x19980330u) {
+                    hdr[0] = 0x20080522u;
+                    WriteUserBytes(cpu, st.x[0], hdr, sizeof(hdr));
+                    return (st.x[1] == 0ULL) ? 0 : -22;
+                }
+            }
             if (st.x[1] != 0ULL) {
-                uint8_t zeros[24]{};
-                if (!WriteUserBytes(cpu, st.x[1], zeros, sizeof(zeros))) return -14;
+                uint32_t cap_data[6]{};
+                if (uid_ == 0u) {
+                    cap_data[0] = 0xFFFFFFFFu; cap_data[1] = 0xFFFFFFFFu; cap_data[2] = 0u;
+                    cap_data[3] = 0x000001FFu; cap_data[4] = 0x000001FFu; cap_data[5] = 0u;
+                }
+                if (!WriteUserBytes(cpu, st.x[1], cap_data, sizeof(cap_data))) return -14;
             }
             return 0;
         }
@@ -4079,6 +4427,81 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 out_halt = true;
                 return 0;
             }
+            out_yield = true;
+            return 0;
+        }
+        case 95: { // waitid(idtype, id, infop, options, rusage)
+            if (!cur) return -10;
+            const int32_t caller_tgid = cur->tgid;
+            const int32_t idtype = static_cast<int32_t>(static_cast<int64_t>(st.x[0]));
+            const int32_t target = (idtype == 1 /* P_PID */) ? static_cast<int32_t>(static_cast<int64_t>(st.x[1])) : -1;
+            const uint64_t infop_uva = st.x[2];
+            const uint64_t options = st.x[3];
+
+            bool has_matching_child = false;
+            int32_t reap_tgid = -1;
+            int reap_status = 0;
+            for (const auto& up : tasks_) {
+                const GuestTask* t = up.get();
+                if (!t || t->ppid != caller_tgid) continue;
+                if (idtype == 1 && t->tgid != target) continue;
+                has_matching_child = true;
+                bool group_all_zombie = true;
+                for (const auto& gp : tasks_) {
+                    if (gp && gp->tgid == t->tgid && gp->state != TaskState::Zombie) {
+                        group_all_zombie = false;
+                        break;
+                    }
+                }
+                if (group_all_zombie) {
+                    reap_tgid = t->tgid;
+                    reap_status = t->exit_status;
+                    break;
+                }
+            }
+            if (reap_tgid > 0) {
+                if (infop_uva != 0ULL) {
+                    uint8_t si[128]{};
+                    const int32_t signo = 17; // SIGCHLD
+                    const int32_t code = 1;   // CLD_EXITED
+                    std::memcpy(si + 0u, &signo, 4u);
+                    std::memcpy(si + 8u, &code, 4u);
+                    std::memcpy(si + 16u, &reap_tgid, 4u);
+                    std::memcpy(si + 24u, &reap_status, 4u);
+                    if (!WriteUserBytes(cpu, infop_uva, si, sizeof(si))) return -14;
+                }
+                if ((options & 0x01000000ULL /* WNOWAIT */) == 0ULL) {
+                    const GuestTask* cur_ptr = CurrentTask();
+                    for (size_t i = 0; i < tasks_.size(); ) {
+                        if (tasks_[i] && tasks_[i]->tgid == reap_tgid) {
+                            tasks_.erase(tasks_.begin() + static_cast<std::ptrdiff_t>(i));
+                        } else {
+                            ++i;
+                        }
+                    }
+                    current_task_idx_ = 0;
+                    for (size_t i = 0; i < tasks_.size(); ++i) {
+                        if (tasks_[i].get() == cur_ptr) {
+                            current_task_idx_ = i;
+                            break;
+                        }
+                    }
+                }
+                return 0;
+            }
+            if (!has_matching_child) return -10; // ECHILD
+            if ((options & 1ULL /* WNOHANG */) != 0ULL) {
+                if (infop_uva != 0ULL) {
+                    uint8_t zeros[128]{};
+                    if (!WriteUserBytes(cpu, infop_uva, zeros, sizeof(zeros))) return -14;
+                }
+                return 0;
+            }
+            cur->state = TaskState::WaitingChild;
+            cur->wait_target_pid = target;
+            cur->wait_status_uva = 0ULL;
+            st.sys.elr_el1 -= 4ULL;
+            out_retry = true;
             out_yield = true;
             return 0;
         }
@@ -4243,6 +4666,7 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
         case 129: // kill(pid, sig)
         case 130: // tkill(tid, sig)
         case 131: // tgkill(tgid, tid, sig)
+        case 138: // rt_sigqueueinfo(tgid, sig, uinfo)
         case 240: { // rt_tgsigqueueinfo(tgid, tid, sig, uinfo)
             const uint64_t sig = (nr == 131 || nr == 240) ? st.x[2] : st.x[1];
             if (sig == 0ULL) return 0;
@@ -4259,6 +4683,8 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             }
             return 0;
         }
+        case 137: // rt_sigtimedwait(set, info, ts, sigsetsize)
+            return -11; // EAGAIN
         case 132: { // sigaltstack(const stack_t* ss, stack_t* old_ss)
             struct LinuxSigAltStack {
                 uint64_t ss_sp;
@@ -4341,6 +4767,12 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 if (sl != std::string::npos) base = base.substr(sl + 1u);
                 std::snprintf(comm, sizeof(comm), "%s", base.c_str());
                 return WriteUserBytes(cpu, st.x[1], comm, sizeof(comm)) ? 0 : -14;
+            }
+            if (opt == 23ULL /* PR_CAPBSET_READ */) {
+                return (st.x[1] <= 40ULL) ? 1 : -22;
+            }
+            if (opt == 24ULL /* PR_CAPBSET_DROP */) {
+                return (st.x[1] <= 40ULL) ? 0 : -22;
             }
             if (opt == 40ULL /* PR_GET_TID_ADDRESS */ && st.x[1] != 0ULL) {
                 uint64_t tidptr = cur ? cur->clear_child_tid : 0ULL;
@@ -4428,6 +4860,19 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 fds.emplace(sfd, std::move(of));
                 return sfd;
             }
+            if (domain == 16 /* AF_NETLINK */) {
+                const int sfd = next_fd++;
+                OpenFile of;
+                of.path = "socket:[netlink#" + std::to_string(sfd) + "]";
+                of.is_netlink = true;
+                of.netlink_protocol = protocol;
+                of.fd_flags = clo;
+                of.nonblock = nb;
+                of.st_dev = 4ULL;
+                of.st_ino = ComputeGuestInode(of.path);
+                fds.emplace(sfd, std::move(of));
+                return sfd;
+            }
             return -97; // EAFNOSUPPORT
         }
         case 199: { // socketpair(domain, type, protocol, sv[2])
@@ -4485,6 +4930,16 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 }
                 it->second.unix_sock->bound_path = key;
                 unix_bound_sockets_[key] = it->second.unix_sock;
+                return 0;
+            }
+            if (it->second.is_netlink) {
+                if (alen >= 12u) {
+                    uint32_t nl_pid = 0u, nl_groups = 0u;
+                    std::memcpy(&nl_pid, sa.data() + 4u, 4u);
+                    std::memcpy(&nl_groups, sa.data() + 8u, 4u);
+                    it->second.netlink_pid = (nl_pid != 0u) ? nl_pid : static_cast<uint32_t>(cur ? cur->tgid : 1);
+                    it->second.netlink_groups = nl_groups;
+                }
                 return 0;
             }
             if (it->second.is_host_inet_sock && it->second.host_fd >= 0) {
@@ -4686,6 +5141,20 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 if (!WriteUserBytes(cpu, st.x[2], &actual, sizeof(actual))) return -14;
                 return 0;
             }
+            if (it->second.is_netlink) {
+                uint32_t ulen = 0u;
+                if (!ReadUserBytes(cpu, st.x[2], &ulen, sizeof(ulen))) return -14;
+                struct { uint16_t nl_family; uint16_t nl_pad; uint32_t nl_pid; uint32_t nl_groups; } nl{};
+                nl.nl_family = 16u;
+                nl.nl_pid = it->second.netlink_pid ? it->second.netlink_pid
+                                                   : static_cast<uint32_t>(cur ? cur->tgid : 1);
+                nl.nl_groups = it->second.netlink_groups;
+                const uint32_t actual = sizeof(nl);
+                const size_t wr = std::min<size_t>(ulen, actual);
+                if (wr > 0u && !WriteUserBytes(cpu, st.x[1], &nl, wr)) return -14;
+                if (!WriteUserBytes(cpu, st.x[2], &actual, sizeof(actual))) return -14;
+                return 0;
+            }
             if (it->second.is_host_inet_sock && it->second.host_fd >= 0) {
                 uint32_t ulen = 0u;
                 if (!ReadUserBytes(cpu, st.x[2], &ulen, sizeof(ulen))) return -14;
@@ -4742,6 +5211,9 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 WakePollWaiters();
                 return static_cast<int64_t>(len);
             }
+            if (it->second.is_netlink) {
+                return static_cast<int64_t>(len);
+            }
             if (it->second.host_fd >= 0) {
                 std::vector<uint8_t> sa;
                 socklen_t alen = 0;
@@ -4765,6 +5237,9 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
             const int rflags = static_cast<int>(st.x[3]);
             const bool dontwait = it->second.nonblock || ((rflags & 0x40 /* MSG_DONTWAIT */) != 0);
 
+            if (it->second.is_netlink) {
+                return -11; // EAGAIN
+            }
             if (it->second.unix_sock) {
                 auto& sock = *it->second.unix_sock;
                 if (sock.rx_chunks.empty()) {
@@ -5008,6 +5483,9 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 WakePollWaiters();
                 return sent;
             }
+            if (it->second.is_netlink) {
+                return static_cast<int64_t>(combined.size());
+            }
             if (it->second.host_fd >= 0) {
                 ssize_t w = ::send(it->second.host_fd, combined.data(), combined.size(),
                                    static_cast<int>(st.x[2]));
@@ -5108,6 +5586,9 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
                 }
                 if (!WriteUserBytes(cpu, st.x[1], &hdr, sizeof(hdr))) return -14;
                 return static_cast<int64_t>(data_pos);
+            }
+            if (it->second.is_netlink) {
+                return -11; // EAGAIN
             }
             return -88;
         }
@@ -5659,11 +6140,35 @@ int64_t LinuxGuestSupervisor::DispatchSyscall(AArch64CpuCore& cpu,
         }
         case 32: case 33: case 37: case 39: case 40: case 51:
         case 52: case 53: case 54: case 55: case 81: case 88:
-        case 119: case 122: case 141: case 151: case 152: case 154:
-        case 158: case 159: case 161: case 162: case 233: case 274:
+        case 119: case 122: case 151: case 152: case 154:
+        case 158: case 159: case 161: case 162: case 267: case 274:
             return 0;
         case 120: case 140:
             return 0;
+        case 141: // getpriority(which, who) -> 20 - nice (nice=0 -> 20)
+            return 20;
+        case 168: { // getcpu(cpu, node, tcache)
+            const uint32_t zero = 0u;
+            if (st.x[0] != 0ULL && !WriteUserBytes(cpu, st.x[0], &zero, sizeof(zero))) return -14;
+            if (st.x[1] != 0ULL && !WriteUserBytes(cpu, st.x[1], &zero, sizeof(zero))) return -14;
+            return 0;
+        }
+        case 233: { // madvise(addr, length, advice)
+            const uint64_t addr = AlignDown4K(UntagUserVa(st.x[0]));
+            const uint64_t len = AlignUp4K(st.x[1]);
+            const int advice = static_cast<int>(st.x[2]);
+            if (advice == 4 /* MADV_DONTNEED */ && len > 0ULL && len <= (64ULL * 1024ULL * 1024ULL)) {
+                static const uint8_t kZeros[4096]{};
+                for (uint64_t va = addr; va < addr + len; va += 4096ULL) {
+                    uint64_t entry_pa = 0, leaf = 0;
+                    if (LookupL3Pte(va, entry_pa, leaf) && (leaf & (1ULL << 7)) == 0ULL) {
+                        const uint64_t pa = leaf & 0x0000FFFFFFFFF000ULL;
+                        ram_.WriteBytes(pa, kZeros, sizeof(kZeros));
+                    }
+                }
+            }
+            return 0;
+        }
         case 123: { // sched_getaffinity(pid, cpusetsize, mask)
             const uint64_t mask_len = st.x[1];
             const uint64_t mask_uva = st.x[2];

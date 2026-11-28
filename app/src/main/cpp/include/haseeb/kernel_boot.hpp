@@ -167,6 +167,10 @@ public:
         bool is_host_inet_sock = false;
         int host_sock_domain = 0;
         int host_sock_type = 0;
+        bool is_netlink = false;
+        int netlink_protocol = 0;
+        uint32_t netlink_pid = 0;
+        uint32_t netlink_groups = 0;
         int32_t so_error = 0;
         VirtioInputDevice* input_dev = nullptr;
         std::vector<std::string> dir_children;
@@ -331,6 +335,7 @@ private:
         uint64_t st_dev = 1ULL;
         uint64_t st_ino = 1ULL;
         uint32_t st_mode = 0100755u;
+        uint64_t st_rdev = 0ULL;
         uint64_t st_size = 0ULL;
     };
 
@@ -439,6 +444,7 @@ private:
     std::unordered_set<std::string> runtime_dirs_;
     std::unordered_map<std::string, std::string> runtime_symlinks_;
     std::unordered_map<std::string, std::vector<uint8_t>> runtime_files_;
+    std::unordered_map<std::string, std::unordered_map<std::string, std::vector<uint8_t>>> runtime_xattrs_;
 };
 
 } // namespace haseeb::vm

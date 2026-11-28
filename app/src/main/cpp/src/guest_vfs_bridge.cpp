@@ -208,14 +208,104 @@ bool GuestVfsBridge::TryResolveSpecialVfs(const std::string& norm_path,
         out_data.assign(la.begin(), la.end());
         return true;
     }
-
-    // 1b. /sys/fs/selinux/* and /sys/devices/system/cpu/*
-    if (norm_path == "/sys/fs/selinux") {
+    if (norm_path == "/proc/device-tree") {
         out_is_dir = true;
-        out_children = {"enforce", "mls", "policyvers", "status", "null", "load"};
+        out_children = {"firmware", "chosen", "compatible", "model"};
         return true;
     }
-    if (norm_path == "/sys/fs/selinux/enforce") {
+    if (norm_path == "/proc/device-tree/compatible") {
+        static constexpr char kCompat[] = "linux,dummy-virt\0";
+        out_data.assign(kCompat, kCompat + sizeof(kCompat));
+        return true;
+    }
+    if (norm_path == "/proc/device-tree/model") {
+        static constexpr char kModel[] = "Haseeb Virtual ARM64 Board\0";
+        out_data.assign(kModel, kModel + sizeof(kModel));
+        return true;
+    }
+    if (norm_path == "/proc/device-tree/chosen") {
+        out_is_dir = true;
+        out_children = {"name"};
+        return true;
+    }
+    if (norm_path == "/proc/device-tree/chosen/name") {
+        static constexpr char kChosen[] = "chosen\0";
+        out_data.assign(kChosen, kChosen + sizeof(kChosen));
+        return true;
+    }
+    if (norm_path == "/proc/device-tree/firmware") {
+        out_is_dir = true;
+        out_children = {"android"};
+        return true;
+    }
+    if (norm_path == "/proc/device-tree/firmware/android") {
+        out_is_dir = true;
+        out_children = {"compatible", "name"};
+        return true;
+    }
+    if (norm_path == "/proc/device-tree/firmware/android/compatible") {
+        static constexpr char kFwCompat[] = "android,firmware\0";
+        out_data.assign(kFwCompat, kFwCompat + sizeof(kFwCompat));
+        return true;
+    }
+    if (norm_path == "/proc/device-tree/firmware/android/name") {
+        static constexpr char kFwName[] = "android\0";
+        out_data.assign(kFwName, kFwName + sizeof(kFwName));
+        return true;
+    }
+    if (norm_path == "/proc/sys/kernel/random/boot_id") {
+        const std::string bid = "68617365-6562-4000-8000-616e64726f69\n";
+        out_data.assign(bid.begin(), bid.end());
+        return true;
+    }
+    if (norm_path == "/proc/sys/kernel/osrelease") {
+        const std::string rel = "5.10.209-haseeb\n";
+        out_data.assign(rel.begin(), rel.end());
+        return true;
+    }
+    if (norm_path == "/proc/sys/kernel/hostname") {
+        const std::string hn = "haseeb-android\n";
+        out_data.assign(hn.begin(), hn.end());
+        return true;
+    }
+    if (norm_path == "/proc/sys/kernel/domainname") {
+        const std::string dn = "localdomain\n";
+        out_data.assign(dn.begin(), dn.end());
+        return true;
+    }
+
+    // 1b. /sys/fs/selinux/*, /sys/block/*, and /sys/devices/system/cpu/*
+    if (norm_path == "/sys/fs/selinux") {
+        out_is_dir = true;
+        out_children = {"enforce", "mls", "policyvers", "status", "null", "load",
+                        "policy", "disable", "checkreqprot", "deny_unknown", "reject_unknown",
+                        "commit_pending_bools", "access", "create", "context",
+                        "booleans", "class", "initial_contexts"};
+        return true;
+    }
+    if (norm_path == "/sys/fs/selinux/booleans" || norm_path == "/sys/fs/selinux/class") {
+        out_is_dir = true;
+        return true;
+    }
+    if (norm_path == "/sys/fs/selinux/initial_contexts") {
+        out_is_dir = true;
+        out_children = {"kernel", "file"};
+        return true;
+    }
+    if (norm_path == "/sys/fs/selinux/initial_contexts/kernel") {
+        static constexpr char kCtx[] = "u:r:kernel:s0\0";
+        out_data.assign(kCtx, kCtx + sizeof(kCtx));
+        return true;
+    }
+    if (norm_path == "/sys/fs/selinux/initial_contexts/file") {
+        static constexpr char kCtx[] = "u:object_r:unlabeled:s0\0";
+        out_data.assign(kCtx, kCtx + sizeof(kCtx));
+        return true;
+    }
+    if (norm_path == "/sys/fs/selinux/enforce" || norm_path == "/sys/fs/selinux/disable" ||
+        norm_path == "/sys/fs/selinux/checkreqprot" || norm_path == "/sys/fs/selinux/deny_unknown" ||
+        norm_path == "/sys/fs/selinux/reject_unknown" ||
+        norm_path == "/sys/fs/selinux/commit_pending_bools") {
         out_data = {'0'};
         return true;
     }
@@ -232,7 +322,34 @@ bool GuestVfsBridge::TryResolveSpecialVfs(const std::string& norm_path,
         out_data[0] = 1u;
         return true;
     }
-    if (norm_path == "/sys/fs/selinux/null") {
+    if (norm_path == "/sys/fs/selinux/null" || norm_path == "/sys/fs/selinux/load" ||
+        norm_path == "/sys/fs/selinux/policy" || norm_path == "/sys/fs/selinux/access" ||
+        norm_path == "/sys/fs/selinux/create" || norm_path == "/sys/fs/selinux/context") {
+        return true;
+    }
+    if (norm_path == "/sys/block") {
+        out_is_dir = true;
+        out_children = {"vda"};
+        return true;
+    }
+    if (norm_path == "/sys/block/vda") {
+        out_is_dir = true;
+        out_children = {"dev", "size", "uevent"};
+        return true;
+    }
+    if (norm_path == "/sys/block/vda/dev") {
+        const std::string v = "254:0\n";
+        out_data.assign(v.begin(), v.end());
+        return true;
+    }
+    if (norm_path == "/sys/block/vda/size") {
+        const std::string v = "4194304\n";
+        out_data.assign(v.begin(), v.end());
+        return true;
+    }
+    if (norm_path == "/sys/block/vda/uevent") {
+        const std::string v = "MAJOR=254\nMINOR=0\nDEVNAME=vda\nDEVTYPE=disk\n";
+        out_data.assign(v.begin(), v.end());
         return true;
     }
     if (norm_path == "/sys/devices/system/cpu/online" ||
@@ -286,7 +403,22 @@ bool GuestVfsBridge::TryResolveSpecialVfs(const std::string& norm_path,
         out_children = {"system"};
         return true;
     }
-    if (norm_path == "/dev/haseeb_sensors" || norm_path == "/dev/video0" ||
+    if (norm_path == "/dev/block") {
+        out_is_dir = true;
+        out_children = {"vda", "by-name"};
+        return true;
+    }
+    if (norm_path == "/dev/block/by-name") {
+        out_is_dir = true;
+        out_children = {"system", "userdata", "cache", "metadata"};
+        return true;
+    }
+    if (norm_path == "/dev/block/vda" ||
+        norm_path == "/dev/block/by-name/system" ||
+        norm_path == "/dev/block/by-name/userdata" ||
+        norm_path == "/dev/block/by-name/cache" ||
+        norm_path == "/dev/block/by-name/metadata" ||
+        norm_path == "/dev/haseeb_sensors" || norm_path == "/dev/video0" ||
         norm_path == "/dev/haseeb_gles" || norm_path == "/dev/magisk_su" ||
         norm_path == "/dev/snd/pcmC0D0p" || norm_path == "/dev/snd/pcmC0D0c" ||
         norm_path == "/dev/binder" || norm_path == "/dev/hwbinder" ||
@@ -451,7 +583,7 @@ int64_t GuestVfsBridge::BuildGetDents64(LinuxGuestSupervisor::OpenFile& of,
         std::memcpy(out.data() + start + 0u, &d_ino, 8u);
         std::memcpy(out.data() + start + 8u, &d_off, 8u);
         std::memcpy(out.data() + start + 16u, &d_reclen, 2u);
-        out[start + 18u] = 8u; // DT_REG
+        out[start + 18u] = 0u; // DT_UNKNOWN (callers use fstatat/statx for subdirs vs files)
         std::memcpy(out.data() + start + 19u, name.data(), name.size());
         out[start + 19u + name.size()] = 0u;
         ++of.dir_cursor;

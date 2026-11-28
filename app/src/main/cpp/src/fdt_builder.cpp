@@ -184,6 +184,14 @@ bool FdtBuilder::Build(const FdtBuildParams& params,
     }
     w.EndNode();
 
+    // /firmware/android (identifies Android DT root; fstab intentionally supplied via /fstab.<hw>)
+    w.BeginNode("firmware");
+    w.BeginNode("android");
+    w.PropString("compatible", "android,firmware");
+    w.PropString("name", "android");
+    w.EndNode();
+    w.EndNode();
+
     // /memory@40000000
     w.BeginNode("memory@40000000");
     w.PropString("device_type", "memory");
